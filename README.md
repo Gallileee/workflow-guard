@@ -46,6 +46,7 @@ python -m venv .venv
 workflow-guard                          # checks .github/workflows in the current directory
 workflow-guard path/to/ci.yml other/dir # files or directories
 workflow-guard --format json            # machine-readable output
+workflow-guard --format sarif --output results.sarif  # for GitHub code scanning
 workflow-guard --min-severity medium    # hide low findings
 workflow-guard --fail-on high           # show everything, but only fail on high
 workflow-guard --ignore WG006           # skip rules
@@ -87,6 +88,52 @@ To accept a finding on one line, add a comment there:
 - Review the diff before committing: `--fix` trusts what the tag points to today, so it pins
   whatever is there now. Check that the action is one you meant to use.
 
+### Code scanning (SARIF)
+
+`--format sarif` writes [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html),
+which GitHub code scanning reads. The findings then appear in the repository's Security tab and as
+annotations on the lines a pull request changes. Use `--output FILE` rather than `>`: PowerShell's
+redirection writes UTF-16, which the upload rejects.
+
+```yaml
+jobs:
+  workflow-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # needed to upload results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.14"
+      # Pin a commit of workflow-guard too, for the same reason as the actions.
+      - run: pip install "git+https://github.com/Gallileee/workflow-guard@<commit SHA>"
+      - run: workflow-guard --format sarif --output results.sarif --fail-on high
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: workflow-guard
+```
+
+How the report maps to code scanning:
+
+- Severity becomes the SARIF `level`: high = `error`, medium = `warning`, low = `note`. It's set per
+  result because WG001 and WG005 vary per finding; that's also why the rules carry no
+  `security-severity` score (GitHub reads that per rule, not per result).
+- Every rule has a description and help text, shown on the alert page.
+- Each result has its own `partialFingerprints` value, a hash of rule, file and message without
+  the line number. An alert therefore stays the same alert when lines above it move, and is closed
+  when the problem is fixed. Two identical problems in one file are told apart by their order.
+- Paths are relative to where you run the tool (`%SRCROOT%`), so run it from the repository root.
+- Files that can't be parsed are listed as tool notifications, and the run is marked
+  unsuccessful, instead of just missing from the report.
+
+This repository's own CI uploads its results the same way (the `code-scanning` job).
+
 Exit codes: `0` nothing at or above `--fail-on` (default `low`), `1` findings, `2` a file couldn't
 be read or parsed, or bad arguments.
 
@@ -104,9 +151,10 @@ src/workflow_guard/
   workflow.py  loading, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the six rules
   fix.py       --fix: GitHubResolver (API lookups) and pin_actions (text edits)
+  sarif.py     --format sarif: rules, results, fingerprints, notifications
   model.py     Finding, Severity
-  cli.py       arguments, file discovery, text/JSON output, exit codes
-tests/         pytest: rules, CLI, and --fix (with a local HTTP server standing in for GitHub)
+  cli.py       arguments, file discovery, text/JSON/SARIF output, exit codes
+tests/         pytest: rules, CLI, SARIF, and --fix (with a local HTTP server standing in for GitHub)
 ```
 
 ## Tests
@@ -128,6 +176,8 @@ workflow, which pins its actions to commit SHAs.
 - WG001 doesn't check that a SHA really belongs to the repository's tag (a SHA from a fork works
   on GitHub too).
 - `--fix` only fixes WG001. The other rules need a human decision (which permissions a job needs).
+- The SARIF output isn't checked against the JSON schema in CI (it was checked by hand, see
+  PROGRESS.md); the tests check the fields GitHub requires.
 - `--fix` doesn't look into GitHub Enterprise Server (the API URL is fixed to api.github.com).
 
 ## Next steps
