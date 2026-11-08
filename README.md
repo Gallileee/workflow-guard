@@ -50,6 +50,7 @@ workflow-guard --min-severity medium    # hide low findings
 workflow-guard --fail-on high           # show everything, but only fail on high
 workflow-guard --ignore WG006           # skip rules
 workflow-guard --list-rules
+workflow-guard --fix                    # pin actions to commit SHAs (rewrites the files)
 ```
 
 Example (from a real repository):
@@ -64,6 +65,27 @@ To accept a finding on one line, add a comment there:
 ```yaml
 - uses: actions/checkout@v4  # workflow-guard: ignore[WG001, WG006]
 ```
+
+### Pinning actions automatically
+
+`--fix` looks up the commit each tag or branch points to right now and rewrites the line:
+
+```diff
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+```
+
+- Only the `uses:` value and the end of its line change. Comments, quotes, indentation and
+  Windows line endings stay as they were; an existing comment becomes `# v7; old comment`.
+- The version stays in the comment, so Dependabot and Renovate can keep updating pinned actions.
+- It uses `GET /repos/{owner}/{repo}/commits/{ref}` with the `application/vnd.github.sha` media
+  type, which answers with just the SHA. Lookups are cached per run.
+- GitHub allows 60 anonymous API requests an hour. Set `GITHUB_TOKEN` or `GH_TOKEN` for more, e.g.
+  `GH_TOKEN=$(gh auth token) workflow-guard --fix`. The token is only sent to api.github.com.
+- Lines with `# workflow-guard: ignore[WG001]`, local actions, actions without a version and
+  Docker images are left alone. A tag that can't be found is reported and its line kept.
+- Review the diff before committing: `--fix` trusts what the tag points to today, so it pins
+  whatever is there now. Check that the action is one you meant to use.
 
 Exit codes: `0` nothing at or above `--fail-on` (default `low`), `1` findings, `2` a file couldn't
 be read or parsed, or bad arguments.
@@ -81,9 +103,10 @@ be read or parsed, or bad arguments.
 src/workflow_guard/
   workflow.py  loading, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the six rules
+  fix.py       --fix: GitHubResolver (API lookups) and pin_actions (text edits)
   model.py     Finding, Severity
   cli.py       arguments, file discovery, text/JSON output, exit codes
-tests/         pytest: one test file for the rules, one for the CLI
+tests/         pytest: rules, CLI, and --fix (with a local HTTP server standing in for GitHub)
 ```
 
 ## Tests
@@ -104,7 +127,8 @@ workflow, which pins its actions to commit SHAs.
 - WG004 only looks at `run:` and `actions/github-script`; other actions can also misuse inputs.
 - WG001 doesn't check that a SHA really belongs to the repository's tag (a SHA from a fork works
   on GitHub too).
-- No auto-fix yet.
+- `--fix` only fixes WG001. The other rules need a human decision (which permissions a job needs).
+- `--fix` doesn't look into GitHub Enterprise Server (the API URL is fixed to api.github.com).
 
 ## Next steps
 

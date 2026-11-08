@@ -113,6 +113,15 @@ class Workflow:
                     if isinstance(step, MappingNode):
                         yield Step(job_id, step)
 
+    def uses_nodes(self) -> Iterator[Node]:
+        """Every ``uses:`` value: reusable workflow calls (``jobs.<id>.uses``) and steps."""
+        for _job_id, job in self.jobs():
+            if (uses := get(job, "uses")) is not None:
+                yield uses
+        for step in self.steps():
+            if (uses := get(step.node, "uses")) is not None:
+                yield uses
+
     # --- suppression -----------------------------------------------------------------------
 
     def is_ignored(self, line: int, rule_id: str) -> bool:
