@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
 from . import __version__
+from .fix import GitHubResolver, Resolver, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
 from .workflow import Workflow, WorkflowError
@@ -78,13 +80,53 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LEVEL",
         help="exit with 1 if a shown finding is at this level or above (default: low)",
     )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="pin actions to the commit SHA of their tag (WG001), via the GitHub API; "
+        "uses GITHUB_TOKEN or GH_TOKEN if set. Rewrites the files in place",
+    )
     parser.add_argument("--list-rules", action="store_true", help="print the rules and exit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
-def run(argv: Sequence[str] | None = None, out: TextIO = sys.stdout, err: TextIO = sys.stderr) -> int:
+def _load(path: Path, fix: Resolver | None, err: TextIO) -> Workflow:
+    """Read one workflow; with a resolver, pin its actions first and save the file."""
+    display = path.as_posix()
+    if fix is None:
+        return Workflow.load(path, display)
+    try:
+        # newline="" keeps \r\n as it is, so only the pinned lines change on Windows checkouts too.
+        with open(path, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise WorkflowError(f"cannot read: {e}") from e
+    result = pin_actions(text, fix, display)
+    for pin in result.pinned:
+        print(f"{display}:{pin.line}: pinned {pin.old} -> {pin.new}", file=err)
+    for line, uses, reason in result.failed:
+        print(f"{display}:{line}: could not pin {uses}: {reason}", file=err)
+    if result.text != text:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(result.text)
+    return Workflow.parse(result.text, display)
+
+
+def _token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or None
+
+
+def run(
+    argv: Sequence[str] | None = None,
+    out: TextIO = sys.stdout,
+    err: TextIO = sys.stderr,
+    resolver: Resolver | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
+    fixer: Resolver | None = None
+    if args.fix and "WG001" not in args.ignore:
+        fixer = resolver or GitHubResolver(token=_token())
 
     if args.list_rules:
         for rule in RULES:
@@ -106,7 +148,7 @@ def run(argv: Sequence[str] | None = None, out: TextIO = sys.stdout, err: TextIO
     broken = 0
     for f in files:
         try:
-            wf = Workflow.load(f, f.as_posix())
+            wf = _load(f, fixer, err)
         except WorkflowError as e:
             print(f"{f.as_posix()}: error: {e}", file=err)
             broken += 1

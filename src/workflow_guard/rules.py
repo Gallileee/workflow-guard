@@ -40,13 +40,8 @@ _FIRST_PARTY = ("actions/", "github/")
 
 
 def unpinned_actions(wf: Workflow) -> Iterator[Finding]:
-    for _job_id, job in wf.jobs():
-        # A job can call a reusable workflow directly: jobs.<id>.uses
-        if (uses := get(job, "uses")) is not None:
-            yield from _check_uses(wf, uses)
-    for step in wf.steps():
-        if (uses := get(step.node, "uses")) is not None:
-            yield from _check_uses(wf, uses)
+    for uses in wf.uses_nodes():
+        yield from _check_uses(wf, uses)
 
 
 def _check_uses(wf: Workflow, node: Node) -> Iterator[Finding]:
