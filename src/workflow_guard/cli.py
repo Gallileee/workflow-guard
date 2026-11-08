@@ -18,6 +18,7 @@ from . import __version__
 from .fix import GitHubResolver, Resolver, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
+from .sarif import to_sarif
 from .workflow import Workflow, WorkflowError
 
 DEFAULT_DIR = Path(".github") / "workflows"
@@ -58,7 +59,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "paths", nargs="*", type=Path, help=f"workflow files or directories (default: {DEFAULT_DIR})"
     )
-    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument(
+        "--format",
+        choices=("text", "json", "sarif"),
+        default="text",
+        help="text (default), json, or sarif for GitHub code scanning",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        metavar="FILE",
+        help="write the report to FILE (UTF-8) instead of standard output",
+    )
     parser.add_argument(
         "--ignore",
         type=_parse_ids,
@@ -145,27 +157,51 @@ def run(
         return 2
 
     findings: list[Finding] = []
-    broken = 0
+    errors: list[tuple[str, str]] = []
     for f in files:
         try:
             wf = _load(f, fixer, err)
         except WorkflowError as e:
             print(f"{f.as_posix()}: error: {e}", file=err)
-            broken += 1
+            errors.append((f.as_posix(), str(e)))
             continue
         findings += [x for x in check(wf, args.ignore) if x.severity >= args.min_severity]
 
-    if args.format == "json":
-        json.dump({"files": len(files), "findings": [x.to_dict() for x in findings]}, out, indent=2)
-        out.write("\n")
-    else:
-        for x in findings:
-            print(f"{x.path}:{x.line}:{x.column}: {x.rule_id} [{x.severity}] {x.message}", file=out)
-        print(f"{len(findings)} finding(s) in {len(files)} file(s)", file=err)
+    try:
+        _report(args, findings, errors, len(files), out, err)
+    except OSError as e:
+        print(f"workflow-guard: cannot write {args.output}: {e}", file=err)
+        return 2
 
-    if broken:
+    if errors:
         return 2
     return 1 if any(x.severity >= args.fail_on for x in findings) else 0
+
+
+def _report(
+    args: argparse.Namespace,
+    findings: list[Finding],
+    errors: list[tuple[str, str]],
+    file_count: int,
+    out: TextIO,
+    err: TextIO,
+) -> None:
+    if args.format == "json":
+        report = json.dumps({"files": file_count, "findings": [x.to_dict() for x in findings]}, indent=2)
+    elif args.format == "sarif":
+        report = json.dumps(to_sarif(findings, errors), indent=2)
+    else:
+        report = "\n".join(
+            f"{x.path}:{x.line}:{x.column}: {x.rule_id} [{x.severity}] {x.message}" for x in findings
+        )
+    if args.output is not None:
+        # Written here rather than through shell redirection: PowerShell's ">" writes UTF-16,
+        # which code scanning can't read.
+        args.output.write_text(report + "\n", encoding="utf-8")
+    elif report:
+        out.write(report + "\n")
+    if args.format == "text" or args.output is not None:
+        print(f"{len(findings)} finding(s) in {file_count} file(s)", file=err)
 
 
 def main() -> None:

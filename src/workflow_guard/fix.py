@@ -76,7 +76,8 @@ class GitHubResolver:
             with self._open(Request(url, headers=headers), timeout=self._timeout) as response:
                 body = response.read(200).decode("utf-8", "replace").strip()
         except HTTPError as e:
-            raise ResolveError(_explain(e, repo, ref)) from None
+            with e:  # an HTTPError holds the open response; close it (ResourceWarning otherwise)
+                raise ResolveError(_explain(e, repo, ref)) from None
         except (URLError, TimeoutError, OSError) as e:
             raise ResolveError(f"cannot reach the GitHub API ({getattr(e, 'reason', e)})") from None
         if not SHA.match(body):
