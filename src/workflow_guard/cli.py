@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TextIO
 
 from . import __version__
+from .annotations import to_annotations
 from .fix import GitHubResolver, Resolver, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
@@ -61,9 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=("text", "json", "sarif"),
+        choices=("text", "json", "sarif", "github"),
         default="text",
-        help="text (default), json, or sarif for GitHub code scanning",
+        help="text (default), json, sarif for GitHub code scanning, or github for annotations "
+        "(workflow commands) inside a GitHub Actions run",
     )
     parser.add_argument(
         "--output",
@@ -190,6 +192,8 @@ def _report(
         report = json.dumps({"files": file_count, "findings": [x.to_dict() for x in findings]}, indent=2)
     elif args.format == "sarif":
         report = json.dumps(to_sarif(findings, errors), indent=2)
+    elif args.format == "github":
+        report = to_annotations(findings, errors)
     else:
         report = "\n".join(
             f"{x.path}:{x.line}:{x.column}: {x.rule_id} [{x.severity}] {x.message}" for x in findings
@@ -200,7 +204,7 @@ def _report(
         args.output.write_text(report + "\n", encoding="utf-8")
     elif report:
         out.write(report + "\n")
-    if args.format == "text" or args.output is not None:
+    if args.format in ("text", "github") or args.output is not None:
         print(f"{len(findings)} finding(s) in {file_count} file(s)", file=err)
 
 

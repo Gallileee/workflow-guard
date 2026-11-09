@@ -28,6 +28,42 @@ jobs:
       # Dogfooding: this repository's own workflows must pass its own checks.
       - run: workflow-guard
 
+  # Runs action.yml the way other repositories would (uses: ./ is this commit's action.yml).
+  action:
+    name: action (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: This repository's workflows pass
+        uses: ./
+      - name: The unsafe fixture fails the step
+        id: unsafe
+        continue-on-error: true
+        uses: ./
+        with:
+          paths: tests/fixtures/unsafe-workflow.yml
+          format: json
+          output: findings.json
+      - name: Ignored rules and fail-on high let it pass
+        uses: ./
+        with:
+          paths: tests/fixtures/unsafe-workflow.yml
+          ignore: WG004
+          fail-on: high
+          format: text
+      - name: Check the results
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.unsafe.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          grep -q '"rule": "WG004"' findings.json
+
   # Uploads this repository's own results to GitHub code scanning (Security tab, PR annotations).
   code-scanning:
     # Pull requests from forks get a read-only token, so the upload would fail there.

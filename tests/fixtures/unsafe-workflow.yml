@@ -1,0 +1,9 @@
+# A deliberately unsafe workflow, used by the tests and by CI's "action" job.
+# It is not in .github/workflows, so GitHub never runs it.
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "${{ github.head_ref }}"

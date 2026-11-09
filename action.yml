@@ -1,0 +1,81 @@
+name: workflow-guard
+description: Find common security mistakes in GitHub Actions workflows (unpinned actions, token permissions, template injection)
+author: Gallileee
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  paths:
+    description: Workflow files or directories, separated by spaces or new lines. Empty checks .github/workflows.
+    required: false
+    default: ""
+  format:
+    description: "github (annotations on the changed lines, default), text, json or sarif"
+    required: false
+    default: github
+  output:
+    description: Write the report to this file instead of the log (e.g. results.sarif for code scanning).
+    required: false
+    default: ""
+  fail-on:
+    description: Fail the step if a finding is at this level or above (low, medium, high).
+    required: false
+    default: low
+  min-severity:
+    description: Only report findings at this level or above (low, medium, high).
+    required: false
+    default: low
+  ignore:
+    description: Comma-separated rule ids to skip, e.g. WG006.
+    required: false
+    default: ""
+  python-version:
+    description: Python used to run workflow-guard (3.10 or newer). It doesn't change the job's own Python.
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    # update-environment: false keeps this Python off the job's PATH, so a later
+    # actions/setup-python (or the runner's own Python) in the caller's job is unaffected.
+    - id: python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      with:
+        python-version: ${{ inputs.python-version }}
+        update-environment: false
+
+    # Installs the action's own checkout (the commit the caller pinned), not a package from
+    # PyPI, into a virtual environment of its own.
+    - id: install
+      shell: bash
+      env:
+        WG_BASE_PYTHON: ${{ steps.python.outputs.python-path }}
+      run: |
+        venv="$RUNNER_TEMP/workflow-guard-venv"
+        "$WG_BASE_PYTHON" -m venv "$venv"
+        if [ "$RUNNER_OS" = Windows ]; then py="$venv/Scripts/python.exe"; else py="$venv/bin/python"; fi
+        "$py" -m pip install --quiet --disable-pip-version-check "$GITHUB_ACTION_PATH"
+        echo "python=$py" >> "$GITHUB_OUTPUT"
+
+    # Inputs reach the script through env:, never as ${{ }} inside run:, so a value can't
+    # become shell code (the template injection that rule WG004 reports).
+    - shell: bash
+      env:
+        WG_PYTHON: ${{ steps.install.outputs.python }}
+        WG_PATHS: ${{ inputs.paths }}
+        WG_FORMAT: ${{ inputs.format }}
+        WG_OUTPUT: ${{ inputs.output }}
+        WG_FAIL_ON: ${{ inputs.fail-on }}
+        WG_MIN_SEVERITY: ${{ inputs.min-severity }}
+        WG_IGNORE: ${{ inputs.ignore }}
+      run: |
+        set -f  # split the paths on whitespace, but don't expand * or ? in them
+        args=(--format "$WG_FORMAT" --fail-on "$WG_FAIL_ON" --min-severity "$WG_MIN_SEVERITY")
+        if [ -n "$WG_IGNORE" ]; then args+=(--ignore "$WG_IGNORE"); fi
+        if [ -n "$WG_OUTPUT" ]; then args+=(--output "$WG_OUTPUT"); fi
+        # shellcheck disable=SC2206
+        paths=($WG_PATHS)
+        # "--" ends the options, so a path can't be read as one (a file named --fix, say).
+        "$WG_PYTHON" -m workflow_guard "${args[@]}" -- "${paths[@]}"

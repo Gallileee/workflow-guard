@@ -1,5 +1,56 @@
 # Progress log
 
+## 2026-11-09 (scheduled run): Milestone 4, GitHub Action, pre-commit hook and annotations
+
+Why: next step 2. Until now another repository had to `pip install git+...` and write the
+upload steps itself; now it is one `uses:` line or three lines of `.pre-commit-config.yaml`.
+Next step 1 was checked first: the code-scanning API shows the `main` analysis from 2026-11-08
+(6 rules, 0 results) and 0 alerts, as expected.
+
+Acceptance criteria:
+- `uses: Gallileee/workflow-guard@<ref>` checks `.github/workflows` and fails the step on findings,
+  with every CLI option available as an input.
+- Findings appear as annotations without code scanning (works in private repositories).
+- The action doesn't change the caller's Python and can't be tricked by its inputs.
+- A pre-commit hook that only runs on workflow files.
+- CI runs the action itself, on Linux and Windows.
+
+Done:
+- `annotations.py` + `--format github`: one `::error`/`::warning`/`::notice` workflow command per
+  finding (by severity), with `file`, `line`, `col` and `title` (`WG004 template-injection`).
+  Percent-encoding as the runner expects (`%`, CR, LF; in properties also `:` and `,`), so a
+  newline in a file name or value can't start a second command such as `::add-mask::`.
+  Unreadable files become `::error` annotations on the file.
+- `action.yml` (composite): `actions/setup-python` pinned to a SHA with
+  `update-environment: false`, a venv in `$RUNNER_TEMP` with the action's own checkout installed,
+  inputs passed via `env:` only, `set -f` so `*` in `paths` isn't expanded, and `--` before the
+  paths. Inputs: paths, format (default `github`), output, fail-on, min-severity, ignore,
+  python-version.
+- `.pre-commit-hooks.yaml`: `language: python`, `files: ^\.github/workflows/[^/]+\.ya?ml$`.
+- CI: an `action` job (ubuntu-latest, windows-latest) with `uses: ./`: the repository passes, the
+  unsafe fixture (`tests/fixtures/unsafe-workflow.yml`) fails with WG004 in the JSON, and
+  `ignore: WG004` + `fail-on: high` passes.
+- Tests: `test_annotations.py` (8), `test_distribution.py` (7: action inputs documented and used,
+  no `${{` in `run:`, actions pinned, `--` present, hook entry and file pattern). 93 in total.
+  Version 0.4.0.
+
+Verified locally (Python 3.14 venv, Git Bash):
+- `pytest -q -W error`: 93 passed. `ruff check`, `ruff format --check`: clean.
+- The action's two bash steps, run with fake runner variables (`RUNNER_OS=Windows`,
+  `RUNNER_TEMP`, `GITHUB_OUTPUT`, `GITHUB_ACTION_PATH`) and `py -3.14` standing in for
+  setup-python: install OK; default paths exit 0; the fixture exit 1 with 4 annotations; two paths
+  on separate lines with `ignore`/`fail-on` exit 0; `paths: --fix` is treated as a missing file
+  (exit 2), and `paths: tests/fixtures/*.yml` isn't globbed (exit 2).
+- `workflow-guard` on its own changed workflow: 0 findings.
+
+Not verified locally: the `action` job on real runners (Linux and Windows) and setup-python's
+`python-path` output; see the PR's checks.
+
+Pre-commit, checked with `pre-commit try-repo <this repo> workflow-guard --all-files`
+(pre-commit 4 in a scratch venv): lendloop passed; a scratch repository with the unsafe fixture
+as `.github/workflows/bad.yml` and a `.github/dependabot.yml` failed with the 4 findings, and only
+1 file was checked, so the `files` pattern works.
+
 ## 2026-11-08 (scheduled run): Milestone 3, SARIF output for GitHub code scanning
 
 Why: next step 2. Step 1 (running `--fix` on the three repositories) was done earlier the same
@@ -111,9 +162,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. After merge: check that alerts appear on the Security tab (there should be none for this
-   repository) and try a PR with a deliberately unpinned action to see the annotation.
-2. Publish it as a GitHub Action / pre-commit hook, so other repositories can use it with one
-   `uses:` line instead of `pip install git+...`. Tag a release (v0.3.0) for that.
-3. Parse `${{ }}` expressions properly (bracket syntax) instead of regex matching.
+1. Tag `v0.4.0` after the merge, so `uses: Gallileee/workflow-guard@v0.4.0` and `rev: v0.4.0`
+   work, then use the action in lendloop and fitness-workout-log.
+2. Parse `${{ }}` expressions properly (bracket syntax) instead of regex matching.
+3. Check composite actions (`action.yml`): WG001 and WG004 apply to their steps too, and this
+   repository's own action could then be checked by CI instead of by a test.
 4. `--fix`: match the file's comment style (one space before `# v7` where Prettier wants it).
+5. A GitHub Release with notes, and later the Marketplace listing.

@@ -29,6 +29,73 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
 
+## Use it in your repository
+
+### As a GitHub Action
+
+```yaml
+# .github/workflows/workflow-guard.yml
+name: workflow-guard
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Gallileee/workflow-guard@v0.4.0   # better: pin the commit SHA, see below
+```
+
+Findings show up as annotations on the workflow lines of the pull request (`::error` for high,
+`::warning` for medium, `::notice` for low) and the step fails. No extra permissions are needed,
+and it works in private repositories too.
+
+Pin the action to a commit like any other: `workflow-guard --fix` turns `@v0.4.0` into
+`@<sha>  # v0.4.0` for you.
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `paths` | `""` (`.github/workflows`) | files or directories, separated by spaces or new lines |
+| `format` | `github` | `github` (annotations), `text`, `json` or `sarif` |
+| `output` | `""` | write the report to this file instead of the log |
+| `fail-on` | `low` | fail the step on findings at this level or above |
+| `min-severity` | `low` | hide findings below this level |
+| `ignore` | `""` | comma-separated rule ids, e.g. `WG006` |
+| `python-version` | `3.12` | Python that runs the tool; the job's own Python isn't changed |
+
+How the action is built (`action.yml`, a composite action):
+
+- `actions/setup-python` with `update-environment: false`, so the tool's Python stays off the
+  job's `PATH` and can't break the caller's own Python setup.
+- The action installs its own checkout (the exact commit you pinned) into a virtual environment
+  in `$RUNNER_TEMP`, not a package from PyPI that could change under the same version.
+- Inputs reach the shell through `env:`, never as `${{ inputs.x }}` inside `run:` (that would be
+  the template injection WG004 reports), and the paths come after `--`, so a path can't turn
+  into an option such as `--fix`.
+- CI runs it on Ubuntu and Windows (the `action` job), against this repository and a deliberately
+  unsafe fixture.
+
+### As a pre-commit hook
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/Gallileee/workflow-guard
+    rev: v0.4.0
+    hooks:
+      - id: workflow-guard
+```
+
+[pre-commit](https://pre-commit.com) installs the tool in its own environment and runs it on the
+workflow files a commit changes (`.github/workflows/*.yml` / `*.yaml`).
+
 ## Install
 
 Needs Python 3.10+.
@@ -46,6 +113,7 @@ python -m venv .venv
 workflow-guard                          # checks .github/workflows in the current directory
 workflow-guard path/to/ci.yml other/dir # files or directories
 workflow-guard --format json            # machine-readable output
+workflow-guard --format github          # annotations, inside a GitHub Actions step
 workflow-guard --format sarif --output results.sarif  # for GitHub code scanning
 workflow-guard --min-severity medium    # hide low findings
 workflow-guard --fail-on high           # show everything, but only fail on high
@@ -106,12 +174,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      - uses: Gallileee/workflow-guard@v0.4.0   # pin the commit SHA (workflow-guard --fix)
         with:
-          python-version: "3.14"
-      # Pin a commit of workflow-guard too, for the same reason as the actions.
-      - run: pip install "git+https://github.com/Gallileee/workflow-guard@<commit SHA>"
-      - run: workflow-guard --format sarif --output results.sarif --fail-on high
+          format: sarif
+          output: results.sarif
+          fail-on: high
       - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
         if: always()
         with:
@@ -132,7 +199,9 @@ How the report maps to code scanning:
 - Files that can't be parsed are listed as tool notifications, and the run is marked
   unsuccessful, instead of just missing from the report.
 
-This repository's own CI uploads its results the same way (the `code-scanning` job).
+This repository's own CI uploads its results the same way (the `code-scanning` job, which runs
+the CLI directly). Code scanning needs a public repository or GitHub Advanced Security; the
+default `format: github` annotations work everywhere.
 
 Exit codes: `0` nothing at or above `--fail-on` (default `low`), `1` findings, `2` a file couldn't
 be read or parsed, or bad arguments.
@@ -145,6 +214,10 @@ be read or parsed, or bad arguments.
 - Each rule is a function `Workflow -> Iterator[Finding]` in `rules.py`, registered in `RULES`.
 - `${{ }}` expressions are found with a regex and checked against a list of untrusted contexts.
   For `run: |` blocks the line of the expression itself is reported, not the `run:` line.
+- `--format github` prints [workflow commands](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands).
+  Messages and properties are percent-encoded the way the runner expects (`%`, `\r`, `\n`, and
+  in properties also `:` and `,`), so a file name or value with a line break can't end the
+  annotation and start a different command on the next line.
 
 ```
 src/workflow_guard/
@@ -152,9 +225,13 @@ src/workflow_guard/
   rules.py     the six rules
   fix.py       --fix: GitHubResolver (API lookups) and pin_actions (text edits)
   sarif.py     --format sarif: rules, results, fingerprints, notifications
+  annotations.py --format github: workflow commands, with GitHub's escaping
   model.py     Finding, Severity
-  cli.py       arguments, file discovery, text/JSON/SARIF output, exit codes
-tests/         pytest: rules, CLI, SARIF, and --fix (with a local HTTP server standing in for GitHub)
+  cli.py       arguments, file discovery, text/JSON/SARIF/GitHub output, exit codes
+action.yml     the composite GitHub Action
+.pre-commit-hooks.yaml  the pre-commit hook
+tests/         pytest: rules, CLI, SARIF, annotations, action.yml and the hook, and --fix
+               (with a local HTTP server standing in for GitHub); fixtures/ holds an unsafe workflow
 ```
 
 ## Tests
@@ -165,13 +242,19 @@ ruff check . && ruff format --check .
 ```
 
 CI runs them on Python 3.10, 3.12 and 3.14, and then runs workflow-guard on this repository's own
-workflow, which pins its actions to commit SHAs.
+workflow, which pins its actions to commit SHAs. The `action` job runs `action.yml` itself on
+Ubuntu and Windows.
 
 ## Limitations
 
 - Expressions are matched with regular expressions, not parsed, so unusual spellings
   (`github.event['pull_request']['title']`) aren't caught.
-- Composite actions (`action.yml`) and the inside of called reusable workflows aren't checked.
+- Composite actions (`action.yml`, this repository's own included) and the inside of called
+  reusable workflows aren't checked. `tests/test_distribution.py` checks this action's own
+  `action.yml` for the same mistakes instead.
+- The action needs `bash` (all GitHub-hosted runners have it, Windows included) and network
+  access to PyPI for PyYAML.
+- Not on PyPI or the GitHub Marketplace yet; install from the repository.
 - WG004 only looks at `run:` and `actions/github-script`; other actions can also misuse inputs.
 - WG001 doesn't check that a SHA really belongs to the repository's tag (a SHA from a fork works
   on GitHub too).
