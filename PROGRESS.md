@@ -1,5 +1,37 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 5, composite and Docker actions
+
+Why: next step 3, picked by the owner after the v0.4.0 action went into lendloop (#23) and
+fitness-workout-log (#37), both merged. Composite actions run shell steps exactly like workflows,
+with the same mistakes, and this repository's own `action.yml` was only checked by a test.
+
+Acceptance criteria:
+- A file with `runs:` is read as an action; one with neither `jobs:` nor `runs:` is an error.
+- Composite steps get WG001, WG004, WG006; a Docker action's `docker://` image gets WG001.
+- `${{ inputs.* }}` inside `run:` of an action is WG004 (medium), but not in a workflow.
+- Without arguments, `action.yml` at the root and `.github/actions/**/action.yml` are checked too,
+  so CI's dogfooding step now covers this repository's own action. `--fix` works on actions.
+- The pre-commit hook runs on those files as well.
+
+Done:
+- `Workflow.kind` (`workflow` / `action`), `is_action`. `steps()` reads `runs.steps` for actions
+  (job id `(action)`); `uses_nodes()` adds `runs.image` when it starts with `docker://`. The rules
+  needed no other change: WG002/3/5 find no jobs or triggers in an action, so they stay quiet.
+- WG004: `inputs.<name>` in a composite action's `run:`/github-script is medium; outsider
+  contexts stay high. Rule summary and help updated.
+- CLI: `default_paths()`. Pre-commit `files` pattern extended.
+- Tests: `test_actions.py` (17, incl. discovery, --fix and the hook pattern). 110 in total.
+  Version 0.5.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 110 passed. `ruff check`, `ruff format --check`: clean.
+- `workflow-guard` in this repository: 0 findings in 2 files (ci.yml and its own action.yml).
+- A copy of `action.yml` with `${{ inputs.paths }}` pasted into `run:` and setup-python on `@v7`:
+  WG004 (medium) on the `run:` line and WG001 on the `uses:` line; the same input in `env:` is
+  not reported.
+- lendloop, fitness-workout-log and GaTe-parking: same results as before (no local actions there).
+
 ## 2026-11-09 (scheduled run): Milestone 4, GitHub Action, pre-commit hook and annotations
 
 Why: next step 2. Until now another repository had to `pip install git+...` and write the
@@ -162,10 +194,8 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.4.0` after the merge, so `uses: Gallileee/workflow-guard@v0.4.0` and `rev: v0.4.0`
-   work, then use the action in lendloop and fitness-workout-log.
+1. Tag `v0.5.0` after the merge; Dependabot then offers the update in lendloop and
+   fitness-workout-log (their `# v0.4.0` pins).
 2. Parse `${{ }}` expressions properly (bracket syntax) instead of regex matching.
-3. Check composite actions (`action.yml`): WG001 and WG004 apply to their steps too, and this
-   repository's own action could then be checked by CI instead of by a test.
-4. `--fix`: match the file's comment style (one space before `# v7` where Prettier wants it).
-5. A GitHub Release with notes, and later the Marketplace listing.
+3. `--fix`: match the file's comment style (one space before `# v7` where Prettier wants it).
+4. A GitHub Release with notes, and later the Marketplace listing.

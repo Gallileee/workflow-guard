@@ -6,10 +6,11 @@
 #       hooks:
 #         - id: workflow-guard
 #
-# pre-commit passes the changed workflow files as arguments.
+# pre-commit passes the changed workflow and action files as arguments.
 - id: workflow-guard
   name: workflow-guard
   description: Find common security mistakes in GitHub Actions workflows
   entry: workflow-guard
   language: python
-  files: ^\.github/workflows/[^/]+\.ya?ml$
+  # Workflows, an action at the repository root, and local actions in .github/actions/.
+  files: ^(\.github/workflows/[^/]+|action|\.github/actions/.+/action)\.ya?ml$

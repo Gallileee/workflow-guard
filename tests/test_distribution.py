@@ -1,4 +1,7 @@
-"""Checks on the files other repositories use: action.yml and .pre-commit-hooks.yaml."""
+"""Checks on the files other repositories use: action.yml and .pre-commit-hooks.yaml.
+
+workflow-guard itself now checks action.yml too (CI runs it on this repository); these tests
+add what it does not look at, such as every input being documented and used."""
 
 import re
 from pathlib import Path
