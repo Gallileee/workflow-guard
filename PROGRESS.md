@@ -1,5 +1,39 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 8, following untrusted values through detours (WG004)
+
+Why: next step 2, picked by the owner. Since v0.6.0 WG004 reads expressions properly, but only
+direct uses: a PR title moved into `env:` and then pasted as `${{ env.TITLE }}`, or passed on as
+a step output, slipped through. That detour is common in real workflows, often because someone
+followed the "use env:" advice halfway.
+
+Acceptance criteria:
+- `${{ env.X }}` in `run:` is reported when X holds untrusted text, whether X was set in `env:`
+  at workflow, job or step level or written to `$GITHUB_ENV` by an earlier step.
+- `${{ steps.<id>.outputs.<name>}}` and `${{ needs.<job>.outputs.<name> }}` are reported when the
+  output was written from untrusted text, also through a shell variable (`title=$TITLE`).
+- `"$TITLE"` in a script, clean overrides, step env in later steps, outputs of steps without an
+  `id`, and loops in `needs:` don't produce findings (or hangs).
+- The message names the chain; no new findings on the real repositories.
+
+Done:
+- `taint.py`: `Taint` (kind, source, severity, the hops), `direct_taint` (the former WG004
+  patterns, moved here), `Scope` (tainted env by exact name, outputs by lower-case id/name) and
+  `Tracker`, which walks the steps of each job in order and caches each job's result for
+  `needs:`; a job being walked counts as having no outputs, which stops `needs:` loops.
+- `rules.py`: WG004 asks the tracker for each expression in `run:`/github-script. Direct uses keep
+  their old messages; detours get `'<path>' carries <origin> (via a -> b) ...` and, for env, the
+  advice to use `"$NAME"`.
+- Tests: `test_taint.py` (21). 198 in total. Version 0.8.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 198 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks on `taint.py`: without the env lookup 7 tests fail, without clean overrides 1,
+  without `needs:` outputs 2.
+- workflow-guard, lendloop, fitness-workout-log: 0 findings. GaTe-parking (local clone, on a team
+  member's branch): the same single low WG001 as before; its PR-title check reads the title
+  through `env:` correctly and isn't reported.
+
 ## 2026-11-09 (interactive): Milestone 7, `--fix` matches the comment style
 
 Why: next step 2, picked by the owner. In GaTe-parking (a team repository that runs
@@ -259,8 +293,9 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.7.0` after the merge; Dependabot then offers the update in lendloop and
-   fitness-workout-log (their `# v0.4.0` pins).
-2. Follow values through `env:` at job/workflow level into `run:` (`${{ env.TITLE }}` where
-   `TITLE` was set from a PR title) and through step outputs.
-3. A GitHub Release with notes, and later the Marketplace listing.
+1. Tag `v0.8.0` after the merge; Dependabot then offers the update in lendloop and
+   fitness-workout-log (their `# v0.7.0` pins).
+2. WG007: untrusted text written to `$GITHUB_ENV` (it can set `LD_PRELOAD`, `BASH_ENV` and the
+   like for every later step), reusing the tracker.
+3. Follow multi-line `name<<EOF` writes and github-script's `core.setOutput` / `exportVariable`.
+4. A GitHub Release with notes, and later the Marketplace listing.
