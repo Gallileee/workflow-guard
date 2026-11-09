@@ -29,6 +29,7 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`, or a `refs/pull/...` ref) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
 | WG007 | untrusted-github-env | high (medium for a composite action's inputs) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
+| WG008 | secrets-exposure | medium; high for `toJSON(secrets)` | `${{ secrets.X }}` pasted into `run:` or a github-script: the secret becomes part of the script text, quotes or `$` in it break the script, and `set -x`, an error message or a process listing can show it (GitHub's log masking only catches exact matches). Pass it through `env:` and use `"$X"`. Also `toJSON(secrets)` anywhere (every secret in one value) and `secrets: inherit` on a reusable workflow from another repository (all secrets handed to code that lives elsewhere). Passing a secret to an action's `with:` is fine. |
 
 ### Actions too
 
@@ -274,7 +275,7 @@ be read or parsed, or bad arguments.
 ```
 src/workflow_guard/
   workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
-  rules.py     the seven rules
+  rules.py     the eight rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
   taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
   writes.py    what a script or github-script writes to $GITHUB_OUTPUT / ENV / PATH

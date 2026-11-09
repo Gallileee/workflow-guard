@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from yaml.nodes import Node, ScalarNode
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from .expressions import (
     ContextPath,
@@ -214,6 +214,88 @@ def untrusted_github_env(wf: Workflow) -> Iterator[Finding]:
             )
 
 
+# --- WG008 secrets exposure --------------------------------------------------------------------
+
+
+def _scalars(node: Node | None) -> Iterator[ScalarNode]:
+    """Every scalar value under ``node`` (mapping keys excluded)."""
+    if isinstance(node, ScalarNode):
+        yield node
+    elif isinstance(node, MappingNode):
+        for _key, value in node.value:
+            yield from _scalars(value)
+    elif isinstance(node, SequenceNode):
+        for item in node.value:
+            yield from _scalars(item)
+
+
+def _expression_offset(node: ScalarNode, start: int) -> int:
+    offset = node.value.count("\n", 0, start)
+    return offset + 1 if node.style in ("|", ">") else offset
+
+
+def _is_all_secrets(path: ContextPath) -> bool:
+    return path.segments == ("secrets",) and path.function == "tojson"
+
+
+def secrets_exposure(wf: Workflow) -> Iterator[Finding]:
+    # toJSON(secrets): every secret of the repository in one value, wherever it is used.
+    for node in _scalars(wf.root):
+        for expr in find_expressions(node.value):
+            if any(_is_all_secrets(path) for path in _paths(expr)):
+                yield _at(
+                    wf,
+                    node,
+                    "WG008",
+                    Severity.HIGH,
+                    "toJSON(secrets) puts every secret of the repository into one value; a single"
+                    " log line, artifact or compromised step then leaks all of them. Pass only the"
+                    " secrets this step needs, one by one",
+                    line_offset=_expression_offset(node, expr.start),
+                )
+
+    # ${{ secrets.X }} pasted into a script.
+    for step in wf.steps():
+        targets = [get(step.node, "run")]
+        if (step.uses or "").startswith("actions/github-script@"):
+            targets.append(get(get(step.node, "with"), "script"))
+        for node in targets:
+            if not isinstance(node, ScalarNode):
+                continue
+            for expr in find_expressions(node.value):
+                path = next(
+                    (p for p in _paths(expr) if p.segments[0] == "secrets" and not _is_all_secrets(p)),
+                    None,
+                )
+                if path is None:
+                    continue
+                name = str(path) if len(path.segments) > 1 else "secrets[...]"
+                yield _at(
+                    wf,
+                    node,
+                    "WG008",
+                    Severity.MEDIUM,
+                    f"'{name}' is pasted into the script text: quotes or '$' in the secret break the"
+                    " script, and 'set -x', an error message or a process listing can show it."
+                    f" Pass it through 'env:' and use the variable instead",
+                    line_offset=_expression_offset(node, expr.start),
+                )
+
+    # secrets: inherit to a reusable workflow in another repository.
+    for job_id, job in wf.jobs():
+        uses = scalar(get(job, "uses")) or ""
+        if not uses or uses.startswith("./") or scalar(get(job, "secrets")) != "inherit":
+            continue
+        yield _at(
+            wf,
+            get(job, "secrets") or job,
+            "WG008",
+            Severity.MEDIUM,
+            f"job '{job_id}' passes all of this repository's secrets ('secrets: inherit') to"
+            f" '{uses}', a workflow in another repository; list the secrets it needs instead",
+        )
+
+
 def _paths(expr: Expression) -> list[ContextPath]:
     try:
         return context_paths(expr.inner)
@@ -365,6 +447,18 @@ RULES: tuple[Rule, ...] = (
             "with a line break such as 'x\\nBASH_ENV=/tmp/evil.sh' then sets a variable that makes "
             "bash run the sender's script; $GITHUB_PATH can put their directory first in PATH. "
             "Pass the value to the step that needs it through env: or a step output instead."
+        ),
+    ),
+    Rule(
+        "WG008",
+        "secrets-exposure",
+        "Secrets pasted into scripts, toJSON(secrets), or 'secrets: inherit' to another repository",
+        secrets_exposure,
+        help=(
+            "${{ secrets.X }} inside run: becomes part of the script text, where quotes break it and "
+            'logs or process listings can show it; pass it through env: and use "$X". '
+            "toJSON(secrets) and 'secrets: inherit' to a reusable workflow in another repository "
+            "hand out every secret at once; pass only the ones needed."
         ),
     ),
 )

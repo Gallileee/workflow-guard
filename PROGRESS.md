@@ -1,5 +1,32 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 11, WG008 secrets exposure
+
+Why: next step 3, picked by the owner after the releases were published. Secrets are what an
+attacker wants from a workflow, and three mistakes hand them out without any injection: pasting
+`${{ secrets.X }}` into a script, `toJSON(secrets)`, and `secrets: inherit` to a workflow in
+another repository.
+
+Acceptance criteria:
+- `${{ secrets.X }}` (any spelling the expression reader knows, computed names too) inside `run:`
+  or a github-script: medium, on the expression's line.
+- `toJSON(secrets)` anywhere in the file: high, reported once (not also as the script case).
+- `secrets: inherit` on `jobs.<id>.uses` that isn't `./...`: medium.
+- Secrets in `env:` or an action's `with:`, and listed `secrets:` for reusable workflows: fine.
+
+Done:
+- `rules.py`: WG008 `secrets-exposure` (`secrets_exposure`), with helpers `_scalars` (every scalar
+  value in the file) and `_expression_offset`.
+- Tests: `test_wg008.py` (18), rule count in `test_cli.py`. 250 in total. Version 0.11.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 250 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: treating `./` reusable workflows like remote ones, reporting `toJSON(secrets)`
+  twice, or not recognising it at all each fail tests (1, 1, 3).
+- Real data: GaTe-parking's release.yml passes `secrets.GITHUB_TOKEN` through `env:` and an
+  action's `with: password:`; neither is reported. workflow-guard, lendloop,
+  fitness-workout-log: 0 findings.
+
 ## 2026-11-09 (interactive): Milestone 10, multi-line writes and github-script
 
 Why: next step 2, picked by the owner. The tracker from milestones 8 and 9 only understood
@@ -354,8 +381,8 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.10.0` after the merge; Dependabot then offers the update in lendloop and
-   fitness-workout-log (their `# v0.9.0` pins).
-2. A GitHub Release with notes for v0.4.0 to v0.10.0, and later the Marketplace listing.
-3. A rule for secrets: `${{ secrets.X }}` pasted into `run:`, and `secrets: inherit` to a
-   reusable workflow from another repository.
+1. Tag `v0.11.0` after the merge and publish its release (notes drafted for approval in
+   `prVSCode/workflow-guard-v0.11.0-release-notes-DRAFT.md`).
+2. Bring lendloop and fitness-workout-log to the latest version (their `# v0.9.0` pins).
+3. A CHANGELOG.md in the repository with the same content as the releases.
+4. The Marketplace listing (needs the owner: it's a public listing under their account).
