@@ -260,6 +260,11 @@ be read or parsed, or bad arguments.
   ```
 
   `"$TITLE"` in the script stays fine: the shell reads the variable, nothing is pasted.
+- The writes themselves are read by `writes.py`: single `>> $GITHUB_*` lines, `{ ... } >>`
+  groups (on one line or several), `cat <<EOF >> $GITHUB_*` shell heredocs, and multi-line
+  values (`name<<DELIM`, the lines, `DELIM`), also when every line has its own `>>`. In
+  `actions/github-script`, `core.setOutput`, `core.exportVariable` and `core.addPath` count
+  too, with `context.payload.*` read as `github.event.*` and `process.env.NAME` as the variable.
   For `run: |` blocks the line of the expression itself is reported, not the `run:` line.
 - `--format github` prints [workflow commands](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands).
   Messages and properties are percent-encoded the way the runner expects (`%`, `\r`, `\n`, and
@@ -271,7 +276,8 @@ src/workflow_guard/
   workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the seven rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
-  taint.py     WG004's tracker: untrusted values through env:, $GITHUB_ENV/OUTPUT, job outputs
+  taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
+  writes.py    what a script or github-script writes to $GITHUB_OUTPUT / ENV / PATH
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
   annotations.py --format github: workflow commands, with GitHub's escaping
@@ -299,10 +305,11 @@ Ubuntu and Windows.
 - The expression reader only extracts property paths; it doesn't evaluate expressions or check
   operator precedence. A computed key (`github.event[matrix.field].title`) can't be resolved,
   so it isn't reported.
-- The detour tracking (WG004, WG007) reads `>> $GITHUB_*` writes one line at a time: multi-line
-  values (`name<<EOF` heredocs), `{ ...; } >> $GITHUB_OUTPUT` groups, `tee`, other shells' syntax
-  and outputs set by actions (e.g. github-script's `core.setOutput`) aren't followed. Neither
-  are outputs of reusable workflows or composite actions as seen by their callers.
+- The write reader (`writes.py`) matches common shell patterns; it isn't a shell parser.
+  `tee -a $GITHUB_OUTPUT`, writes inside functions or loops, variables holding the file name,
+  PowerShell/Python `shell:` steps, and github-script calls spread over several lines aren't
+  followed. Neither are outputs of other actions, reusable workflows or composite actions as
+  seen by their callers.
 - The inside of called reusable workflows and of remote actions (`uses: owner/repo@sha`)
   isn't checked; only files in the repository being checked are.
 - `.github/actions` is searched for `action.yml` at any depth, but other places for local

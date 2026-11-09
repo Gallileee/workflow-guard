@@ -1,5 +1,40 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 10, multi-line writes and github-script
+
+Why: next step 2, picked by the owner. The tracker from milestones 8 and 9 only understood
+`echo "name=value" >> "$GITHUB_..."` on one line. GitHub's own docs show multi-line values
+(`name<<EOF`) written from a `{ ... } >> "$GITHUB_OUTPUT"` group, which is exactly how issue and
+PR bodies (always multi-line) get passed on, and github-script steps set outputs with
+`core.setOutput`. Both were invisible to WG004 and WG007.
+
+Acceptance criteria:
+- Groups (several lines or one), `cat <<EOF >> $GITHUB_*` heredocs and `name<<DELIM` blocks
+  (also with `>>` on every line) are read as the values the runner sees.
+- `core.setOutput` / `exportVariable` / `addPath` in github-script feed outputs, env and WG007,
+  with `context.payload.*` = `github.event.*` and `process.env.X` = the env variable.
+- WG007 reports the line inside the block or script that carries the untrusted text.
+- All earlier tests pass unchanged; no new findings on the real repositories.
+
+Done:
+- `writes.py` (new, no YAML or taint inside): `shell_writes` -> `Write` (line, file, shell text,
+  written text), `assignments` (one-line and multi-line values per file; an unclosed block runs
+  to the end), `github_script_calls`, `payload` (drops echo/printf and quotes).
+- `taint.py`: `_apply_shell_writes` and `_apply_script_calls` replace the two line regexes;
+  `_taint_of_js` for github-script values; `FileWrite.key` says which script a line is in.
+- `rules.py`: WG007 points into `with.script` for github-script findings.
+- Tests: `test_writes.py` (19). 232 in total. Version 0.10.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 232 passed. `ruff check`, `ruff format --check`: clean. The 213 earlier
+  tests passed on the new reader before any new test was added.
+- Mutation checks: without groups 2 tests fail, without `name<<DELIM` blocks 7, without
+  `context.payload` 2.
+- Real data: GaTe-parking's pr-title.yml (PR title in `env:`, `valid=true/false` and `id=$id`
+  outputs, a `cat > help.md <<'EOF'` to an ordinary file) and release.yml (`VERSION` from the tag
+  into `$GITHUB_ENV`): the tracker sees `PR_TITLE` as tainted, everything written as clean, and
+  reports nothing. workflow-guard, lendloop, fitness-workout-log: 0 findings.
+
 ## 2026-11-09 (interactive): Milestone 9, WG007 untrusted text in $GITHUB_ENV / $GITHUB_PATH
 
 Why: next step 2, picked by the owner. `echo "T=$TITLE" >> "$GITHUB_ENV"` has no `${{ }}` in the
@@ -319,8 +354,8 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.9.0` after the merge; Dependabot then offers the update in lendloop and
-   fitness-workout-log (their `# v0.7.0` pins).
-2. Follow multi-line `name<<EOF` writes and github-script's `core.setOutput` / `exportVariable`
-   (both WG004 and WG007 would gain from it).
-3. A GitHub Release with notes, and later the Marketplace listing.
+1. Tag `v0.10.0` after the merge; Dependabot then offers the update in lendloop and
+   fitness-workout-log (their `# v0.9.0` pins).
+2. A GitHub Release with notes for v0.4.0 to v0.10.0, and later the Marketplace listing.
+3. A rule for secrets: `${{ secrets.X }}` pasted into `run:`, and `secrets: inherit` to a
+   reusable workflow from another repository.

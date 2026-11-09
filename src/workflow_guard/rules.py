@@ -193,10 +193,13 @@ _FILE_EFFECT = {
 
 def untrusted_github_env(wf: Workflow) -> Iterator[Finding]:
     for tracked in Tracker(wf).steps():
-        node = get(tracked.step.node, "run")
-        if not isinstance(node, ScalarNode):
-            continue
         for write in tracked.writes:
+            if write.key == "run":
+                node = get(tracked.step.node, "run")
+            else:
+                node = get(get(tracked.step.node, "with"), "script")
+            if not isinstance(node, ScalarNode):
+                continue
             target, effect = _FILE_EFFECT[write.file]
             via = f" (via {' -> '.join(write.taint.via)})" if write.taint.via else ""
             offset = write.line + (1 if node.style in ("|", ">") else 0)
