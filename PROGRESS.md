@@ -44,8 +44,12 @@ Verified locally (Python 3.14 venv, Git Bash):
 - `workflow-guard` on its own changed workflow: 0 findings.
 
 Not verified locally: the `action` job on real runners (Linux and Windows) and setup-python's
-`python-path` output; see the PR's checks. The pre-commit hook is only tested by
-`pre-commit try-repo` (see the PR description for the result).
+`python-path` output; see the PR's checks.
+
+Pre-commit, checked with `pre-commit try-repo <this repo> workflow-guard --all-files`
+(pre-commit 4 in a scratch venv): lendloop passed; a scratch repository with the unsafe fixture
+as `.github/workflows/bad.yml` and a `.github/dependabot.yml` failed with the 4 findings, and only
+1 file was checked, so the `files` pattern works.
 
 ## 2026-11-08 (scheduled run): Milestone 3, SARIF output for GitHub code scanning
 
@@ -159,7 +163,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 ## Next steps (in order)
 
 1. Tag `v0.4.0` after the merge, so `uses: Gallileee/workflow-guard@v0.4.0` and `rev: v0.4.0`
-   work, then use the action in lendloop or fitness-workout-log instead of nothing.
+   work, then use the action in lendloop and fitness-workout-log.
 2. Parse `${{ }}` expressions properly (bracket syntax) instead of regex matching.
 3. Check composite actions (`action.yml`): WG001 and WG004 apply to their steps too, and this
    repository's own action could then be checked by CI instead of by a test.
