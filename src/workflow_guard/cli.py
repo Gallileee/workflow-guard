@@ -23,6 +23,18 @@ from .sarif import to_sarif
 from .workflow import Workflow, WorkflowError
 
 DEFAULT_DIR = Path(".github") / "workflows"
+LOCAL_ACTIONS_DIR = Path(".github") / "actions"
+ACTION_FILES = ("action.yml", "action.yaml")
+
+
+def default_paths() -> list[Path]:
+    """What runs without arguments: the workflows, an action at the repository root (a
+    repository that *is* an action), and local actions under .github/actions/<name>/."""
+    paths = [DEFAULT_DIR]
+    paths += [Path(name) for name in ACTION_FILES if Path(name).is_file()]
+    if LOCAL_ACTIONS_DIR.is_dir():
+        paths += sorted(p for p in LOCAL_ACTIONS_DIR.rglob("action.y*ml") if p.name in ACTION_FILES)
+    return paths
 
 
 def find_workflows(paths: Sequence[Path]) -> list[Path]:
@@ -58,7 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Find common security mistakes in GitHub Actions workflows.",
     )
     parser.add_argument(
-        "paths", nargs="*", type=Path, help=f"workflow files or directories (default: {DEFAULT_DIR})"
+        "paths",
+        nargs="*",
+        type=Path,
+        help=f"workflow or action.yml files, or directories (default: {DEFAULT_DIR.as_posix()}, "
+        "action.yml and .github/actions/*/action.yml)",
     )
     parser.add_argument(
         "--format",
@@ -147,7 +163,7 @@ def run(
             print(f"{rule.id}  {rule.name:<22} {rule.summary}", file=out)
         return 0
 
-    paths = args.paths or [DEFAULT_DIR]
+    paths = args.paths or default_paths()
     missing = [p for p in paths if not p.exists()]
     if missing and args.paths:
         for p in missing:
@@ -155,7 +171,8 @@ def run(
         return 2
     files = find_workflows([p for p in paths if p.exists()])
     if not files:
-        print(f"workflow-guard: no workflow files found in {', '.join(map(str, paths))}", file=err)
+        shown = ", ".join(p.as_posix() for p in paths)
+        print(f"workflow-guard: no workflow files found in {shown}", file=err)
         return 2
 
     findings: list[Finding] = []
