@@ -1,5 +1,31 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 9, WG007 untrusted text in $GITHUB_ENV / $GITHUB_PATH
+
+Why: next step 2, picked by the owner. `echo "T=$TITLE" >> "$GITHUB_ENV"` has no `${{ }}` in the
+script, so WG004 is silent, yet a title with a line break sets any variable for the later steps
+(`BASH_ENV`, `LD_PRELOAD`, `NODE_OPTIONS`), which runs the sender's code. GitHub's own hardening
+guide warns about exactly this. The tracker from milestone 8 already knows which shell variables
+are tainted, so the rule is small.
+
+Acceptance criteria:
+- A `run:` line that appends tainted text to `$GITHUB_ENV` or `$GITHUB_PATH` is reported on that
+  line, whether the text comes from an expression, `env:` or an earlier `$GITHUB_ENV` write, and
+  also without a literal `NAME=` (`echo "$LINE" >> $GITHUB_ENV`).
+- Runner variables (`$GITHUB_SHA`), `$GITHUB_OUTPUT`, plain files and numbers aren't reported.
+- Composite action inputs: medium. Inline ignores and SARIF work like for the other rules.
+
+Done:
+- `taint.py`: `FileWrite` and `TrackedStep.writes`, filled by `_file_writes` (any line with
+  `>> $GITHUB_ENV|PATH`; the text before `>>` is checked).
+- `rules.py`: WG007 `untrusted-github-env` with summary and help; `_origin` shared with WG004.
+- Tests: `test_wg007.py` (15), the rule count in `test_cli.py`. 213 in total. Version 0.9.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 213 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation check: without `PATH` in the write pattern, the `$GITHUB_PATH` test fails.
+- No new findings on workflow-guard, lendloop, fitness-workout-log, GaTe-parking.
+
 ## 2026-11-09 (interactive): Milestone 8, following untrusted values through detours (WG004)
 
 Why: next step 2, picked by the owner. Since v0.6.0 WG004 reads expressions properly, but only
@@ -293,9 +319,8 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.8.0` after the merge; Dependabot then offers the update in lendloop and
+1. Tag `v0.9.0` after the merge; Dependabot then offers the update in lendloop and
    fitness-workout-log (their `# v0.7.0` pins).
-2. WG007: untrusted text written to `$GITHUB_ENV` (it can set `LD_PRELOAD`, `BASH_ENV` and the
-   like for every later step), reusing the tracker.
-3. Follow multi-line `name<<EOF` writes and github-script's `core.setOutput` / `exportVariable`.
-4. A GitHub Release with notes, and later the Marketplace listing.
+2. Follow multi-line `name<<EOF` writes and github-script's `core.setOutput` / `exportVariable`
+   (both WG004 and WG007 would gain from it).
+3. A GitHub Release with notes, and later the Marketplace listing.

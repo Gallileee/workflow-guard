@@ -134,11 +134,7 @@ def _injection_message(path: ContextPath, taint: Taint) -> str:
             )
         return f"'{taint.source}' can be set by outsiders and is pasted into a script; {_ADVICE}"
 
-    origin = {
-        OUTSIDER: f"'{taint.source}', which outsiders can set",
-        TOJSON: f"toJSON({taint.source}), which includes values outsiders can set",
-        INPUT: f"'{taint.source}' from the calling workflow, which may be untrusted",
-    }[taint.kind]
+    origin = _origin(taint)
     if path.segments[0] == "env":
         # The variable is already in the environment: the shell can read it without pasting.
         name = taint.via[-1].split(" ", 1)[0].removeprefix("env.").removeprefix("$")
@@ -169,6 +165,50 @@ def template_injection(wf: Workflow) -> Iterator[Finding]:
                 yield _at(
                     wf, node, "WG004", taint.severity, _injection_message(path, taint), line_offset=offset
                 )
+
+
+# --- WG007 untrusted text in $GITHUB_ENV / $GITHUB_PATH ----------------------------------------
+
+
+def _origin(taint: Taint) -> str:
+    return {
+        OUTSIDER: f"'{taint.source}', which outsiders can set",
+        TOJSON: f"toJSON({taint.source}), which includes values outsiders can set",
+        INPUT: f"'{taint.source}' from the calling workflow, which may be untrusted",
+    }[taint.kind]
+
+
+_FILE_EFFECT = {
+    "ENV": (
+        "$GITHUB_ENV",
+        "a line break in it can set any variable for the later steps (BASH_ENV, LD_PRELOAD,"
+        " NODE_OPTIONS...), which runs code of the sender's choosing",
+    ),
+    "PATH": (
+        "$GITHUB_PATH",
+        "it can put a directory of the sender's choosing first in PATH for the later steps",
+    ),
+}
+
+
+def untrusted_github_env(wf: Workflow) -> Iterator[Finding]:
+    for tracked in Tracker(wf).steps():
+        node = get(tracked.step.node, "run")
+        if not isinstance(node, ScalarNode):
+            continue
+        for write in tracked.writes:
+            target, effect = _FILE_EFFECT[write.file]
+            via = f" (via {' -> '.join(write.taint.via)})" if write.taint.via else ""
+            offset = write.line + (1 if node.style in ("|", ">") else 0)
+            yield _at(
+                wf,
+                node,
+                "WG007",
+                write.taint.severity,
+                f"{_origin(write.taint)}{via} is written to {target}; {effect}."
+                " Keep it in a step output or a file instead",
+                line_offset=offset,
+            )
 
 
 def _paths(expr: Expression) -> list[ContextPath]:
@@ -310,6 +350,18 @@ RULES: tuple[Rule, ...] = (
         help=(
             "actions/checkout stores the token in .git/config, where every later step (and anything "
             "it downloads) can read it. Set persist-credentials: false unless a step pushes."
+        ),
+    ),
+    Rule(
+        "WG007",
+        "untrusted-github-env",
+        "Untrusted text written to $GITHUB_ENV or $GITHUB_PATH",
+        untrusted_github_env,
+        help=(
+            "Every later step of the job reads $GITHUB_ENV and $GITHUB_PATH. A pull request title "
+            "with a line break such as 'x\\nBASH_ENV=/tmp/evil.sh' then sets a variable that makes "
+            "bash run the sender's script; $GITHUB_PATH can put their directory first in PATH. "
+            "Pass the value to the step that needs it through env: or a step output instead."
         ),
     ),
 )
