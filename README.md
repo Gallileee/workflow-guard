@@ -163,6 +163,14 @@ To accept a finding on one line, add a comment there:
 
 - Only the `uses:` value and the end of its line change. Comments, quotes, indentation and
   Windows line endings stay as they were; an existing comment becomes `# v7; old comment`.
+- The new comment follows the file's style, so a formatter check doesn't fail afterwards.
+  Prettier writes one space before `#` (`@<sha> # v7`), yamllint wants two (`@<sha>  # v7`).
+  In this order:
+  1. `--comment-spaces N`, if given;
+  2. the gap the file's own end-of-line comments use most (a tie goes to two spaces);
+  3. one space if the repository uses Prettier (a `.prettierrc*` / `prettier.config.*` file,
+     or `prettier` in `package.json`), found by walking up to the folder with `.git`;
+  4. two spaces.
 - The version stays in the comment, so Dependabot and Renovate can keep updating pinned actions.
 - It uses `GET /repos/{owner}/{repo}/commits/{ref}` with the `application/vnd.github.sha` media
   type, which answers with just the SHA. Lookups are cached per run.
@@ -248,7 +256,7 @@ src/workflow_guard/
   workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the six rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
-  fix.py       --fix: GitHubResolver (API lookups) and pin_actions (text edits)
+  fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
   annotations.py --format github: workflow commands, with GitHub's escaping
   model.py     Finding, Severity
@@ -290,6 +298,8 @@ Ubuntu and Windows.
 - `--fix` only fixes WG001. The other rules need a human decision (which permissions a job needs).
 - The SARIF output isn't checked against the JSON schema in CI (it was checked by hand, see
   PROGRESS.md); the tests check the fields GitHub requires.
+- The comment style is a heuristic: a `#` after whitespace inside a quoted string counts as a
+  comment, and a `.prettierignore` that excludes `.github/` isn't read (use `--comment-spaces`).
 - `--fix` doesn't look into GitHub Enterprise Server (the API URL is fixed to api.github.com).
 
 ## Next steps
