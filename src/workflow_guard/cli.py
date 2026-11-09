@@ -16,7 +16,7 @@ from typing import TextIO
 
 from . import __version__
 from .annotations import to_annotations
-from .fix import GitHubResolver, Resolver, pin_actions
+from .fix import GitHubResolver, Resolver, fallback_gap, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
 from .sarif import to_sarif
@@ -62,6 +62,16 @@ def _severity(text: str) -> Severity:
         return Severity.parse(text)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _comment_spaces(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= 8:
+        raise argparse.ArgumentTypeError(f"expected a number from 1 to 8, got {text!r}")
+    return n
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,12 +126,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin actions to the commit SHA of their tag (WG001), via the GitHub API; "
         "uses GITHUB_TOKEN or GH_TOKEN if set. Rewrites the files in place",
     )
+    parser.add_argument(
+        "--comment-spaces",
+        type=_comment_spaces,
+        metavar="N",
+        help="with --fix: spaces before the added '# v4' comment (default: what the file's "
+        "comments already use; without any, 1 if the repository uses Prettier, else 2)",
+    )
     parser.add_argument("--list-rules", action="store_true", help="print the rules and exit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
-def _load(path: Path, fix: Resolver | None, err: TextIO) -> Workflow:
+def _load(path: Path, fix: Resolver | None, err: TextIO, gap: str | None = None) -> Workflow:
     """Read one workflow; with a resolver, pin its actions first and save the file."""
     display = path.as_posix()
     if fix is None:
@@ -132,7 +149,7 @@ def _load(path: Path, fix: Resolver | None, err: TextIO) -> Workflow:
             text = fh.read()
     except (OSError, UnicodeDecodeError) as e:
         raise WorkflowError(f"cannot read: {e}") from e
-    result = pin_actions(text, fix, display)
+    result = pin_actions(text, fix, display, gap, fallback_gap(path))
     for pin in result.pinned:
         print(f"{display}:{pin.line}: pinned {pin.old} -> {pin.new}", file=err)
     for line, uses, reason in result.failed:
@@ -175,11 +192,12 @@ def run(
         print(f"workflow-guard: no workflow files found in {shown}", file=err)
         return 2
 
+    gap = " " * args.comment_spaces if args.comment_spaces else None
     findings: list[Finding] = []
     errors: list[tuple[str, str]] = []
     for f in files:
         try:
-            wf = _load(f, fixer, err)
+            wf = _load(f, fixer, err, gap)
         except WorkflowError as e:
             print(f"{f.as_posix()}: error: {e}", file=err)
             errors.append((f.as_posix(), str(e)))

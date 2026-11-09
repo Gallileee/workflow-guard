@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -99,6 +101,79 @@ def _explain(e: HTTPError, repo: str, ref: str) -> str:
     return f"GitHub API error {e.code} for {repo}@{ref}; try again later"
 
 
+DEFAULT_COMMENT_GAP = "  "
+"""Two spaces before ``#``: what yamllint (and PEP 8) expect, used when a file shows no habit."""
+PRETTIER_COMMENT_GAP = " "
+"""Prettier rewrites every end-of-line comment in YAML to one space before ``#``."""
+
+# An end-of-line comment: something that isn't blank, whitespace, then "#" followed by a space or
+# the end of the line. YAML only starts a comment at a "#" after whitespace, so "a#b" isn't one.
+_INLINE_COMMENT = re.compile(r"\S([ \t]+)#(?=[ \t\r]|$)", re.M)
+
+
+def comment_gap(text: str, fallback: str = DEFAULT_COMMENT_GAP) -> str:
+    """The whitespace this file usually puts before an end-of-line comment.
+
+    Prettier formats YAML with one space (``uses: x@sha # v4``), yamllint wants two; rewriting a
+    file in the other style makes its formatter check fail. So the most common gap among the
+    file's own comments wins (a tie goes to two spaces). A file without such comments gets
+    ``fallback``.
+    """
+    counts = Counter(m.group(1) for m in _INLINE_COMMENT.finditer(text))
+    if not counts:
+        return fallback
+    return max(counts, key=lambda gap: (counts[gap], gap == DEFAULT_COMMENT_GAP))
+
+
+_PRETTIER_CONFIGS = (
+    ".prettierrc",
+    ".prettierrc.json",
+    ".prettierrc.json5",
+    ".prettierrc.yaml",
+    ".prettierrc.yml",
+    ".prettierrc.toml",
+    ".prettierrc.js",
+    ".prettierrc.cjs",
+    ".prettierrc.mjs",
+    ".prettierrc.ts",
+    "prettier.config.js",
+    "prettier.config.cjs",
+    "prettier.config.mjs",
+    "prettier.config.ts",
+)
+
+
+def repository_root(file: Path) -> Path | None:
+    """The nearest directory above ``file`` that holds ``.git`` (a folder, or a file in a
+    worktree), or None outside a repository."""
+    for directory in file.resolve().parents:
+        if (directory / ".git").exists():
+            return directory
+    return None
+
+
+def uses_prettier(root: Path) -> bool:
+    """True if the repository has a Prettier config file, or Prettier in package.json (as a
+    dependency or a ``"prettier"`` key)."""
+    if any((root / name).is_file() for name in _PRETTIER_CONFIGS):
+        return True
+    try:
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(package, dict):
+        return False
+    sections = [package, package.get("dependencies"), package.get("devDependencies")]
+    return any(isinstance(section, dict) and "prettier" in section for section in sections)
+
+
+def fallback_gap(file: Path) -> str:
+    """The gap for a file without end-of-line comments of its own: Prettier's one space if its
+    repository uses Prettier, else two."""
+    root = repository_root(file)
+    return PRETTIER_COMMENT_GAP if root is not None and uses_prettier(root) else DEFAULT_COMMENT_GAP
+
+
 @dataclass(frozen=True)
 class Pin:
     line: int
@@ -113,9 +188,20 @@ class FixResult:
     failed: list[tuple[int, str, str]] = field(default_factory=list)  # (line, uses, reason)
 
 
-def pin_actions(text: str, resolver: Resolver, path: str = "<string>") -> FixResult:
-    """Pin every ``owner/repo@tag`` in one workflow's text. Raises WorkflowError if it isn't one."""
+def pin_actions(
+    text: str,
+    resolver: Resolver,
+    path: str = "<string>",
+    gap: str | None = None,
+    fallback: str = DEFAULT_COMMENT_GAP,
+) -> FixResult:
+    """Pin every ``owner/repo@tag`` in one workflow's text. Raises WorkflowError if it isn't one.
+
+    ``gap`` is the whitespace written before a new ``# v4`` comment. By default it is the
+    file's own habit (``comment_gap``), or ``fallback`` if the file has no end-of-line comments."""
     wf = Workflow.parse(text, path)
+    if gap is None:
+        gap = comment_gap(text, fallback)
     result = FixResult(text)
     nodes = [n for n in wf.uses_nodes() if isinstance(n, ScalarNode)]
     lines_with_uses = [n.start_mark.line for n in nodes]
@@ -142,7 +228,7 @@ def pin_actions(text: str, resolver: Resolver, path: str = "<string>") -> FixRes
 
         # Keep the version readable in a comment, unless two uses share the line (flow style).
         if lines_with_uses.count(node.start_mark.line) == 1:
-            edits.append(_comment_edit(text, end, match["ref"]))
+            edits.append(_comment_edit(text, end, match["ref"], gap))
         result.pinned.append(Pin(line, node.value, new_value))
 
     out = text
@@ -152,8 +238,8 @@ def pin_actions(text: str, resolver: Resolver, path: str = "<string>") -> FixRes
     return result
 
 
-def _comment_edit(text: str, after: int, version: str) -> tuple[int, int, str]:
-    """``  # v4`` at the end of the line, or ``# v4; existing comment`` if it has one."""
+def _comment_edit(text: str, after: int, version: str, gap: str) -> tuple[int, int, str]:
+    """``<gap># v4`` at the end of the line, or ``# v4; existing comment`` if it has one."""
     line_end = text.find("\n", after)
     if line_end == -1:
         line_end = len(text)
@@ -161,7 +247,7 @@ def _comment_edit(text: str, after: int, version: str) -> tuple[int, int, str]:
         line_end -= 1
     hash_at = text.find("#", after, line_end)
     if hash_at == -1:
-        return (line_end, line_end, f"  # {version}")
+        return (line_end, line_end, f"{gap}# {version}")
     body = hash_at + 1
     while body < line_end and text[body] == " ":
         body += 1

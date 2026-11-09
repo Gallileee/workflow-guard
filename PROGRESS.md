@@ -1,5 +1,39 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 7, `--fix` matches the comment style
+
+Why: next step 2, picked by the owner. In GaTe-parking (a team repository that runs
+`prettier --check .`), every `--fix` needed a `prettier --write .github/` afterwards, because
+`--fix` always wrote two spaces before `# v7` and Prettier wants one.
+
+Acceptance criteria:
+- A file whose comments use one space gets one space; two gets two.
+- A file with no end-of-line comments in a Prettier repository gets one space.
+- `--comment-spaces N` overrides everything; 1 to 8, anything else is a usage error.
+- On GaTe-parking's real workflows, unpinning and re-pinning gives the original bytes back, and
+  Prettier's own check passes.
+
+Done:
+- `fix.py`: `comment_gap(text, fallback)` (most common whitespace before an end-of-line `#`, tie
+  to two spaces), `repository_root`, `uses_prettier` (config files, or `prettier` in
+  package.json at the top level / dependencies / devDependencies; `eslint-config-prettier`
+  alone doesn't count), `fallback_gap(path)`. `pin_actions` takes `gap` and `fallback`.
+- CLI: `--comment-spaces N`; `--fix` passes the file's repository fallback.
+- Tests: 27 new in `test_fix.py` (gap detection, Prettier detection, repository root with a
+  worktree `.git` file, the order of the four sources, the option's validation). One existing
+  expectation changed on purpose: a file whose only comment uses three spaces now gets three.
+  177 in total. Version 0.7.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 177 passed. `ruff check`, `ruff format --check`: clean.
+- GaTe-parking `origin/main` workflows (5 files, Prettier style), copied to a scratch folder
+  with its real package.json and a `.git` marker, re-pinned against the real API:
+  - all 20 pins removed: `--fix` restored them byte for byte (via the Prettier fallback);
+  - only the 8 checkout pins removed: byte for byte again, and `npx prettier@3.6.2 --check`
+    passes. Without package.json, `no-ai-attribution.yml` (no other comment) got two spaces,
+    as designed.
+  - Before this change the same round trip gave 20 differing lines and a failing Prettier check.
+
 ## 2026-11-09 (interactive): Milestone 6, a real expression reader
 
 Why: next step 2, picked by the owner. WG004 and WG005 used regular expressions on the raw
@@ -225,9 +259,8 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.6.0` after the merge; Dependabot then offers the update in lendloop and
+1. Tag `v0.7.0` after the merge; Dependabot then offers the update in lendloop and
    fitness-workout-log (their `# v0.4.0` pins).
-2. `--fix`: match the file's comment style (one space before `# v7` where Prettier wants it).
-3. Follow values through `env:` at job/workflow level into `run:` (`${{ env.TITLE }}` where
+2. Follow values through `env:` at job/workflow level into `run:` (`${{ env.TITLE }}` where
    `TITLE` was set from a PR title) and through step outputs.
-4. A GitHub Release with notes, and later the Marketplace listing.
+3. A GitHub Release with notes, and later the Marketplace listing.
