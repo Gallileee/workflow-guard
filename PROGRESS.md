@@ -1,5 +1,36 @@
 # Progress log
 
+## 2026-11-09 (interactive): Milestone 6, a real expression reader
+
+Why: next step 2, picked by the owner. WG004 and WG005 used regular expressions on the raw
+text, which GitHub's expression syntax easily slips past (`github.event['pull_request']['title']`,
+upper case, `toJSON(github.event)`), and which flagged text that only looks like a context
+(`'github.head_ref'` as a string literal).
+
+Acceptance criteria:
+- Bracket syntax, any letter case and array indexes resolve to the same path as dot syntax.
+- String literals are not contexts; `}}` inside a string doesn't end an expression.
+- `toJSON()` of an object that contains an untrusted field is reported.
+- WG005 sees the same spellings in `ref:`, plus `refs/pull/...` refs.
+- No change on the real repositories (lendloop, fitness-workout-log, GaTe-parking).
+
+Done:
+- `expressions.py`: `find_expressions` (string-aware search for `${{ }}`), `tokenize` (names,
+  strings with `''` escapes, numbers, operators, punctuation; `ExpressionError` for anything
+  else), `context_paths` (lower-cased paths, `*` for array elements, the innermost function
+  each path is an argument of), `matches` / `is_ancestor` for comparing with patterns.
+- `rules.py`: the untrusted contexts are now a list of path patterns instead of one regex.
+  WG004 reports per expression (first hit); an expression GitHub would reject is skipped,
+  later ones are still checked. WG005 uses the same reader, and `refs/pull/` counts as PR code.
+- Tests: `test_expressions.py` (40: lexer, paths, 8 former bypasses, 7 former false positives,
+  WG005 spellings). 150 in total. Version 0.6.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 150 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation check: without lower-casing path names, 3 tests fail.
+- `workflow-guard` here 0 findings; lendloop, fitness-workout-log and GaTe-parking report the
+  same as before.
+
 ## 2026-11-09 (interactive): Milestone 5, composite and Docker actions
 
 Why: next step 3, picked by the owner after the v0.4.0 action went into lendloop (#23) and
@@ -194,8 +225,9 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.5.0` after the merge; Dependabot then offers the update in lendloop and
+1. Tag `v0.6.0` after the merge; Dependabot then offers the update in lendloop and
    fitness-workout-log (their `# v0.4.0` pins).
-2. Parse `${{ }}` expressions properly (bracket syntax) instead of regex matching.
-3. `--fix`: match the file's comment style (one space before `# v7` where Prettier wants it).
+2. `--fix`: match the file's comment style (one space before `# v7` where Prettier wants it).
+3. Follow values through `env:` at job/workflow level into `run:` (`${{ env.TITLE }}` where
+   `TITLE` was set from a PR title) and through step outputs.
 4. A GitHub Release with notes, and later the Marketplace listing.
