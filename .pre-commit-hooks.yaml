@@ -1,0 +1,15 @@
+# Lets other repositories run workflow-guard with pre-commit (https://pre-commit.com):
+#
+#   repos:
+#     - repo: https://github.com/Gallileee/workflow-guard
+#       rev: v0.4.0
+#       hooks:
+#         - id: workflow-guard
+#
+# pre-commit passes the changed workflow files as arguments.
+- id: workflow-guard
+  name: workflow-guard
+  description: Find common security mistakes in GitHub Actions workflows
+  entry: workflow-guard
+  language: python
+  files: ^\.github/workflows/[^/]+\.ya?ml$
