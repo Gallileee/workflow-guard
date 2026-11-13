@@ -1,5 +1,33 @@
 # Progress log
 
+## 2026-11-13 (interactive): WG004 for actions that run a script
+
+Why: picked by the owner ("WG004 for more actions"). WG004 and WG008 only looked at `run:` and
+github-script; `appleboy/ssh-action`'s `script: echo "${{ github.event.pull_request.title }}"`
+runs the same injected command on a production server and went unreported.
+
+Acceptance criteria:
+- A table of 14 actions and their script inputs (`scripts.py`); action and input names match
+  without case, any ref; local (`./`) and `docker://` steps never match.
+- WG004 and WG008 check those inputs exactly like `run:` (same tracker, detours, line offsets,
+  inline ignores); the message ends with the action and input, plus how to get a variable to
+  the script where `env:` doesn't reach it (SSH, containers).
+- github-script keeps its old messages; other inputs (`host:`, `key:`) aren't checked.
+- Release notes in CHANGELOG.md in this pull request; v0.17.0's heading gets its date.
+
+Done:
+- `src/workflow_guard/scripts.py` (`SCRIPT_INPUTS`, `scripts(step)`, `Script.hint()`), used by
+  WG004 and WG008. Rule summary/help updated.
+- Tests: `test_script_inputs.py` (41). 438 in total.
+- README (WG004 row, "Actions that run a script", limitations), CHANGELOG v0.18.0, version
+  0.18.0.
+
+Verified locally:
+- `pytest -q -W error`: 438 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: 9 mutants (case-sensitive inputs or actions, empty note separator, a hint
+  for github-script, docker:// as an action, no run:, hints dropped from WG004/WG008), all
+  killed (the docker:// one after adding a digest case).
+
 ## 2026-11-13 (interactive): WG009 follow-ups
 
 Why: picked by the owner ("WG009 follow-ups"). WG009 (v0.16.0) only saw `actions/checkout`; the
@@ -646,6 +674,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.17.0` and publish its release from CHANGELOG.md (needs the owner's approval).
-2. WG004 for more actions that take a script as an input (beyond `run:` and github-script).
+1. Tag `v0.18.0` and publish its release from CHANGELOG.md (needs the owner's approval).
+2. Let users add their own script-running actions (a config file or `--script-input
+   owner/repo:input`), for in-house actions.
 3. The Marketplace listing (needs the owner: it's a public listing under their account).
