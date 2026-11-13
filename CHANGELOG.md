@@ -4,6 +4,35 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
+## v0.17.0 — WG009 sees git checkouts in scripts
+
+### Checking out with git or gh in a script
+
+WG009 now also reports a `workflow_run` workflow that brings the triggering run's commit into
+the working tree from a `run:` script (high), not only with `actions/checkout`:
+
+- `git checkout`, `git switch`, `git fetch`, `git pull`, `git reset` or `git worktree add` with
+  `github.event.workflow_run.head_sha`, `head_branch` and the like, also as `git -C dir ...` and
+  across `\` line continuations;
+- the same through an `env:` variable of the workflow, job or step (`git checkout "$HEAD_SHA"`,
+  `${{ env.HEAD_SHA }}`); a step's `env:` overrides the job's, as on GitHub;
+- `gh pr checkout` of the triggering run's pull request.
+
+```
+.github/workflows/preview.yml:14:9: WG009 [high] checks out the triggering run's code with git
+or gh in a script, under 'workflow_run', which runs with secrets and a write token; the
+triggering run can be a pull request from a fork, and its code then runs here
+```
+
+### `branches:` is not a protection
+
+A `branches: [main]` filter under `on.workflow_run` matches the head branch of the triggering
+run. For a fork's pull request that is the fork's own branch, which it can call `main`. WG009
+findings now say so when such a filter (or `branches-ignore:`) is present, instead of leaving
+the impression that the filter made the workflow safe.
+
+Other rules' output is unchanged.
+
 ## v0.16.0 — WG009: workflow_run (2026-11-13)
 
 ### New rule: WG009 workflow-run

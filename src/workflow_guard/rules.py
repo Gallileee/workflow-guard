@@ -25,7 +25,7 @@ from .expressions import (
 from .model import Finding, Severity
 from .project import repo_root
 from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
-from .workflow import Step, Workflow, get, key_node, scalar
+from .workflow import Step, Workflow, get, items, key_node, scalar
 
 
 @dataclass(frozen=True)
@@ -401,15 +401,63 @@ _WORKSPACE_PATHS = {"", ".", "${{github.workspace}}", "$github_workspace", "${gi
 _GH_RUN_DOWNLOAD = re.compile(r"\bgh\s+run\s+download\b")
 _GH_RUN_DIR = re.compile(r"\s(?:-D|--dir)(?:\s|=)")
 _FORK_RUN = "the triggering run can be a pull request from a fork"
+# Any part of the triggering run: what `gh pr checkout` needs (a PR number, a branch name).
+_RUN_ANY = (("github", "event", "workflow_run"),)
+# git commands that bring a commit into the working tree, and `gh pr checkout`.
+_GIT_CHECKOUT = re.compile(
+    r"\bgit\s+(?:-[cC]\s+\S+\s+)*(?:checkout|switch|fetch|pull|reset|worktree\s+add)\b"
+)
+_GH_PR_CHECKOUT = re.compile(r"\bgh\s+pr\s+checkout\b")
+_SHELL_VAR = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _names(text: str, patterns: tuple[tuple[str, ...], ...], env_vars: frozenset[str] = frozenset()) -> bool:
+    """True if ``text`` refers to one of ``patterns``: in a ``${{ }}``, or through an ``env:``
+    variable in ``env_vars`` (lower case), as ``${{ env.X }}`` or as ``$X`` in a script."""
+    for expr in find_expressions(text):
+        for path in _paths(expr):
+            if any(matches(path.segments, pattern) for pattern in patterns):
+                return True
+            if len(path.segments) > 1 and path.segments[0] == "env" and path.segments[1] in env_vars:
+                return True
+    return any(name.lower() in env_vars for name in _SHELL_VAR.findall(text))
 
 
 def _names_run_head(text: str) -> bool:
-    return any(
-        matches(path.segments, pattern)
-        for expr in find_expressions(text)
-        for path in _paths(expr)
-        for pattern in _RUN_HEAD
-    )
+    return _names(text, _RUN_HEAD)
+
+
+def _env_naming(patterns: tuple[tuple[str, ...], ...], *scopes: Node | None) -> frozenset[str]:
+    """Names (lower case) of ``env:`` variables in these scopes whose value refers to
+    ``patterns``. Later scopes override earlier ones, as in GitHub (workflow, job, step)."""
+    env: dict[str, str] = {}
+    for scope in scopes:
+        for name, value in items(get(scope, "env")):
+            env[name.lower()] = scalar(value) or ""
+    return frozenset(name for name, value in env.items() if _names(value, patterns))
+
+
+def _script_checks_out_run(run: str, head_vars: frozenset[str], run_vars: frozenset[str]) -> bool:
+    """A ``run:`` script that checks out the triggering run's commit: ``git checkout/fetch/...``
+    of its head, or ``gh pr checkout`` of its pull request."""
+    for line in run.replace("\\\n", " ").splitlines():
+        if _GIT_CHECKOUT.search(line) and _names(line, _RUN_HEAD, head_vars):
+            return True
+        if _GH_PR_CHECKOUT.search(line) and _names(line, _RUN_ANY, run_vars):
+            return True
+    return False
+
+
+def _branch_filter_note(wf: Workflow) -> str:
+    """``branches:`` under ``on.workflow_run`` looks like protection but isn't."""
+    trigger = get(get(wf.root, "on"), "workflow_run")
+    for key in ("branches", "branches-ignore"):
+        if get(trigger, key) is not None:
+            return (
+                f" ('{key}:' under 'on.workflow_run' doesn't prevent that: it matches the branch"
+                " name of the fork's pull request, which the fork picks)"
+            )
+    return ""
 
 
 def _workflow_name(wf: Workflow, root: Path) -> str:
@@ -479,9 +527,26 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
         return
     if (why := _fork_runs(wf)) is None:
         return
-    for _job_id, job_steps in groupby(wf.steps(), key=lambda step: step.job_id):
+    why += _branch_filter_note(wf)
+    jobs = dict(wf.jobs())
+    for job_id, job_steps in groupby(wf.steps(), key=lambda step: step.job_id):
         steps = list(job_steps)
         for i, step in enumerate(steps):
+            scopes = (wf.root, jobs.get(job_id), step.node)
+            run = scalar(get(step.node, "run"))
+            if run is not None and _script_checks_out_run(
+                run, _env_naming(_RUN_HEAD, *scopes), _env_naming(_RUN_ANY, *scopes)
+            ):
+                yield _at(
+                    wf,
+                    step.node,
+                    "WG009",
+                    Severity.HIGH,
+                    "checks out the triggering run's code with git or gh in a script, under"
+                    f" 'workflow_run', which runs with secrets and a write token; {why}, and its"
+                    " code then runs here",
+                )
+                continue
             if (step.uses or "").startswith("actions/checkout@"):
                 if _names_run_head(step.with_value("ref") or "") or _names_run_head(
                     step.with_value("repository") or ""
