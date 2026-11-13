@@ -5,9 +5,10 @@ import json
 import textwrap
 from pathlib import Path
 
-from workflow_guard.calls import link_local_calls, repo_root
+from workflow_guard.calls import link_local_calls
 from workflow_guard.cli import run
 from workflow_guard.model import Severity
+from workflow_guard.project import repo_root
 from workflow_guard.rules import check
 from workflow_guard.workflow import Workflow
 

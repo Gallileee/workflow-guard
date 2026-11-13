@@ -287,6 +287,20 @@ be read or parsed, or bad arguments.
   'github.event.comment.body', which outsiders can set (via env.BODY (step 1 of job 'reply')
   -> with.body in .github/workflows/reply.yml:7) and is pasted into a script; ...
   ```
+- **Outputs come back** too. After a step with an `id` that runs a local action, its
+  `steps.<id>.outputs.*` carry what the action's `outputs.<name>.value` carries; after a job
+  that calls a local reusable workflow, `needs.<job>.outputs.*` carry what its
+  `on.workflow_call.outputs.<name>.value` carries (usually `${{ jobs.<job>.outputs.<x> }}`).
+  Each call is worked out with its own `with:` values, so a clean call doesn't inherit the
+  title another call passed to the same action. An action that reads the event itself works
+  too:
+
+  ```
+  .github/workflows/label.yml:9:14: WG004 [high] 'steps.meta.outputs.title' carries
+  'github.event.pull_request.title', which outsiders can set (via env.TITLE (step 'meta') ->
+  steps.meta.outputs.title -> outputs.title of .github/actions/pr-meta/action.yml ->
+  steps.meta.outputs.title) and is pasted into a script; ...
+  ```
 - The writes themselves are read by `writes.py`: single `>> $GITHUB_*` lines, `{ ... } >>`
   groups (on one line or several), `cat <<EOF >> $GITHUB_*` shell heredocs, and multi-line
   values (`name<<DELIM`, the lines, `DELIM`), also when every line has its own `>>`. In
@@ -305,6 +319,7 @@ src/workflow_guard/
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
   taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
   calls.py     local reusable workflows and actions: what callers pass into each input
+  project.py   the files checked together; which file a uses: ./... runs
   writes.py    what a script or github-script writes to $GITHUB_OUTPUT / ENV / PATH
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
@@ -336,8 +351,8 @@ Ubuntu and Windows.
 - The write reader (`writes.py`) matches common shell patterns; it isn't a shell parser.
   `tee -a $GITHUB_OUTPUT`, writes inside functions or loops, variables holding the file name,
   PowerShell/Python `shell:` steps, and github-script calls spread over several lines aren't
-  followed. Neither are outputs of other actions, reusable workflows or composite actions as
-  seen by their callers (`needs.<call>.outputs.*` after a reusable workflow is trusted).
+  followed. Neither are outputs of remote actions and reusable workflows (`uses: owner/repo`):
+  their `steps.<id>.outputs.*` / `needs.<job>.outputs.*` are trusted. Local ones are followed.
 - Inputs of local reusable workflows and local actions are linked to their callers only when
   both files are checked in the same run (the default checks `.github/workflows/`, a root
   `action.yml` and `.github/actions/`). A reusable workflow or action that other repositories

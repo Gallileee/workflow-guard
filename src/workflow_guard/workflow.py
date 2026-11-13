@@ -19,6 +19,7 @@ import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 if TYPE_CHECKING:
+    from .project import Project
     from .taint import Taint
 
 
@@ -90,6 +91,9 @@ class Workflow:
     """For a reusable workflow or an action: the untrusted text local callers pass into each
     input (names in lower case), filled in by ``calls.link_local_calls``. None = no caller among
     the checked files, so any caller is possible."""
+    project: Project | None = None
+    """The files checked together with this one, set by ``calls.link_local_calls``: lets the
+    tracker follow outputs of local reusable workflows and actions back to the caller."""
 
     @classmethod
     def load(cls, path: Path, display_path: str | None = None) -> Workflow:

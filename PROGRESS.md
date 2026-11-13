@@ -1,5 +1,42 @@
 # Progress log
 
+## 2026-11-13 (interactive): Milestone 14, outputs back to the caller
+
+Why: next step 2, picked by the owner ("Outputs to callers"). Milestones 12 and 13 followed
+untrusted text *into* local reusable workflows and actions. The way back was still blind: an
+action that reads the PR title and returns it as an output, or a reusable workflow that hands
+an input back through `on.workflow_call.outputs`, made the caller's `${{ steps.x.outputs.y }}`
+or `${{ needs.call.outputs.y }}` look clean.
+
+Acceptance criteria:
+- After a step with an `id` running a local action: `steps.<id>.outputs.<name>` carries the
+  taint of the action's `outputs.<name>.value` (step outputs, env, inputs inside the action).
+- After a job calling a local reusable workflow: `needs.<job>.outputs.<name>` carries the taint
+  of `on.workflow_call.outputs.<name>.value`, with `jobs.<id>.outputs.*` understood there.
+- Each call uses its own `with:` values (context-sensitive), not the merge of all callers.
+- Loops of calls terminate; the message names the callee's output; WG007 sees outputs too.
+- No change in findings on the five local repositories.
+
+Done:
+- `project.py` (new): `Project` (the files checked together) resolves `uses: ./...` for jobs
+  and steps; `repo_root`, `file_key` and `call_site` moved here from `calls.py`.
+- `taint.py`: `Tracker(wf, inputs, stack)` with per-call inputs and a stack of files being
+  walked; `outputs()`, `with_taints()`, `_called_outputs`, `_apply_action_outputs`; the
+  action walk is cached; `jobs.<id>.outputs.*` resolves like `needs`.
+- `calls.py`: uses `Project`; `link_local_calls` also sets `Workflow.project`, so every
+  tracker (rules included) can follow local calls.
+- Tests: `test_call_outputs.py` (12). 292 in total. Version 0.14.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 292 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: using the merged inputs instead of each call's own fails 2 tests; dropping
+  the loop guard fails 1 (recursion); not resolving `jobs.*` in workflow_call outputs fails 1.
+- Demo: `label.yml` (pull_request_target) runs `./.github/actions/pr-meta`, which puts the PR
+  title in an output; `echo "${{ steps.meta.outputs.title }}"` is high, the message going
+  through `outputs.title of .github/actions/pr-meta/action.yml`.
+- JSON output for workflow-guard, lendloop, fitness-workout-log, transit-raptor and
+  GaTe-parking is byte-identical to v0.13.0's.
+
 ## 2026-11-13 (interactive): Milestone 13, local action inputs
 
 Why: next step 2, picked by the owner ("Composite action inputs") after v0.12.0 was published.
@@ -452,10 +489,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.13.0` and publish its release once the owner approves the drafted notes
-   (`prVSCode/workflow-guard-v0.13.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
+1. Tag `v0.14.0` and publish its release once the owner approves the drafted notes
+   (`prVSCode/workflow-guard-v0.14.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
    fitness-workout-log and transit-raptor.
-2. Outputs of a reusable workflow back to its caller (`needs.<call>.outputs.*`) and outputs of a
-   local action back to the calling step (`steps.<id>.outputs.*`).
+2. Per-call inputs for findings too: a finding inside an action is reported with the worst
+   caller; it could list every caller that passes untrusted text.
 3. A CHANGELOG.md in the repository with the same content as the releases.
 4. The Marketplace listing (needs the owner: it's a public listing under their account).
