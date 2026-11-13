@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from itertools import groupby
+from pathlib import Path
 
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
@@ -21,8 +23,9 @@ from .expressions import (
     matches,
 )
 from .model import Finding, Severity
+from .project import repo_root
 from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
-from .workflow import Workflow, get, key_node, scalar
+from .workflow import Step, Workflow, get, key_node, scalar
 
 
 @dataclass(frozen=True)
@@ -382,6 +385,142 @@ def persisted_credentials(wf: Workflow) -> Iterator[Finding]:
             )
 
 
+# --- WG009 workflow_run with the triggering run's code or artifacts ---------------------------
+
+# The triggering run's commit: a fork's pull request when that run was a 'pull_request'.
+_RUN_HEAD = (
+    ("github", "event", "workflow_run", "head_sha"),
+    ("github", "event", "workflow_run", "head_branch"),
+    ("github", "event", "workflow_run", "head_commit"),
+    ("github", "event", "workflow_run", "head_repository"),
+    ("github", "event", "workflow_run", "pull_requests"),
+)
+# Triggers whose runs can carry a fork's code (a workflow_run chain can pass it on).
+_UNTRUSTED_TRIGGERS = ("pull_request", "workflow_run")
+_WORKSPACE_PATHS = {"", ".", "${{github.workspace}}", "$github_workspace", "${github_workspace}"}
+_GH_RUN_DOWNLOAD = re.compile(r"\bgh\s+run\s+download\b")
+_GH_RUN_DIR = re.compile(r"\s(?:-D|--dir)(?:\s|=)")
+_FORK_RUN = "the triggering run can be a pull request from a fork"
+
+
+def _names_run_head(text: str) -> bool:
+    return any(
+        matches(path.segments, pattern)
+        for expr in find_expressions(text)
+        for path in _paths(expr)
+        for pattern in _RUN_HEAD
+    )
+
+
+def _workflow_name(wf: Workflow, root: Path) -> str:
+    """What ``on.workflow_run.workflows`` calls ``wf``: its ``name:``, else its path."""
+    if name := scalar(get(wf.root, "name")):
+        return name
+    path = Path(wf.path).resolve()
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else wf.path
+
+
+def _fork_runs(wf: Workflow) -> str | None:
+    """Why the triggering run's code and artifacts may be a stranger's; None when every
+    workflow named under ``on.workflow_run.workflows`` is among the checked files and none of
+    them runs for pull requests (their runs then only build this repository's own commits)."""
+    listed = get(get(get(wf.root, "on"), "workflow_run"), "workflows")
+    if isinstance(listed, SequenceNode):
+        names = [n.value for n in listed.value if isinstance(n, ScalarNode)]
+    else:
+        names = [listed.value] if isinstance(listed, ScalarNode) else []
+    root = repo_root(Path(wf.path))
+    if wf.project is None or root is None or not names:
+        return _FORK_RUN
+    known = {
+        _workflow_name(other, root): other
+        for other in wf.project.files.values()
+        if not other.is_action and repo_root(Path(other.path)) == root
+    }
+    reasons = []
+    for name in names:
+        if (other := known.get(name)) is None:
+            return _FORK_RUN
+        if found := [t for t in _UNTRUSTED_TRIGGERS if t in other.triggers()]:
+            reasons.append(f"'{name}' runs on {found[0]}")
+    if not reasons:
+        return None
+    return f"{', '.join(reasons)}, so the triggering run can be a pull request from a fork"
+
+
+def _in_workspace(path: str) -> bool:
+    return re.sub(r"\s+", "", path.lower()).rstrip("/") in _WORKSPACE_PATHS
+
+
+def _artifact_download(step: Step) -> bool | None:
+    """None if the step doesn't download another run's artifacts; else whether it unpacks them
+    straight into the workspace, where they can replace the repository's own files."""
+    uses = step.uses or ""
+    if uses.startswith("actions/download-artifact@"):
+        if step.with_value("run-id") is None:
+            return None  # this run's own artifacts
+        return _in_workspace(step.with_value("path") or "")
+    if uses.startswith("dawidd6/action-download-artifact@"):
+        return _in_workspace(step.with_value("path") or "")
+    if uses.startswith("actions/github-script@") and "downloadArtifact" in (step.with_value("script") or ""):
+        return False  # the script decides where the zip goes; at least it isn't unpacked yet
+    run = scalar(get(step.node, "run")) or ""
+    if _GH_RUN_DOWNLOAD.search(run):
+        return not _GH_RUN_DIR.search(run)
+    return None
+
+
+def _runs_workspace_code(step: Step) -> bool:
+    return get(step.node, "run") is not None or (step.uses or "").startswith("./")
+
+
+def workflow_run(wf: Workflow) -> Iterator[Finding]:
+    if wf.is_action or "workflow_run" not in wf.triggers():
+        return
+    if (why := _fork_runs(wf)) is None:
+        return
+    for _job_id, job_steps in groupby(wf.steps(), key=lambda step: step.job_id):
+        steps = list(job_steps)
+        for i, step in enumerate(steps):
+            if (step.uses or "").startswith("actions/checkout@"):
+                if _names_run_head(step.with_value("ref") or "") or _names_run_head(
+                    step.with_value("repository") or ""
+                ):
+                    yield _at(
+                        wf,
+                        step.node,
+                        "WG009",
+                        Severity.HIGH,
+                        "checks out the triggering run's code under 'workflow_run', which runs with"
+                        f" secrets and a write token; {why}, and its code then runs here",
+                    )
+                continue
+            if (into_workspace := _artifact_download(step)) is None:
+                continue
+            later = next((s for s in steps[i + 1 :] if _runs_workspace_code(s)), None)
+            if into_workspace and later is not None:
+                yield _at(
+                    wf,
+                    step.node,
+                    "WG009",
+                    Severity.HIGH,
+                    "unpacks the triggering run's artifacts into the workspace, where they can"
+                    " replace the repository's scripts and config, and the step at line"
+                    f" {later.node.start_mark.line + 1} runs commands there with secrets; {why}."
+                    " Download to ${{ runner.temp }} instead and treat the files as data",
+                )
+            else:
+                yield _at(
+                    wf,
+                    step.node,
+                    "WG009",
+                    Severity.MEDIUM,
+                    f"downloads the triggering run's artifacts under 'workflow_run'; {why}."
+                    " Treat their contents as untrusted data: don't run or source them, and don't"
+                    " paste them into scripts or $GITHUB_ENV",
+                )
+
+
 RULES: tuple[Rule, ...] = (
     Rule(
         "WG001",
@@ -470,6 +609,18 @@ RULES: tuple[Rule, ...] = (
             'logs or process listings can show it; pass it through env: and use "$X". '
             "toJSON(secrets) and 'secrets: inherit' to a reusable workflow in another repository "
             "hand out every secret at once; pass only the ones needed."
+        ),
+    ),
+    Rule(
+        "WG009",
+        "workflow-run",
+        "workflow_run that checks out or downloads artifacts of the triggering run",
+        workflow_run,
+        help=(
+            "A workflow_run workflow runs with secrets and a write token, but the run that triggered "
+            "it may have built a fork's pull request: its commit and its artifacts are the fork "
+            "author's. Don't check out that commit. Download artifacts to ${{ runner.temp }}, not "
+            "the workspace, and treat them as data: never run, source or paste them into scripts."
         ),
     ),
 )

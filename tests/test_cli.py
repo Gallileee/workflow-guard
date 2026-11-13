@@ -112,7 +112,7 @@ def test_unknown_rule_or_severity_is_a_usage_error(capsys):
 
 def test_list_rules():
     code, out, _ = call("--list-rules")
-    assert code == 0 and len(out.splitlines()) == 8 and out.startswith("WG001")
+    assert code == 0 and len(out.splitlines()) == 9 and out.startswith("WG001")
 
 
 def test_a_missing_path_is_an_error(tmp_path):

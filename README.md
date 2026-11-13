@@ -30,6 +30,7 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
 | WG007 | untrusted-github-env | high (medium for inputs from unknown callers) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
 | WG008 | secrets-exposure | medium; high for `toJSON(secrets)` | `${{ secrets.X }}` pasted into `run:` or a github-script: the secret becomes part of the script text, quotes or `$` in it break the script, and `set -x`, an error message or a process listing can show it (GitHub's log masking only catches exact matches). Pass it through `env:` and use `"$X"`. Also `toJSON(secrets)` anywhere (every secret in one value) and `secrets: inherit` on a reusable workflow from another repository (all secrets handed to code that lives elsewhere). Passing a secret to an action's `with:` is fine. |
+| WG009 | workflow-run | high for a checkout of the triggering commit or artifacts unpacked into the workspace before a `run:` step; medium for other artifact downloads | A `workflow_run` workflow runs with secrets and a write token, but the run that triggered it may have built a fork's pull request. Checking out `github.event.workflow_run.head_sha` (or `head_branch`, `head_repository`, `pull_requests`) runs the fork's code with those secrets. Its artifacts (`actions/download-artifact` with `run-id:`, `dawidd6/action-download-artifact`, `gh run download`, `downloadArtifact` in a github-script) are the fork author's files: unpacked into the workspace they can replace the repository's scripts and config that later steps run. Download to `${{ runner.temp }}` and treat the contents as data. When every workflow named under `on.workflow_run.workflows` is among the checked files and none runs on `pull_request` (or another `workflow_run`), nothing is reported: those runs only build this repository's own commits. |
 
 ### Actions too
 
@@ -384,6 +385,10 @@ with `python scripts/release_check.py --releases` (needs the GitHub CLI).
   access to PyPI for PyYAML.
 - Not on PyPI or the GitHub Marketplace yet; install from the repository.
 - WG004 only looks at `run:` and `actions/github-script`; other actions can also misuse inputs.
+- WG009 looks for `actions/checkout` and four common ways to download artifacts. A `git checkout` of the
+  triggering commit inside `run:`, other download actions, and what the job does with the files
+  afterwards aren't analysed: any later `run:` step after an unpack into the workspace counts.
+  `branches:` filters under `on.workflow_run` aren't read.
 - WG001 doesn't check that a SHA really belongs to the repository's tag (a SHA from a fork works
   on GitHub too).
 - `--fix` only fixes WG001. The other rules need a human decision (which permissions a job needs).
