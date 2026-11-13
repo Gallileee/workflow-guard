@@ -41,6 +41,7 @@ from .expressions import (
     matches,
 )
 from .model import Severity
+from .project import call_site, file_key
 from .workflow import Step, Workflow, get, items, scalar
 from .writes import ENV, OUTPUT, PATH, assignments, github_script_calls, shell_writes
 
@@ -169,22 +170,61 @@ class TrackedStep:
     """Tainted text this step's script appends to $GITHUB_ENV / $GITHUB_PATH."""
 
 
+_CALLER = object()
+"""Default for ``Tracker(inputs=...)``: what the file's local callers pass (``input_taints``)."""
+
+
 class Tracker:
-    def __init__(self, wf: Workflow) -> None:
+    def __init__(
+        self,
+        wf: Workflow,
+        inputs: dict[str, Taint] | None | object = _CALLER,
+        stack: frozenset[str] = frozenset(),
+    ) -> None:
+        """``inputs``: the taint of each input for one particular call (used to follow that
+        call's outputs back to the caller); by default the merged ``wf.input_taints``.
+        ``stack``: files being walked further up, to stop at a loop of calls."""
         self.wf = wf
+        self._inputs = wf.input_taints if inputs is _CALLER else inputs
+        self._stack = stack | {file_key(wf.path)}
         self._jobs = {job_id.lower(): (job_id, job) for job_id, job in wf.jobs()}
         self._walked: dict[str, tuple[list[TrackedStep], dict[str, Taint]]] = {}
         self._walking: set[str] = set()
+        self._action: tuple[list[TrackedStep], Scope] | None = None
 
     # --- public -----------------------------------------------------------------------------
 
     def steps(self) -> Iterator[TrackedStep]:
         """Every step with what is tainted while it runs, in workflow order."""
         if self.wf.is_action:
-            yield from self._walk_steps(list(self.wf.steps()), Scope(), "the action")[0]
+            yield from self._walk_action()[0]
             return
         for key in self._jobs:
             yield from self._walk_job(key)[0]
+
+    def outputs(self) -> dict[str, Taint]:
+        """Tainted outputs (lower-case names) of an action (``outputs.<name>.value``) or a
+        reusable workflow (``on.workflow_call.outputs.<name>.value``), as its caller sees them."""
+        if self.wf.is_action:
+            declared, scope = get(self.wf.root, "outputs"), self._walk_action()[1]
+        else:
+            declared, scope = get(get(get(self.wf.root, "on"), "workflow_call"), "outputs"), Scope()
+        found: dict[str, Taint] = {}
+        for name, node in items(declared):
+            text = scalar(get(node, "value"))
+            if text is not None and (taint := self._taint_of_text(text, scope)) is not None:
+                found[name.lower()] = taint.through(f"outputs.{name} of {self.wf.path}")
+        return found
+
+    def with_taints(self, with_node: Node | None, scope: Scope, where: str) -> dict[str, Taint]:
+        """The tainted ``with:`` values of a call (lower-case names), each with the hop
+        ``with.<name> in <where>``."""
+        found: dict[str, Taint] = {}
+        for name, value in items(with_node):
+            text = scalar(value)
+            if text is not None and (taint := self.taint_of_value(text, scope)) is not None:
+                found[name.lower()] = taint.through(f"with.{name} in {where}")
+        return found
 
     def taint_of_value(self, text: str, scope: Scope | None = None) -> Taint | None:
         """The taint of a ``with:`` value: of a step, seen with that step's ``scope``, or of a
@@ -210,7 +250,7 @@ class Tracker:
             return found[1]
         if seg[0] == "steps" and len(seg) >= 4 and seg[2] == "outputs":
             return scope.outputs.get((seg[1], seg[3]))
-        if seg[0] == "needs" and len(seg) >= 4 and seg[2] == "outputs" and not self.wf.is_action:
+        if seg[0] in ("needs", "jobs") and len(seg) >= 4 and seg[2] == "outputs" and not self.wf.is_action:
             return self._walk_job(seg[1])[1].get(seg[3]) if seg[1] in self._jobs else None
         return None
 
@@ -219,8 +259,8 @@ class Tracker:
         callers pass in. With no caller among the checked files, possibly anything: a caller
         may pass a pull request title straight through, and the callee can't know."""
         name = path.segments[1]
-        if self.wf.input_taints is not None:
-            return self.wf.input_taints.get(name)
+        if self._inputs is not None:
+            return self._inputs.get(name)
         if self.wf.input_type(name) in _SAFE_INPUT_TYPES:
             return None
         return Taint(INPUT, str(path), Severity.MEDIUM)
@@ -273,6 +313,10 @@ class Tracker:
             text = scalar(value)
             if text is not None and (taint := self._taint_of_text(text, final)) is not None:
                 outputs[name.lower()] = taint.through(f"needs.{job_id}.outputs.{name}")
+        for name, taint in self._called_outputs(
+            job, None, Scope(), f"{self.wf.path} (job '{job_id}')"
+        ).items():
+            outputs[name] = taint.through(f"needs.{job_id}.outputs.{name}")
         self._walking.discard(key)
         self._walked[key] = (tracked, outputs)
         return tracked, outputs
@@ -292,7 +336,35 @@ class Tracker:
             script = scalar(get(get(step.node, "with"), "script"))
             if script is not None and (step.uses or "").startswith("actions/github-script@"):
                 self._apply_script_calls(script, own, scope, current, step_id, label)
+            if step_id:
+                self._apply_action_outputs(step, step_id, own, scope)
         return tracked, scope
+
+    def _walk_action(self) -> tuple[list[TrackedStep], Scope]:
+        if self._action is None:
+            self._action = self._walk_steps(list(self.wf.steps()), Scope(), "the action")
+        return self._action
+
+    def _called_outputs(
+        self, node: MappingNode, step: Step | None, scope: Scope, where: str
+    ) -> dict[str, Taint]:
+        """Outputs of the local reusable workflow (job ``node``) or local action (``step``)
+        that ``node`` runs, worked out for this call's own ``with:`` values."""
+        project = self.wf.project
+        if project is None:
+            return {}
+        uses = scalar(get(node, "uses"))
+        callee = project.local_action(self.wf, uses) if step else project.reusable_workflow(self.wf, uses)
+        if callee is None or file_key(callee.path) in self._stack:
+            return {}
+        inputs = self.with_taints(get(node, "with"), scope, where)
+        return Tracker(callee, inputs, self._stack).outputs()
+
+    def _apply_action_outputs(self, step: Step, step_id: str, own: Scope, scope: Scope) -> None:
+        """After a step that runs a local action: its tainted outputs, as ``steps.<id>.outputs.*``."""
+        where = call_site(self.wf, get(step.node, "uses"))
+        for name, taint in self._called_outputs(step.node, step, own, where).items():
+            scope.outputs[(step_id.lower(), name)] = taint.through(f"steps.{step_id}.outputs.{name}")
 
     def _apply_shell_writes(
         self, run: str, own: Scope, scope: Scope, current: TrackedStep, step_id: str | None, label: str
