@@ -1,5 +1,35 @@
 # Progress log
 
+## 2026-11-13 (interactive): a Release check in CI
+
+Why: picked by the owner ("Release check in CI") after four releases in one day (v0.12.0 to
+v0.15.0). Each release is five manual steps (bump two files, merge, tag, push the tag, publish
+notes); nothing caught a skipped one.
+
+Acceptance criteria:
+- Errors: pyproject.toml and `__version__` disagree; the version is older than the newest
+  `v*` tag (numerically: 0.9.5 < 0.10.0); a pushed tag or published release doesn't match the
+  code; an older tag has no GitHub Release.
+- Warnings only (normal between steps): the version isn't tagged yet; the newest tag has no
+  release yet.
+- Runs on pull requests, pushes to main, `v*` tag pushes and published releases; passes
+  workflow-guard's own checks; standard library only.
+- On the current repository: 0 errors (version 0.15.0, 12 tags, all with releases).
+
+Done:
+- `scripts/release_check.py`: `check()` (pure), `git_tags`, `published_releases` (gh CLI),
+  `report` (`::error::`/`::warning::` annotations in Actions), `main` (exit 0/1/2).
+- `.github/workflows/release-check.yml`: full-history checkout, `GH_TOKEN: github.token`.
+- Tests: `test_release_check.py` (15, one on a real temporary git repository). 313 in total.
+- README: a Releasing section. No version bump: nothing in the package changed.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 313 passed. `ruff check`, `ruff format --check`: clean.
+- `python scripts/release_check.py --releases` on this repository: 0 errors.
+- workflow-guard on its own workflows (now 3 files): 0 findings.
+- Mutation checks: comparing versions as text fails 1 test (added for exactly that), sorting
+  tags as text 3, skipping the tag/ref match 1.
+
 ## 2026-11-13 (interactive): Milestone 15, every tainted caller in the message
 
 Why: next step 2, picked by the owner ("List all callers"). Since milestone 12 a finding inside
@@ -523,10 +553,8 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.15.0` and publish its release once the owner approves the drafted notes
-   (`prVSCode/workflow-guard-v0.15.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
-   fitness-workout-log and transit-raptor.
-2. A release check in CI: the version in `pyproject.toml` matches the latest tag, and every
-   tag has a GitHub Release.
-3. A CHANGELOG.md in the repository with the same content as the releases.
-4. The Marketplace listing (needs the owner: it's a public listing under their account).
+1. WG009: `workflow_run` workflows that download artifacts of the triggering run and execute
+   them (the fork's code with the base repository's secrets and write token).
+2. Publish more of the release in one place: a CHANGELOG.md generated from the releases (the
+   Release check could then also check that it lists the newest tag).
+3. The Marketplace listing (needs the owner: it's a public listing under their account).

@@ -330,6 +330,7 @@ src/workflow_guard/
   model.py     Finding, Severity
   cli.py       arguments, file discovery, text/JSON/SARIF/GitHub output, exit codes
 action.yml     the composite GitHub Action
+scripts/release_check.py  the Release check workflow's script (versions, tags, releases)
 .pre-commit-hooks.yaml  the pre-commit hook
 tests/         pytest: rules, CLI, SARIF, annotations, action.yml and the hook, and --fix
                (with a local HTTP server standing in for GitHub); fixtures/ holds an unsafe workflow
@@ -345,6 +346,21 @@ ruff check . && ruff format --check .
 CI runs them on Python 3.10, 3.12 and 3.14, and then runs workflow-guard on this repository's own
 workflow, which pins its actions to commit SHAs. The `action` job runs `action.yml` itself on
 Ubuntu and Windows.
+
+## Releasing
+
+1. Bump the version in `pyproject.toml` and `src/workflow_guard/__init__.py` in the pull request.
+2. Merge, then tag the merge commit and push the tag: `git tag -a vX.Y.Z <sha>`,
+   `git push origin vX.Y.Z`.
+3. Publish a GitHub Release for the tag with its notes:
+   `gh release create vX.Y.Z --verify-tag --notes-file notes.md`.
+
+The **Release check** workflow (`scripts/release_check.py`, standard library only) runs on pull
+requests, pushes to main, `v*` tags and published releases. It fails when the two versions
+disagree, when the version is older than the newest tag (a lost bump), when a pushed tag doesn't
+match the code, or when an older tag has no release. A missing tag or release for the newest
+version is a warning, since that is the normal state between the steps above. Run it locally
+with `python scripts/release_check.py --releases` (needs the GitHub CLI).
 
 ## Limitations
 

@@ -1,0 +1,33 @@
+name: Release check
+
+# Catches a forgotten release step (see scripts/release_check.py): versions that disagree, a
+# lost version bump, a tag that doesn't match the code, a tag without a GitHub Release.
+# Missing tag/release for the newest version is only a warning: that is the normal state
+# between merging, tagging and publishing.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # all tags
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.14"
+      - name: Check versions, tags and releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python scripts/release_check.py --releases
