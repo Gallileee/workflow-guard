@@ -1,5 +1,31 @@
 # Progress log
 
+## 2026-11-13 (interactive): WG009 workflow_run
+
+Why: picked by the owner ("WG009 workflow_run"). A `workflow_run` workflow runs with the base
+repository's secrets and write token after a run that may have built a fork's pull request.
+Checking out that run's commit, or unpacking its artifacts where later steps run commands, gives
+the fork author's files those secrets. Nothing in WG001-WG008 sees it: no `${{ }}` reaches a
+script, and WG005 only looks at `pull_request_target`.
+
+Acceptance criteria:
+- High: `actions/checkout` with `ref:`/`repository:` naming the triggering run's head
+  (`head_sha`, `head_branch`, `head_commit`, `head_repository`, `pull_requests`).
+- High: another run's artifacts unpacked into the workspace (`actions/download-artifact` with
+  `run-id:` and no `path:` or `path: .`/`${{ github.workspace }}`, `dawidd6/action-download-
+  artifact` with its default `./`, `gh run download` without `-D`) followed by a `run:` step or a
+  local action in the same job. Medium otherwise, and for `downloadArtifact` in a github-script.
+- A download of the run's own artifacts (no `run-id:`) isn't reported.
+- No findings when every workflow listed under `on.workflow_run.workflows` is a checked file of
+  the same repository (matched by `name:`, else by its path) and none runs on `pull_request` or
+  `workflow_run`. An unknown name counts as untrusted. Messages name the untrusted workflow.
+- The other rules' output is unchanged on the portfolio repositories.
+
+Done:
+- `rules.py`: `workflow_run` (WG009) with `_fork_runs`, `_artifact_download`.
+- Tests: `test_wg009.py` (30). 343 in total. `--list-rules` now lists 9 rules.
+- README: the WG009 row and its limitations. Version 0.16.0.
+
 ## 2026-11-13 (interactive): a Release check in CI
 
 Why: picked by the owner ("Release check in CI") after four releases in one day (v0.12.0 to
@@ -553,8 +579,9 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. WG009: `workflow_run` workflows that download artifacts of the triggering run and execute
-   them (the fork's code with the base repository's secrets and write token).
+1. Tag `v0.16.0` and publish its release notes (needs the owner's approval of the notes).
 2. Publish more of the release in one place: a CHANGELOG.md generated from the releases (the
    Release check could then also check that it lists the newest tag).
-3. The Marketplace listing (needs the owner: it's a public listing under their account).
+3. WG009 follow-ups: `git checkout`/`git fetch` of the triggering commit inside `run:`, and
+   `on.workflow_run.branches` filters.
+4. The Marketplace listing (needs the owner: it's a public listing under their account).
