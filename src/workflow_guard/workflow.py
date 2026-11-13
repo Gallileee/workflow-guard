@@ -13,9 +13,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+
+if TYPE_CHECKING:
+    from .taint import Taint
 
 
 class WorkflowError(Exception):
@@ -80,6 +84,10 @@ class Workflow:
     lines: list[str]
     kind: str = WORKFLOW
     """``WORKFLOW`` or ``ACTION``."""
+    input_taints: dict[str, Taint] | None = None
+    """For a reusable workflow: the untrusted text local callers pass into each input (names in
+    lower case), filled in by ``calls.link_local_calls``. None = no caller among the checked
+    files, so any caller is possible."""
 
     @classmethod
     def load(cls, path: Path, display_path: str | None = None) -> Workflow:
@@ -119,6 +127,19 @@ class Workflow:
         if isinstance(on, SequenceNode):
             return {n.value for n in on.value if isinstance(n, ScalarNode)}
         return {name for name, _ in items(on)}
+
+    @property
+    def is_reusable(self) -> bool:
+        """Triggered by ``workflow_call``: other workflows run it with ``jobs.<id>.uses``."""
+        return not self.is_action and "workflow_call" in self.triggers()
+
+    def input_type(self, name: str) -> str | None:
+        """The declared ``type:`` of a ``workflow_call`` input (``name`` in any case)."""
+        declared = get(get(get(self.root, "on"), "workflow_call"), "inputs")
+        for key, value in items(declared):
+            if key.lower() == name.lower():
+                return (scalar(get(value, "type")) or "").lower() or None
+        return None
 
     def jobs(self) -> Iterator[tuple[str, MappingNode]]:
         for job_id, job in items(get(self.root, "jobs")):
