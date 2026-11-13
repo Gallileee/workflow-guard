@@ -82,7 +82,11 @@ OUTSIDER = "outsider"
 TOJSON = "tojson"
 """``toJSON()`` of an object that contains such a field."""
 INPUT = "input"
-"""A composite action's input: the calling workflow may pass untrusted text."""
+"""An input of a composite action or reusable workflow whose callers aren't known: any of them
+may pass untrusted text."""
+
+_SAFE_INPUT_TYPES = ("boolean", "number")
+"""``workflow_call`` input types that can't carry text."""
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,11 @@ class Tracker:
         for key in self._jobs:
             yield from self._walk_job(key)[0]
 
+    def taint_of_value(self, text: str) -> Taint | None:
+        """The taint of a value outside any step, such as a ``with:`` value of a job that calls a
+        reusable workflow (it can read ``needs``, ``inputs`` and ``github``, but no ``env``)."""
+        return self._taint_of_text(text, Scope())
+
     def taint_of_expression(self, expr: Expression, scope: Scope) -> tuple[ContextPath, Taint] | None:
         """The first tainted path in one expression, with its taint."""
         for path in _paths(expr):
@@ -199,6 +208,8 @@ class Tracker:
         if (taint := direct_taint(path, self.wf.is_action)) is not None:
             return taint
         seg = path.segments
+        if seg[0] == "inputs" and len(seg) >= 2 and self.wf.is_reusable:
+            return self._reusable_input(path)
         if seg[0] == "env" and len(seg) >= 2 and (found := scope.env_by_expression(seg[1])):
             return found[1]
         if seg[0] == "steps" and len(seg) >= 4 and seg[2] == "outputs":
@@ -206,6 +217,16 @@ class Tracker:
         if seg[0] == "needs" and len(seg) >= 4 and seg[2] == "outputs" and not self.wf.is_action:
             return self._walk_job(seg[1])[1].get(seg[3]) if seg[1] in self._jobs else None
         return None
+
+    def _reusable_input(self, path: ContextPath) -> Taint | None:
+        """``inputs.<name>`` of a reusable workflow: what the known local callers pass in, or,
+        with no caller among the checked files, possibly anything (like a composite action)."""
+        name = path.segments[1]
+        if self.wf.input_taints is not None:
+            return self.wf.input_taints.get(name)
+        if self.wf.input_type(name) in _SAFE_INPUT_TYPES:
+            return None
+        return Taint(INPUT, str(path), Severity.MEDIUM)
 
     def _taint_of_text(self, text: str, scope: Scope) -> Taint | None:
         for expr in find_expressions(text):

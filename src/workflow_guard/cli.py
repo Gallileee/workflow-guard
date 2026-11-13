@@ -16,6 +16,7 @@ from typing import TextIO
 
 from . import __version__
 from .annotations import to_annotations
+from .calls import link_local_calls
 from .fix import GitHubResolver, Resolver, fallback_gap, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
@@ -193,15 +194,18 @@ def run(
         return 2
 
     gap = " " * args.comment_spaces if args.comment_spaces else None
-    findings: list[Finding] = []
     errors: list[tuple[str, str]] = []
+    loaded: list[Workflow] = []
     for f in files:
         try:
-            wf = _load(f, fixer, err, gap)
+            loaded.append(_load(f, fixer, err, gap))
         except WorkflowError as e:
             print(f"{f.as_posix()}: error: {e}", file=err)
             errors.append((f.as_posix(), str(e)))
-            continue
+    # All files first: a reusable workflow's inputs depend on what its callers pass in.
+    link_local_calls(loaded)
+    findings: list[Finding] = []
+    for wf in loaded:
         findings += [x for x in check(wf, args.ignore) if x.severity >= args.min_severity]
 
     try:

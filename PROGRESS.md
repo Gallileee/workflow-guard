@@ -1,5 +1,42 @@
 # Progress log
 
+## 2026-11-13 (scheduled run): Milestone 12, local reusable workflows
+
+Why: the open item from the previous runs ("checking inside called local reusable workflows").
+A reusable workflow (`on: workflow_call`) pasting `${{ inputs.title }}` into `run:` wasn't
+reported at all, although a `pull_request_target` workflow can call it with the PR title. That
+is the composite-action problem from milestone 5 one level up, and unlike an action, the caller
+is usually in the same repository, so the real answer can be worked out.
+
+Acceptance criteria:
+- `inputs.*` of a reusable workflow in `run:`/github-script: medium when no checked file calls
+  it (not for `type: boolean`/`number`); `workflow_dispatch`-only inputs stay trusted.
+- With local callers among the checked files: the taint of what they pass in `with:` (direct
+  values, `needs.*.outputs`, their own inputs through a chain), the worst caller winning; clean
+  callers mean no finding. The message names the caller's file and job.
+- Detours inside the called workflow (env:, $GITHUB_ENV, outputs) and WG007 work unchanged.
+- No new findings on the five local repositories (none uses `workflow_call`).
+
+Done:
+- `calls.py` (new): `repo_root`, `local_calls`, `link_local_calls` (callers first, loops cut).
+- `workflow.py`: `Workflow.input_taints`, `is_reusable`, `input_type`.
+- `taint.py`: `Tracker._reusable_input`, `Tracker.taint_of_value` (a `with:` value of a job).
+- `cli.py`: loads every file before checking any, then links the calls.
+- Tests: `test_calls.py` (17). 267 in total. Version 0.12.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 267 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: not linking callers before their callees fails the chain test; giving
+  uncalled workflows an empty map (instead of None) fails the medium pass-on test.
+- Demo in a scratch folder (`triage.yml` on `pull_request_target` calling `label.yml` with the
+  PR title): the folder gives WG004 high on label.yml's `echo` line naming triage.yml's job;
+  label.yml alone gives medium; its boolean `dry-run` input isn't reported.
+- workflow-guard, lendloop, fitness-workout-log, transit-raptor, GaTe-parking: same findings as
+  before (0 at medium+ except GaTe-parking's known WG001/WG002).
+
+Not done: tag v0.12.0 and its GitHub Release (release notes need the owner's approval; draft in
+`prVSCode/workflow-guard-v0.12.0-release-notes-DRAFT.md`).
+
 ## 2026-11-09 (interactive): Milestone 11, WG008 secrets exposure
 
 Why: next step 3, picked by the owner after the releases were published. Secrets are what an
@@ -381,8 +418,11 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.11.0` after the merge and publish its release (notes drafted for approval in
-   `prVSCode/workflow-guard-v0.11.0-release-notes-DRAFT.md`).
-2. Bring lendloop and fitness-workout-log to the latest version (their `# v0.9.0` pins).
+1. Tag `v0.12.0` and publish its release once the owner approves the drafted notes
+   (`prVSCode/workflow-guard-v0.12.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
+   fitness-workout-log and transit-raptor.
+2. Link inputs of local composite actions (`uses: ./.github/actions/x` + `with:`) the same way
+   `calls.py` links reusable workflows, and outputs of a reusable workflow back to its caller
+   (`needs.<call>.outputs.*`).
 3. A CHANGELOG.md in the repository with the same content as the releases.
 4. The Marketplace listing (needs the owner: it's a public listing under their account).
