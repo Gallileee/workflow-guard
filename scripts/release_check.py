@@ -9,7 +9,11 @@ script catches a step that was forgotten:
 - error: a pushed tag (or a published release) doesn't match the version in the code;
 - error: an older tag has no GitHub Release;
 - warning: the version has no tag yet (normal in a pull request that bumps it, and between the
-  merge and the tag), or the newest tag has no release yet (between the tag and the release).
+  merge and the tag), or the newest tag has no release yet (between the tag and the release);
+- error: CHANGELOG.md has no section for the version in the code or for a tag, has a section
+  for a version that is neither, or isn't newest first (see scripts/release_notes.py);
+- error (with ``--releases``): a section's title or text differs from its GitHub Release;
+  warning: its date differs.
 
 Warnings don't fail the job. In GitHub Actions they become annotations on the run.
 
@@ -21,14 +25,26 @@ only, so it runs before anything is installed.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+if (_HERE := str(Path(__file__).resolve().parent)) not in sys.path:
+    sys.path.insert(0, _HERE)  # release_notes.py lives next to this script
+
+from release_notes import (  # noqa: E402
+    CHANGELOG,
+    Release,
+    Section,
+    fetch_releases,
+    parse,
+    section_text,
+    tidy,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 _VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
@@ -127,6 +143,68 @@ def check(
     return problems
 
 
+def check_changelog(
+    sections: list[Section] | None,
+    version: str,
+    tags: Iterable[str],
+    releases: Mapping[str, Release] | None = None,
+) -> list[Problem]:
+    """CHANGELOG.md against the version, the tags and (if given) the releases' text.
+    ``sections`` is None when there is no CHANGELOG.md."""
+    if sections is None:
+        return [Problem(ERROR, f"{CHANGELOG} is missing; create it with scripts/release_notes.py sync")]
+    problems: list[Problem] = []
+    tagged = version_tags(tags)
+    expected = f"v{version}"
+    seen: dict[str, Section] = {}
+    for s in sections:
+        if s.tag in seen:
+            problems.append(Problem(ERROR, f"{CHANGELOG}:{s.line}: a second section for {s.tag}"))
+        seen.setdefault(s.tag, s)
+    order = [parse_version(s.tag) for s in sections]
+    if order != sorted(order, reverse=True):
+        problems.append(Problem(ERROR, f"{CHANGELOG}: sections aren't newest first"))
+    if expected not in seen:
+        problems.append(
+            Problem(
+                ERROR,
+                f"{CHANGELOG} has no section for {expected}: write its release notes there in the"
+                " pull request that bumps the version",
+            )
+        )
+    for tag in tagged:
+        if tag not in seen and tag != expected:
+            problems.append(Problem(ERROR, f"{CHANGELOG} has no section for tag {tag}"))
+    for tag, s in seen.items():
+        if tag not in tagged and tag != expected:
+            problems.append(
+                Problem(
+                    ERROR,
+                    f"{CHANGELOG}:{s.line}: section {tag} is neither tagged nor the version in the code"
+                    f" ({version})",
+                )
+            )
+    for tag, s in seen.items():
+        if releases is None or (release := releases.get(tag)) is None:
+            continue
+        where = f"{CHANGELOG}:{s.line}"
+        if s.title != (release.name.strip() or tag):
+            problems.append(
+                Problem(ERROR, f"{where}: title '{s.title}' differs from the release's '{release.name}'")
+            )
+        if tidy(s.text) != section_text(release):
+            problems.append(
+                Problem(
+                    ERROR,
+                    f"{where}: the text of {tag} differs from its GitHub Release; fix the one that's"
+                    " wrong (scripts/release_notes.py sync copies the releases)",
+                )
+            )
+        if s.date and release.date and s.date != release.date:
+            problems.append(Problem(WARNING, f"{where}: {tag} was released on {release.date}, not {s.date}"))
+    return problems
+
+
 # --- gathering the facts ----------------------------------------------------------------------
 
 
@@ -137,16 +215,9 @@ def git_tags(root: Path) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def published_releases(root: Path) -> set[str]:
-    """Tag names of the published (not draft) releases, from the GitHub CLI."""
-    out = subprocess.run(
-        ["gh", "release", "list", "--limit", "1000", "--json", "tagName,isDraft"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return {r["tagName"] for r in json.loads(out) if not r.get("isDraft")}
+def read_changelog(root: Path) -> list[Section] | None:
+    path = root / CHANGELOG
+    return parse(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
 def report(problems: list[Problem], annotate: bool) -> str:
@@ -158,7 +229,9 @@ def report(problems: list[Problem], annotate: bool) -> str:
 
 def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--releases", action="store_true", help="also check GitHub Releases (gh CLI)")
+    parser.add_argument(
+        "--releases", action="store_true", help="also check GitHub Releases and their text (gh CLI)"
+    )
     args = parser.parse_args(argv)
     try:
         version = read_version(
@@ -167,12 +240,15 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
         init = (root / "src" / "workflow_guard" / "__init__.py").read_text(encoding="utf-8")
         init_version = read_version(init, _INIT_VERSION, "__init__.py")
         tags = git_tags(root)
-        releases = published_releases(root) if args.releases else None
+        releases = fetch_releases(root) if args.releases else None
+        sections = read_changelog(root)
     except (OSError, ValueError, subprocess.CalledProcessError) as e:
         detail = getattr(e, "stderr", "") or ""
         print(f"release check: cannot read the release state: {e} {detail}".strip(), file=sys.stderr)
         return 2
-    problems = check(version, init_version, tags, releases, os.environ.get("GITHUB_REF"))
+    released = set(releases) if releases is not None else None
+    problems = check(version, init_version, tags, released, os.environ.get("GITHUB_REF"))
+    problems += check_changelog(sections, version, tags, releases)
     if problems:
         print(report(problems, annotate=os.environ.get("GITHUB_ACTIONS") == "true"))
     errors = sum(p.level == ERROR for p in problems)

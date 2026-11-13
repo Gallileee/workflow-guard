@@ -1,5 +1,41 @@
 # Progress log
 
+## 2026-11-13 (interactive): CHANGELOG.md
+
+Why: picked by the owner ("CHANGELOG.md"). The release notes of 13 versions lived only on
+GitHub, and each was written in a separate draft file after the merge. Now the notes are written
+in the pull request that bumps the version, reviewed with the code, and the release is published
+from them.
+
+Acceptance criteria:
+- CHANGELOG.md has one section per release, newest first: `## <release title> (<date>)`, then
+  the release notes with headings one level deeper and without a first heading that repeats the
+  title. Generated from the 13 published releases; `notes` gives back each release's text.
+- `scripts/release_notes.py`: `notes vX` / `title vX` for `gh release create`, `sync` to copy
+  edited releases back. Standard library only.
+- Release check errors: no CHANGELOG.md; no section for the version in the code (so a bump PR
+  must bring its notes) or for a tag; a section for a version that is neither; not newest
+  first; a duplicate section; with `--releases`, a title or text that differs from the GitHub
+  Release. Warning: a date that differs. A missing date is fine (written before the release).
+- On this repository: 0 errors.
+
+Done:
+- `scripts/release_notes.py`, `CHANGELOG.md` (13 sections), `check_changelog()` in
+  `scripts/release_check.py`; releases are now read with `gh api .../releases` (title, text and
+  date in one call).
+- Tests: `test_release_notes.py` (11), 12 more in `test_release_check.py`. 366 in total.
+- README: the Releasing steps now start from CHANGELOG.md. No version bump: the package is
+  unchanged.
+
+Verified locally:
+- `pytest -q -W error`: 366 passed. `ruff check`, `ruff format --check`: clean.
+- `python scripts/release_check.py --releases`: version 0.16.0, 13 tags, 0 errors.
+- `release_notes.py notes` gives each release's exact text for v0.4.0-v0.11.0 and v0.16.0;
+  for v0.12.0-v0.15.0 the same minus the first heading that repeated the title.
+- Mutation checks: 11 mutants (ordering by text, skipped tag/section checks, comparing raw
+  bodies, case-sensitive title match, headings inside code blocks, sync dropping unreleased
+  sections, notes not shifting headings back), all killed.
+
 ## 2026-11-13 (interactive): WG009 workflow_run
 
 Why: picked by the owner ("WG009 workflow_run"). A `workflow_run` workflow runs with the base
@@ -579,9 +615,6 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.16.0` and publish its release notes (needs the owner's approval of the notes).
-2. Publish more of the release in one place: a CHANGELOG.md generated from the releases (the
-   Release check could then also check that it lists the newest tag).
-3. WG009 follow-ups: `git checkout`/`git fetch` of the triggering commit inside `run:`, and
+1. WG009 follow-ups: `git checkout`/`git fetch` of the triggering commit inside `run:`, and
    `on.workflow_run.branches` filters.
-4. The Marketplace listing (needs the owner: it's a public listing under their account).
+2. The Marketplace listing (needs the owner: it's a public listing under their account).

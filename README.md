@@ -331,7 +331,8 @@ src/workflow_guard/
   model.py     Finding, Severity
   cli.py       arguments, file discovery, text/JSON/SARIF/GitHub output, exit codes
 action.yml     the composite GitHub Action
-scripts/release_check.py  the Release check workflow's script (versions, tags, releases)
+scripts/release_check.py  the Release check workflow's script (versions, tags, releases, changelog)
+scripts/release_notes.py  CHANGELOG.md <-> GitHub Release notes (notes, title, sync)
 .pre-commit-hooks.yaml  the pre-commit hook
 tests/         pytest: rules, CLI, SARIF, annotations, action.yml and the hook, and --fix
                (with a local HTTP server standing in for GitHub); fixtures/ holds an unsafe workflow
@@ -350,18 +351,31 @@ Ubuntu and Windows.
 
 ## Releasing
 
-1. Bump the version in `pyproject.toml` and `src/workflow_guard/__init__.py` in the pull request.
+1. In the pull request: bump the version in `pyproject.toml` and
+   `src/workflow_guard/__init__.py`, and add its section at the top of
+   [CHANGELOG.md](CHANGELOG.md): `## vX.Y.Z — Title`, then the release notes (headings start at
+   `###`; the date can wait).
 2. Merge, then tag the merge commit and push the tag: `git tag -a vX.Y.Z <sha>`,
    `git push origin vX.Y.Z`.
-3. Publish a GitHub Release for the tag with its notes:
-   `gh release create vX.Y.Z --verify-tag --notes-file notes.md`.
+3. Publish the GitHub Release from that section:
+
+   ```bash
+   gh release create vX.Y.Z --verify-tag \
+     --title "$(python scripts/release_notes.py title vX.Y.Z)" \
+     --notes-file <(python scripts/release_notes.py notes vX.Y.Z)
+   ```
 
 The **Release check** workflow (`scripts/release_check.py`, standard library only) runs on pull
 requests, pushes to main, `v*` tags and published releases. It fails when the two versions
 disagree, when the version is older than the newest tag (a lost bump), when a pushed tag doesn't
-match the code, or when an older tag has no release. A missing tag or release for the newest
-version is a warning, since that is the normal state between the steps above. Run it locally
-with `python scripts/release_check.py --releases` (needs the GitHub CLI).
+match the code, or when an older tag has no release. It also fails when CHANGELOG.md has no
+section for the version in the code or for a tag, isn't newest first, or says something else
+than the GitHub Release (title or text; headings may be one level apart, and a first heading
+that repeats the title is ignored). A missing tag or release for the newest version is a
+warning, since that is the normal state between the steps above, and so is a wrong date. Run it
+locally with `python scripts/release_check.py --releases` (needs the GitHub CLI). If a release
+was edited on GitHub, `python scripts/release_notes.py sync` copies the releases into
+CHANGELOG.md.
 
 ## Limitations
 
