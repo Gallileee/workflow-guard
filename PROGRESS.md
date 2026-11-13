@@ -1,5 +1,39 @@
 # Progress log
 
+## 2026-11-13 (interactive): Milestone 15, every tainted caller in the message
+
+Why: next step 2, picked by the owner ("List all callers"). Since milestone 12 a finding inside
+a reusable workflow or action showed only the worst caller. With several callers passing a
+title, fixing that one and re-running revealed the next one, one at a time.
+
+Acceptance criteria:
+- WG004 and WG007 findings on an input name every *other* local caller that passes untrusted
+  text, after the existing message: `; other callers pass untrusted text too: <hop> ('<source>'); ...`.
+- The worst caller still leads (the detour); others follow highest severity first, then in
+  file order; no duplicates; callers passing clean values aren't listed.
+- Works for reusable workflows (job callers) and actions (step callers), through env detours in
+  the callee and through chains (a middle workflow's own callers are carried along).
+- One tainted caller: message unchanged. No change on the five local repositories.
+
+Done:
+- `taint.py`: `Taint.callers`, `merge_callers` (worst first, others listed, nested lists kept).
+- `calls.py`: `link_local_calls` collects every tainted value per input and merges them.
+- `rules.py`: `_other_callers` suffix for WG004 (`_injection_message`) and WG007.
+- Tests: `test_all_callers.py` (6). 298 in total. Version 0.15.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 298 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: no de-duplication fails 1 test, no severity ordering 2, dropping a middle
+  caller's own list 1.
+- Demo (scratch folder: triage.yml with the PR title, issues.yml with the issue title, push.yml
+  with a constant, all calling label.yml): one high finding led by issues.yml, triage.yml listed,
+  push.yml not.
+- JSON output for workflow-guard, lendloop, fitness-workout-log, transit-raptor and
+  GaTe-parking is byte-identical to v0.14.0's.
+
+Note: the SARIF fingerprint includes the message, so a finding that gains a caller list gets a
+new fingerprint in code scanning (the old alert closes, a new one opens).
+
 ## 2026-11-13 (interactive): Milestone 14, outputs back to the caller
 
 Why: next step 2, picked by the owner ("Outputs to callers"). Milestones 12 and 13 followed
@@ -489,10 +523,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.14.0` and publish its release once the owner approves the drafted notes
-   (`prVSCode/workflow-guard-v0.14.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
+1. Tag `v0.15.0` and publish its release once the owner approves the drafted notes
+   (`prVSCode/workflow-guard-v0.15.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
    fitness-workout-log and transit-raptor.
-2. Per-call inputs for findings too: a finding inside an action is reported with the worst
-   caller; it could list every caller that passes untrusted text.
+2. A release check in CI: the version in `pyproject.toml` matches the latest tag, and every
+   tag has a GitHub Release.
 3. A CHANGELOG.md in the repository with the same content as the releases.
 4. The Marketplace listing (needs the owner: it's a public listing under their account).
