@@ -105,18 +105,14 @@ class Taint:
         return replace(self, via=(*self.via, hop))
 
 
-def direct_taint(path: ContextPath, in_action: bool) -> Taint | None:
-    """The taint of a context path on its own, without looking at env or outputs."""
+def direct_taint(path: ContextPath) -> Taint | None:
+    """The taint of a context path on its own, without looking at env, outputs or inputs."""
     if any(matches(path.segments, pattern) for pattern in UNTRUSTED):
         return Taint(OUTSIDER, str(path), Severity.HIGH)
     if path.function == "tojson":
         inside = next((p for p in UNTRUSTED if is_ancestor(path.segments, p)), None)
         if inside is not None:
             return Taint(TOJSON, str(path), Severity.HIGH, example=".".join(inside))
-    # In a composite action, inputs come from whichever workflow calls it, and that workflow may
-    # pass a pull request title straight through: the action can't know, so it must not trust them.
-    if in_action and len(path.segments) >= 2 and path.segments[0] == "inputs":
-        return Taint(INPUT, str(path), Severity.MEDIUM)
     return None
 
 
@@ -190,10 +186,10 @@ class Tracker:
         for key in self._jobs:
             yield from self._walk_job(key)[0]
 
-    def taint_of_value(self, text: str) -> Taint | None:
-        """The taint of a value outside any step, such as a ``with:`` value of a job that calls a
-        reusable workflow (it can read ``needs``, ``inputs`` and ``github``, but no ``env``)."""
-        return self._taint_of_text(text, Scope())
+    def taint_of_value(self, text: str, scope: Scope | None = None) -> Taint | None:
+        """The taint of a ``with:`` value: of a step, seen with that step's ``scope``, or of a
+        job that calls a reusable workflow (no scope: ``needs``, ``inputs`` and ``github`` only)."""
+        return self._taint_of_text(text, scope or Scope())
 
     def taint_of_expression(self, expr: Expression, scope: Scope) -> tuple[ContextPath, Taint] | None:
         """The first tainted path in one expression, with its taint."""
@@ -205,11 +201,11 @@ class Tracker:
     # --- values -----------------------------------------------------------------------------
 
     def _taint_of_path(self, path: ContextPath, scope: Scope) -> Taint | None:
-        if (taint := direct_taint(path, self.wf.is_action)) is not None:
-            return taint
         seg = path.segments
-        if seg[0] == "inputs" and len(seg) >= 2 and self.wf.is_reusable:
-            return self._reusable_input(path)
+        if seg[0] == "inputs" and len(seg) >= 2 and (self.wf.is_action or self.wf.is_reusable):
+            return self._caller_input(path)
+        if (taint := direct_taint(path)) is not None:
+            return taint
         if seg[0] == "env" and len(seg) >= 2 and (found := scope.env_by_expression(seg[1])):
             return found[1]
         if seg[0] == "steps" and len(seg) >= 4 and seg[2] == "outputs":
@@ -218,9 +214,10 @@ class Tracker:
             return self._walk_job(seg[1])[1].get(seg[3]) if seg[1] in self._jobs else None
         return None
 
-    def _reusable_input(self, path: ContextPath) -> Taint | None:
-        """``inputs.<name>`` of a reusable workflow: what the known local callers pass in, or,
-        with no caller among the checked files, possibly anything (like a composite action)."""
+    def _caller_input(self, path: ContextPath) -> Taint | None:
+        """``inputs.<name>`` of a composite action or reusable workflow: what the known local
+        callers pass in. With no caller among the checked files, possibly anything: a caller
+        may pass a pull request title straight through, and the callee can't know."""
         name = path.segments[1]
         if self.wf.input_taints is not None:
             return self.wf.input_taints.get(name)
@@ -353,7 +350,7 @@ class Tracker:
                     segments.append("*")
                 else:
                     segments.append((seg["name"] or seg["sq"] or seg["dq"] or "").lower())
-            if (taint := direct_taint(ContextPath(tuple(segments), None), self.wf.is_action)) is not None:
+            if (taint := direct_taint(ContextPath(tuple(segments), None))) is not None:
                 return taint
         for match in _JS_ENV.finditer(text):
             if (taint := scope.env.get(match["name"] or match["key"])) is not None:

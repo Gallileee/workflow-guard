@@ -28,6 +28,8 @@ class WorkflowError(Exception):
 
 WORKFLOW = "workflow"
 ACTION = "action"
+ACTION_FILES = ("action.yml", "action.yaml")
+"""The names an action's metadata file can have; a local ``uses: ./dir`` reads one of them."""
 ACTION_JOB = "(action)"
 """The job id given to the steps of a composite action, which has no jobs."""
 
@@ -85,9 +87,9 @@ class Workflow:
     kind: str = WORKFLOW
     """``WORKFLOW`` or ``ACTION``."""
     input_taints: dict[str, Taint] | None = None
-    """For a reusable workflow: the untrusted text local callers pass into each input (names in
-    lower case), filled in by ``calls.link_local_calls``. None = no caller among the checked
-    files, so any caller is possible."""
+    """For a reusable workflow or an action: the untrusted text local callers pass into each
+    input (names in lower case), filled in by ``calls.link_local_calls``. None = no caller among
+    the checked files, so any caller is possible."""
 
     @classmethod
     def load(cls, path: Path, display_path: str | None = None) -> Workflow:

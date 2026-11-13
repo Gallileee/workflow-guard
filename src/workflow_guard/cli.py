@@ -21,11 +21,10 @@ from .fix import GitHubResolver, Resolver, fallback_gap, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
 from .sarif import to_sarif
-from .workflow import Workflow, WorkflowError
+from .workflow import ACTION_FILES, Workflow, WorkflowError
 
 DEFAULT_DIR = Path(".github") / "workflows"
 LOCAL_ACTIONS_DIR = Path(".github") / "actions"
-ACTION_FILES = ("action.yml", "action.yaml")
 
 
 def default_paths() -> list[Path]:

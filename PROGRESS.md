@@ -1,5 +1,39 @@
 # Progress log
 
+## 2026-11-13 (interactive): Milestone 13, local action inputs
+
+Why: next step 2, picked by the owner ("Composite action inputs") after v0.12.0 was published.
+Milestone 12 linked reusable workflows to their callers, but a composite action's inputs were
+still always medium, even when the only caller in the repository passes clean values, and a
+caller passing a comment body only made it medium instead of high.
+
+Acceptance criteria:
+- A step with `uses: ./<folder>` (also `uses: ./` for a root `action.yml`) is a caller of that
+  folder's `action.yml`/`action.yaml` when both files are checked.
+- Its `with:` values are read with what is tainted at that step: env at every level (the
+  step's own too) and earlier step outputs. Worst caller wins; clean callers mean no finding.
+- Chains: composite action -> local action, reusable workflow -> local action.
+- No change in findings on the five local repositories.
+
+Done:
+- `calls.py`: `local_calls` adds step calls (`Call.step`, `where` = file:line), `repo_root`
+  finds the folder holding `.github` from any depth, `_scope_of` gets the step's scope from
+  the caller's `Tracker`.
+- `taint.py`: inputs of actions go through the same `_caller_input` as reusable workflows;
+  `direct_taint` lost its `in_action` flag; `taint_of_value` takes a scope.
+- `workflow.py`: `ACTION_FILES` moved here from `cli.py`.
+- Tests: `test_local_actions.py` (13). 280 in total. Version 0.13.0.
+
+Verified locally (Python 3.14 venv):
+- `pytest -q -W error`: 280 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: evaluating `with:` without the step's scope fails 2 tests; not resolving
+  step calls at all fails 9.
+- Demo (`reply.yml` on `issue_comment` passing the comment body through step `env:` into
+  `.github/actions/comment`): high with the detour named; the action alone gives medium.
+- This repository's own `ci.yml` (`uses: ./` three times) is now linked to `action.yml` and
+  found clean. JSON output for workflow-guard, lendloop, fitness-workout-log, transit-raptor
+  and GaTe-parking is byte-identical to v0.12.0's.
+
 ## 2026-11-13 (scheduled run): Milestone 12, local reusable workflows
 
 Why: the open item from the previous runs ("checking inside called local reusable workflows").
@@ -418,11 +452,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.12.0` and publish its release once the owner approves the drafted notes
-   (`prVSCode/workflow-guard-v0.12.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
+1. Tag `v0.13.0` and publish its release once the owner approves the drafted notes
+   (`prVSCode/workflow-guard-v0.13.0-release-notes-DRAFT.md`); then bump the pins in lendloop,
    fitness-workout-log and transit-raptor.
-2. Link inputs of local composite actions (`uses: ./.github/actions/x` + `with:`) the same way
-   `calls.py` links reusable workflows, and outputs of a reusable workflow back to its caller
-   (`needs.<call>.outputs.*`).
+2. Outputs of a reusable workflow back to its caller (`needs.<call>.outputs.*`) and outputs of a
+   local action back to the calling step (`steps.<id>.outputs.*`).
 3. A CHANGELOG.md in the repository with the same content as the releases.
 4. The Marketplace listing (needs the owner: it's a public listing under their account).
