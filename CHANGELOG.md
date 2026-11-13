@@ -4,7 +4,43 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.17.0 — WG009 sees git checkouts in scripts
+## v0.18.0 — WG004 checks actions that run a script
+
+### Script inputs of actions
+
+WG004 (untrusted `${{ }}` pasted into code) and WG008 (secrets pasted into code) looked only at
+`run:` and `actions/github-script`. Many workflows run their commands through an action
+instead: over SSH, in a container, with retries. Their script inputs are now checked too:
+
+| Action | Inputs |
+|--------|--------|
+| `appleboy/ssh-action` | `script` |
+| `garygrossgarten/github-action-ssh`, `google-github-actions/ssh-compute` | `command` |
+| `addnab/docker-run-action` | `run` |
+| `uraimo/run-on-arch-action` | `run`, `install`, `setup` |
+| `nick-fields/retry`, `nick-invision/retry` | `command`, `on_retry_command`, `new_command_on_retry` |
+| `Wandalen/wretry.action` | `command` |
+| `azure/cli`, `azure/powershell` | `inlineScript` |
+| `cypress-io/github-action` | `build`, `start`, `command`, `install-command` |
+| `mathiasvr/command-output` | `run` |
+| `jannekem/run-python-script-action` | `script` |
+
+The message names the action and, where the step's `env:` doesn't reach the script, how to pass a
+variable there:
+
+```
+.github/workflows/deploy.yml:16:19: WG004 [high] 'github.event.pull_request.title' can be set by
+outsiders and is pasted into a script; pass it through 'env:' and use the variable instead
+(appleboy/ssh-action runs its 'script' input as a script; on the server, pass it with the
+action's 'envs:' input)
+```
+
+Detours (`env:`, step and job outputs, local callers) are followed into these inputs as into
+`run:`. Other inputs of the same actions (`host:`, `key:`) are data and stay unreported.
+
+Other rules' output is unchanged.
+
+## v0.17.0 — WG009 sees git checkouts in scripts (2026-11-13)
 
 ### Checking out with git or gh in a script
 

