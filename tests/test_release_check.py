@@ -110,6 +110,9 @@ def test_main_reads_a_real_repository(tmp_path, monkeypatch, capsys):
     (tmp_path / "src" / "workflow_guard" / "__init__.py").write_text(
         '__version__ = "0.2.0"\n', encoding="utf-8"
     )
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## v0.3.0\n\nc\n\n## v0.2.0\n\nb\n\n## v0.1.0\n\na\n", encoding="utf-8"
+    )
     _git(tmp_path, "init", "-q")
     _git(
         tmp_path,
@@ -139,3 +142,96 @@ def test_main_reads_a_real_repository(tmp_path, monkeypatch, capsys):
 def test_main_reports_an_unreadable_repository(tmp_path, capsys):
     assert rc.main([], root=tmp_path) == 2
     assert "cannot read the release state" in capsys.readouterr().err
+
+
+# --- CHANGELOG.md --------------------------------------------------------------------------------
+
+rn = sys.modules["release_notes"]
+CL_TAGS = ["v0.9.0", "v0.10.0"]
+
+
+def section(tag, text="notes", title=None, date=""):
+    return rn.Section(tag, title or f"{tag} — T", date, text, line=3)
+
+
+def released(tag, body="notes", name=None, date="2026-11-09"):
+    return rn.Release(tag, name or f"{tag} — T", body, date)
+
+
+def changelog(*tags):
+    return [section(t) for t in tags]
+
+
+def test_a_complete_changelog_is_clean():
+    releases = {t: released(t) for t in CL_TAGS}
+    assert rc.check_changelog(changelog("v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS, releases) == []
+
+
+def test_a_missing_changelog_is_an_error():
+    (p,) = rc.check_changelog(None, "0.10.0", CL_TAGS)
+    assert p.level == rc.ERROR and "CHANGELOG.md is missing" in p.text
+
+
+def test_the_bumped_version_needs_its_section_in_the_pull_request():
+    (p,) = rc.check_changelog(changelog("v0.10.0", "v0.9.0"), "0.11.0", CL_TAGS)
+    assert p.level == rc.ERROR
+    assert "no section for v0.11.0: write its release notes there" in p.text
+    assert rc.check_changelog(changelog("v0.11.0", "v0.10.0", "v0.9.0"), "0.11.0", CL_TAGS) == []
+
+
+def test_every_tag_needs_a_section():
+    (p,) = rc.check_changelog(changelog("v0.10.0"), "0.10.0", CL_TAGS)
+    assert p.text == "CHANGELOG.md has no section for tag v0.9.0"
+
+
+def test_a_section_for_an_unknown_version_is_an_error():
+    (p,) = rc.check_changelog(changelog("v0.12.0", "v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS)
+    assert "section v0.12.0 is neither tagged nor the version in the code (0.10.0)" in p.text
+
+
+def test_sections_must_be_newest_first_by_number():
+    (p,) = rc.check_changelog(changelog("v0.9.0", "v0.10.0"), "0.10.0", CL_TAGS)
+    assert "aren't newest first" in p.text
+    # as text "v0.9.0" > "v0.10.0"; as versions it isn't
+    assert rc.check_changelog(changelog("v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS) == []
+
+
+def test_a_second_section_for_a_tag_is_an_error():
+    problems = rc.check_changelog(changelog("v0.10.0", "v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS)
+    assert [p.text for p in problems] == ["CHANGELOG.md:3: a second section for v0.10.0"]
+
+
+def test_text_and_title_must_match_the_release():
+    releases = {
+        "v0.10.0": released("v0.10.0", body="edited on GitHub"),
+        "v0.9.0": released("v0.9.0", name="Other"),
+    }
+    problems = rc.check_changelog(changelog("v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS, releases)
+    assert [p.level for p in problems] == [rc.ERROR, rc.ERROR]
+    assert "the text of v0.10.0 differs from its GitHub Release" in problems[0].text
+    assert "title 'v0.9.0 — T' differs from the release's 'Other'" in problems[1].text
+
+
+def test_the_release_body_may_repeat_the_title_and_use_shallower_headings():
+    body = "## v0.10.0 — T\n\n## Upgrade\n\nnotes"
+    releases = {"v0.10.0": released("v0.10.0", body=body)}
+    sections = [section("v0.10.0", "### Upgrade\n\nnotes"), section("v0.9.0")]
+    assert rc.check_changelog(sections, "0.10.0", CL_TAGS, releases) == []
+
+
+def test_a_wrong_date_is_a_warning_and_a_missing_one_is_fine():
+    releases = {"v0.10.0": released("v0.10.0", date="2026-11-13")}
+    sections = [section("v0.10.0", date="2026-11-12"), section("v0.9.0")]
+    (p,) = rc.check_changelog(sections, "0.10.0", CL_TAGS, releases)
+    assert p.level == rc.WARNING and "released on 2026-11-13, not 2026-11-12" in p.text
+    assert rc.check_changelog(changelog("v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS, releases) == []
+
+
+def test_unreleased_sections_are_not_compared():
+    assert rc.check_changelog(changelog("v0.10.0", "v0.9.0"), "0.10.0", CL_TAGS, {}) == []
+
+
+def test_this_repositorys_changelog_covers_its_version():
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    version = rc.read_version(pyproject, rc._PYPROJECT_VERSION, "pyproject.toml")
+    assert f"v{version}" in {s.tag for s in rc.read_changelog(ROOT)}
