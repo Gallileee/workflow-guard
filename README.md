@@ -265,8 +265,11 @@ be read or parsed, or bad arguments.
   every job with `uses: ./.github/workflows/<file>.yml` links the caller to that file. The
   caller's `with:` values are read like any other value (direct `${{ }}`, `needs.*.outputs`,
   its own `inputs.*` when it is reusable too), and the called workflow's `inputs.<name>` then
-  carries the worst of what its callers pass. A chain of reusable workflows is linked caller
-  first. With no caller among the checked files, inputs stay medium, except `type: boolean`
+  carries the worst of what its callers pass. The finding's detour shows that caller; every
+  other caller that also passes untrusted text is listed at the end of the message
+  (`other callers pass untrusted text too: with.title in .github/workflows/issues.yml (job
+  'label') ('github.event.issue.title'); ...`), so all of them can be fixed at once. Callers
+  passing clean values aren't listed. A chain of reusable workflows is linked caller first. With no caller among the checked files, inputs stay medium, except `type: boolean`
   and `type: number`, which can't carry text; `workflow_dispatch` inputs are trusted (only
   people with write access can start a run):
 

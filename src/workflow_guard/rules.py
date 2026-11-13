@@ -119,7 +119,18 @@ def write_all(wf: Workflow) -> Iterator[Finding]:
 _ADVICE = "pass it through 'env:' and use the variable instead"
 
 
+def _other_callers(taint: Taint) -> str:
+    """The end of a message for an input that several local callers fill with untrusted text."""
+    if not taint.callers:
+        return ""
+    return f"; other callers pass untrusted text too: {'; '.join(taint.callers)}"
+
+
 def _injection_message(path: ContextPath, taint: Taint) -> str:
+    return _injection_text(path, taint) + _other_callers(taint)
+
+
+def _injection_text(path: ContextPath, taint: Taint) -> str:
     """Direct uses keep their short message; a detour through env/outputs is spelled out."""
     if not taint.via:
         if taint.kind == TOJSON:
@@ -209,7 +220,7 @@ def untrusted_github_env(wf: Workflow) -> Iterator[Finding]:
                 "WG007",
                 write.taint.severity,
                 f"{_origin(write.taint)}{via} is written to {target}; {effect}."
-                " Keep it in a step output or a file instead",
+                f" Keep it in a step output or a file instead{_other_callers(write.taint)}",
                 line_offset=offset,
             )
 

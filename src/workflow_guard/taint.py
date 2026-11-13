@@ -101,9 +101,27 @@ class Taint:
     """For ``TOJSON``: one untrusted field inside the object."""
     via: tuple[str, ...] = ()
     """The detour, oldest first, e.g. ``("env.TITLE (job 'test')", "steps.meta.outputs.title")``."""
+    callers: tuple[str, ...] = ()
+    """For an input of a reusable workflow or action: the *other* local callers that pass
+    untrusted text into it too (``via`` shows the worst one), e.g.
+    ``"with.title in .github/workflows/b.yml (job 'call') ('github.event.issue.title')"``."""
 
     def through(self, hop: str) -> Taint:
         return replace(self, via=(*self.via, hop))
+
+
+def merge_callers(taints: list[Taint]) -> Taint:
+    """One input's taint from several callers: the worst one (the first of equals) with every
+    other caller listed in ``callers``, highest severity first, without duplicates."""
+    ordered = sorted(taints, key=lambda t: -t.severity)  # stable: callers keep file order
+    worst, others = ordered[0], ordered[1:]
+    listed = list(worst.callers)
+    for taint in others:
+        hop = taint.via[-1] if taint.via else taint.source
+        for entry in (f"{hop} ('{taint.source}')", *taint.callers):
+            if entry not in listed:
+                listed.append(entry)
+    return replace(worst, callers=tuple(listed))
 
 
 def direct_taint(path: ContextPath) -> Taint | None:

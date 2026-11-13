@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from yaml.nodes import MappingNode, Node
 
 from .project import Project, call_site, file_key
-from .taint import Scope, Taint, Tracker
+from .taint import Scope, Taint, Tracker, merge_callers
 from .workflow import Workflow, get, scalar
 
 
@@ -65,7 +65,7 @@ def local_calls(workflows: Sequence[Workflow], project: Project | None = None) -
 def link_local_calls(workflows: Sequence[Workflow]) -> None:
     """Give every checked file the ``Project`` (so trackers can follow outputs of local calls),
     and set ``input_taints`` on every checked reusable workflow or action that a checked file
-    calls.
+    calls: per input the worst caller, with the other tainted callers in ``Taint.callers``.
 
     A caller may itself be called, passing its own inputs on, so callers are linked first. A
     loop of calls (which GitHub rejects) is cut where it closes."""
@@ -80,16 +80,14 @@ def link_local_calls(workflows: Sequence[Workflow]) -> None:
         if key in done or key in linking or key not in calls:
             return  # no caller among the checked files: input_taints stays None
         linking.add(key)
-        taints: dict[str, Taint] = {}
+        passed: dict[str, list[Taint]] = {}
         for call in calls[key]:
             link(file_key(call.caller.path))
             tracker = Tracker(call.caller)
             scope = _scope_of(tracker, call.step)
             for name, taint in tracker.with_taints(call.with_node, scope, call.where).items():
-                current = taints.get(name)
-                if current is None or taint.severity > current.severity:
-                    taints[name] = taint
-        project.files[key].input_taints = taints
+                passed.setdefault(name, []).append(taint)
+        project.files[key].input_taints = {name: merge_callers(found) for name, found in passed.items()}
         linking.discard(key)
         done.add(key)
 
