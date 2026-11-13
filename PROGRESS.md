@@ -1,5 +1,36 @@
 # Progress log
 
+## 2026-11-13 (interactive): WG009 follow-ups
+
+Why: picked by the owner ("WG009 follow-ups"). WG009 (v0.16.0) only saw `actions/checkout`; the
+same attack written as `git fetch origin $SHA && git checkout FETCH_HEAD` in a script went
+unreported. And its limitations said `branches:` filters "aren't read", as if they could make a
+workflow safe; they can't (a fork picks its branch name).
+
+Acceptance criteria:
+- High: a `run:` line with `git checkout|switch|fetch|pull|reset|worktree add` (also
+  `git -C dir ...`) and a reference to the triggering run's head, directly or through an `env:`
+  variable of the workflow, job or step (`$X`, `${X}`, `${{ env.X }}`; step overrides job
+  overrides workflow); `gh pr checkout` with any reference to the triggering run. `\`
+  continuations are joined; other lines don't count.
+- No finding for `git checkout main`, `gh pr checkout 12`, `gh pr view <run PR>`, or a head SHA
+  only echoed.
+- A `branches:`/`branches-ignore:` filter under `on.workflow_run` is named in WG009 messages as
+  no protection; trusted triggering workflows are still not reported.
+- Release notes written in CHANGELOG.md in this pull request (the new release process).
+
+Done:
+- `rules.py`: `_script_checks_out_run`, `_env_naming`, `_names`, `_branch_filter_note`.
+- Tests: 31 more in `test_wg009.py`. 397 in total.
+- README (WG009 row, limitations), CHANGELOG.md `v0.17.0`, version 0.17.0.
+
+Verified locally:
+- `pytest -q -W error`: 397 passed. `ruff check`, `ruff format --check`: clean.
+- Mutation checks: 13 mutants (no continuation joining, whole script as one line, no
+  `${{ env.X }}`, no `$X`, wrong env override order, gh pr checkout without a run reference, no
+  git command required, no `-C`, no `worktree add`, no `branches-ignore`, no branch note), all
+  killed.
+
 ## 2026-11-13 (interactive): CHANGELOG.md
 
 Why: picked by the owner ("CHANGELOG.md"). The release notes of 13 versions lived only on
@@ -615,6 +646,6 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. WG009 follow-ups: `git checkout`/`git fetch` of the triggering commit inside `run:`, and
-   `on.workflow_run.branches` filters.
-2. The Marketplace listing (needs the owner: it's a public listing under their account).
+1. Tag `v0.17.0` and publish its release from CHANGELOG.md (needs the owner's approval).
+2. WG004 for more actions that take a script as an input (beyond `run:` and github-script).
+3. The Marketplace listing (needs the owner: it's a public listing under their account).

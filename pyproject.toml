@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workflow-guard"
-version = "0.16.0"
+version = "0.17.0"
 description = "Find common security mistakes in GitHub Actions workflows"
 readme = "README.md"
 license = "MIT"

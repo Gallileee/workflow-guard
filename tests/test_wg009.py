@@ -250,3 +250,112 @@ def test_a_workflow_of_another_repository_doesnt_count():
         str(Path("other").resolve() / ".github" / "workflows" / "ci.yml"),
     )
     assert len(report("[CI]", elsewhere)) == 1
+
+
+# --- checking out with git or gh in a script -----------------------------------------------------
+
+HEAD = "${{ github.event.workflow_run.head_sha }}"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        f"git checkout {HEAD}",
+        f"git -C src checkout {HEAD}",
+        f"git fetch origin {HEAD} && git switch --detach FETCH_HEAD",
+        "git fetch origin ${{ github.event.workflow_run.head_branch }}",
+        f"git reset --hard {HEAD}",
+        f"git worktree add ../pr {HEAD}",
+        "gh pr checkout ${{ github.event.workflow_run.pull_requests[0].number }}",
+    ],
+)
+def test_a_script_checking_out_the_triggering_commit_is_high(script):
+    ((line, severity, message),) = wg009(on_run(f"- run: {script}"))
+    assert (line, severity) == (10, Severity.HIGH)
+    assert message.startswith("checks out the triggering run's code with git or gh in a script")
+    assert message.endswith("can be a pull request from a fork, and its code then runs here")
+
+
+def test_a_multi_line_script_and_a_continued_line():
+    text = on_run("- run: |", "    npm ci", "    git fetch origin \\", f"      {HEAD}", "    make")
+    assert [s for _, s, _ in wg009(text)] == [Severity.HIGH]
+
+
+@pytest.mark.parametrize(
+    "use", ['git checkout "$HEAD_SHA"', "git checkout ${HEAD_SHA}", "git checkout ${{ env.HEAD_SHA }}"]
+)
+@pytest.mark.parametrize("where", ["workflow", "job", "step"])
+def test_through_an_env_variable(use, where):
+    env = f"env:\n  HEAD_SHA: {HEAD}\n"
+    text = on_run("- run: " + use if "${{" not in use else f"- run: '{use}'")
+    if where == "workflow":
+        text = text.replace("permissions: {}\n", "permissions: {}\n" + env)
+    elif where == "job":
+        text = text.replace("    runs-on: x\n", "    runs-on: x\n    env:\n      HEAD_SHA: " + HEAD + "\n")
+    else:
+        text += "        env:\n          HEAD_SHA: " + HEAD + "\n"
+    assert [s for _, s, _ in wg009(text)] == [Severity.HIGH]
+
+
+def test_a_step_env_overrides_the_job_env():
+    text = on_run('- run: git checkout "$REF"', "  env:", "    REF: main")
+    text = text.replace("    runs-on: x\n", "    runs-on: x\n    env:\n      REF: " + HEAD + "\n")
+    assert wg009(text) == []
+
+
+def test_gh_pr_checkout_through_an_env_variable():
+    text = on_run(
+        '- run: gh pr checkout "$PR"',
+        "  env:",
+        "    PR: ${{ github.event.workflow_run.pull_requests[0].number }}",
+    )
+    assert [s for _, s, _ in wg009(text)] == [Severity.HIGH]
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "git checkout main",
+        f"echo {HEAD}",  # no checkout (WG004 has nothing to say either: a SHA is safe)
+        "git fetch origin && make",
+        'git checkout "$OTHER"',
+        "gh pr checkout 12",
+        "gh pr view ${{ github.event.workflow_run.pull_requests[0].number }}",
+    ],
+)
+def test_scripts_that_dont_check_out_the_triggering_commit(script):
+    assert wg009(on_run(f"- run: {script}")) == []
+
+
+def test_a_head_reference_on_another_line_doesnt_count():
+    text = on_run("- run: |", "    git fetch origin", f"    echo {HEAD}")
+    assert wg009(text) == []
+
+
+def test_scripts_in_other_workflows_are_not_checked():
+    assert wg009(on_run(f"- run: git checkout {HEAD}", trigger="push")) == []
+
+
+# --- branches filters ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["branches", "branches-ignore"])
+def test_a_branches_filter_is_named_as_no_protection(key):
+    trigger = f"workflow_run:\n    workflows: [CI]\n    {key}: [main]"
+    ((_, severity, message),) = wg009(on_run(f"- run: git checkout {HEAD}", trigger=trigger))
+    assert severity == Severity.HIGH
+    assert f"('{key}:' under 'on.workflow_run' doesn't prevent that" in message
+    assert "which the fork picks), and its code then runs here" in message
+
+
+def test_no_branches_filter_no_note():
+    ((_, _, message),) = wg009(on_run(f"- run: git checkout {HEAD}"))
+    assert "doesn't prevent that" not in message
+
+
+def test_a_branches_filter_doesnt_report_trusted_workflows():
+    text = on_run(
+        f"- run: git checkout {HEAD}", trigger="workflow_run:\n    workflows: [CI]\n    branches: [main]"
+    )
+    others = [triggering("CI", "push")]
+    assert wg009(text, str(ROOT / ".github" / "workflows" / "report.yml"), others) == []
