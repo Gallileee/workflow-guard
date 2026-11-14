@@ -56,13 +56,31 @@ jobs:
           ignore: WG004
           fail-on: high
           format: text
+      - name: A custom action passes without script-inputs
+        uses: ./
+        with:
+          paths: tests/fixtures/custom-script-input.yml
+      - name: With script-inputs its commands input is checked
+        id: custom
+        continue-on-error: true
+        uses: ./
+        with:
+          paths: tests/fixtures/custom-script-input.yml
+          script-inputs: |
+            other-org/tool:run
+            my-org/deploy:commands
+          format: json
+          output: custom.json
       - name: Check the results
         shell: bash
         env:
           OUTCOME: ${{ steps.unsafe.outcome }}
+          CUSTOM: ${{ steps.custom.outcome }}
         run: |
           test "$OUTCOME" = failure
           grep -q '"rule": "WG004"' findings.json
+          test "$CUSTOM" = failure
+          grep -q "my-org/deploy runs its 'commands' input as a script" custom.json
 
   # Uploads this repository's own results to GitHub code scanning (Security tab, PR annotations).
   code-scanning:

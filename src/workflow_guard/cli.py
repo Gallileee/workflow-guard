@@ -21,6 +21,7 @@ from .fix import GitHubResolver, Resolver, fallback_gap, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
 from .sarif import to_sarif
+from .scripts import merge_script_inputs, parse_script_input
 from .workflow import ACTION_FILES, Workflow, WorkflowError
 
 DEFAULT_DIR = Path(".github") / "workflows"
@@ -72,6 +73,14 @@ def _comment_spaces(text: str) -> int:
     if not 1 <= n <= 8:
         raise argparse.ArgumentTypeError(f"expected a number from 1 to 8, got {text!r}")
     return n
+
+
+def _script_input(text: str) -> str:
+    try:
+        parse_script_input(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -132,6 +141,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="with --fix: spaces before the added '# v4' comment (default: what the file's "
         "comments already use; without any, 1 if the repository uses Prettier, else 2)",
+    )
+    parser.add_argument(
+        "--script-input",
+        type=_script_input,
+        action="append",
+        default=[],
+        metavar="ACTION:INPUTS",
+        help="an action of yours that runs an input as a script, e.g. my-org/deploy:commands "
+        "(several inputs separated by commas; repeat the option for more actions); WG004 and "
+        "WG008 then check those inputs like run:",
     )
     parser.add_argument("--list-rules", action="store_true", help="print the rules and exit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -201,6 +220,9 @@ def run(
         except WorkflowError as e:
             print(f"{f.as_posix()}: error: {e}", file=err)
             errors.append((f.as_posix(), str(e)))
+    script_inputs = merge_script_inputs(args.script_input)
+    for wf in loaded:
+        wf.script_inputs = script_inputs
     # All files first: a reusable workflow's inputs depend on what its callers pass in.
     link_local_calls(loaded)
     findings: list[Finding] = []

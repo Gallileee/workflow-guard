@@ -69,3 +69,10 @@ def test_pre_commit_hook_only_matches_workflow_files():
     assert not files.search(".github/workflows/sub/x.yml")  # GitHub doesn't read subdirectories
     assert not files.search("docs/.github/workflows/ci.yml")
     assert not files.search(".github/workflows/notes.txt")
+
+
+def test_action_passes_each_script_input_as_an_option():
+    script = STEPS[-1]["run"]
+    assert 'for spec in $WG_SCRIPT_INPUTS; do args+=(--script-input "$spec"); done' in script
+    # set -f comes first, so a spec isn't expanded as a file pattern
+    assert script.index("set -f") < script.index("for spec in")

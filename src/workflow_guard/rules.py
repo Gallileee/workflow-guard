@@ -162,7 +162,7 @@ def _injection_text(path: ContextPath, taint: Taint) -> str:
 def template_injection(wf: Workflow) -> Iterator[Finding]:
     tracker = Tracker(wf)
     for tracked in tracker.steps():
-        for script in scripts(tracked.step):
+        for script in scripts(tracked.step, wf.script_inputs):
             node = script.node
             for expr in find_expressions(node.value):
                 hit = tracker.taint_of_expression(expr, tracked.scope)
@@ -265,7 +265,7 @@ def secrets_exposure(wf: Workflow) -> Iterator[Finding]:
 
     # ${{ secrets.X }} pasted into a script.
     for step in wf.steps():
-        for script in scripts(step):
+        for script in scripts(step, wf.script_inputs):
             node = script.node
             for expr in find_expressions(node.value):
                 path = next(

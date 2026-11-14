@@ -30,6 +30,12 @@ inputs:
     description: Comma-separated rule ids to skip, e.g. WG006.
     required: false
     default: ""
+  script-inputs:
+    description: >-
+      Your own actions that run an input as a script, so WG004 and WG008 check those inputs
+      too: owner/repo:input[,input], separated by spaces or new lines (e.g. my-org/deploy:commands).
+    required: false
+    default: ""
   python-version:
     description: Python used to run workflow-guard (3.10 or newer). It doesn't change the job's own Python.
     required: false
@@ -70,11 +76,13 @@ runs:
         WG_FAIL_ON: ${{ inputs.fail-on }}
         WG_MIN_SEVERITY: ${{ inputs.min-severity }}
         WG_IGNORE: ${{ inputs.ignore }}
+        WG_SCRIPT_INPUTS: ${{ inputs.script-inputs }}
       run: |
         set -f  # split the paths on whitespace, but don't expand * or ? in them
         args=(--format "$WG_FORMAT" --fail-on "$WG_FAIL_ON" --min-severity "$WG_MIN_SEVERITY")
         if [ -n "$WG_IGNORE" ]; then args+=(--ignore "$WG_IGNORE"); fi
         if [ -n "$WG_OUTPUT" ]; then args+=(--output "$WG_OUTPUT"); fi
+        for spec in $WG_SCRIPT_INPUTS; do args+=(--script-input "$spec"); done
         # shellcheck disable=SC2206
         paths=($WG_PATHS)
         # "--" ends the options, so a path can't be read as one (a file named --fix, say).

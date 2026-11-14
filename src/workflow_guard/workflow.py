@@ -11,7 +11,7 @@ key ``on`` as the boolean ``True``. Node keys stay the plain string ``"on"``.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -94,6 +94,9 @@ class Workflow:
     project: Project | None = None
     """The files checked together with this one, set by ``calls.link_local_calls``: lets the
     tracker follow outputs of local reusable workflows and actions back to the caller."""
+    script_inputs: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    """The user's own actions that run an input as a script (``--script-input``): action in
+    lower case -> input names in lower case. Added to ``scripts.SCRIPT_INPUTS``."""
 
     @classmethod
     def load(cls, path: Path, display_path: str | None = None) -> Workflow:
