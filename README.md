@@ -125,9 +125,10 @@ Pin the action to a commit like any other: `workflow-guard --fix` turns `@v0.4.0
 | `paths` | `""` (`.github/workflows`) | files or directories, separated by spaces or new lines |
 | `format` | `github` | `github` (annotations), `text`, `json` or `sarif` |
 | `output` | `""` | write the report to this file instead of the log |
-| `fail-on` | `low` | fail the step on findings at this level or above |
-| `min-severity` | `low` | hide findings below this level |
-| `ignore` | `""` | comma-separated rule ids, e.g. `WG006` |
+| `fail-on` | `""` (the settings file's, else `low`) | fail the step on findings at this level or above |
+| `min-severity` | `""` (the settings file's, else `low`) | hide findings below this level |
+| `config` | `""` (`.github/workflow-guard.yml` if there is one) | settings file; `none` reads none (see [Settings file](#settings-file)) |
+| `ignore` | `""` | comma-separated rule ids, e.g. `WG006`; added to the settings file's |
 | `script-inputs` | `""` | your own actions that run an input as a script: `owner/repo:input[,input]`, separated by spaces or new lines (see [Actions that run a script](#actions-that-run-a-script)) |
 | `python-version` | `3.12` | Python that runs the tool; the job's own Python isn't changed |
 
@@ -142,6 +143,27 @@ How the action is built (`action.yml`, a composite action):
   into an option such as `--fix`.
 - CI runs it on Ubuntu and Windows (the `action` job), against this repository and a deliberately
   unsafe fixture.
+
+### Settings file
+
+Instead of repeating options in the workflow, the pre-commit configuration and your shell, put
+them in `.github/workflow-guard.yml` (or `.yaml`):
+
+```yaml
+ignore: [WG006]                 # rule ids, a list or "WG006, WG002"
+min-severity: low               # low, medium, high
+fail-on: medium
+script-inputs:                  # your own actions that run an input as a script
+  - my-org/deploy:commands
+```
+
+All three ways of running workflow-guard read it: the command line and the pre-commit hook look
+in the current folder and the folders above it, up to the repository root, and the action runs
+in the checked-out repository. Options given directly win (`--fail-on high` over `fail-on:`);
+`ignore` and `script-inputs` from both are combined. `--config FILE` (the action's `config`
+input) names another file, `--no-config` (`config: none`) reads none. An unknown key, rule id or
+level stops the run with an error (exit 2), so a typo can't silently switch a setting off. The
+file isn't a workflow and isn't checked as one.
 
 ### As a pre-commit hook
 
@@ -181,6 +203,7 @@ workflow-guard --min-severity medium    # hide low findings
 workflow-guard --fail-on high           # show everything, but only fail on high
 workflow-guard --ignore WG006           # skip rules
 workflow-guard --script-input my-org/deploy:commands  # an action of yours that runs an input
+workflow-guard --config ci/wg.yml       # another settings file (--no-config: none)
 workflow-guard --list-rules
 workflow-guard --fix                    # pin actions to commit SHAs (rewrites the files)
 ```
@@ -369,6 +392,7 @@ src/workflow_guard/
   project.py   the files checked together; which file a uses: ./... runs
   writes.py    what a script or github-script writes to $GITHUB_OUTPUT / ENV / PATH
   scripts.py   where a step's script text is: run:, github-script, actions that run an input
+  config.py    .github/workflow-guard.yml: finding, reading and checking the settings file
   fix.py       --fix: GitHubResolver (API lookups), pin_actions (text edits), comment style
   sarif.py     --format sarif: rules, results, fingerprints, notifications
   annotations.py --format github: workflow commands, with GitHub's escaping

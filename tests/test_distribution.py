@@ -76,3 +76,13 @@ def test_action_passes_each_script_input_as_an_option():
     assert 'for spec in $WG_SCRIPT_INPUTS; do args+=(--script-input "$spec"); done' in script
     # set -f comes first, so a spec isn't expanded as a file pattern
     assert script.index("set -f") < script.index("for spec in")
+
+
+def test_action_leaves_levels_to_the_settings_file_unless_set():
+    script = STEPS[-1]["run"]
+    assert ACTION["inputs"]["fail-on"]["default"] == ""
+    assert ACTION["inputs"]["min-severity"]["default"] == ""
+    assert 'if [ -n "$WG_FAIL_ON" ]; then args+=(--fail-on "$WG_FAIL_ON"); fi' in script
+    assert 'if [ -n "$WG_MIN_SEVERITY" ]; then args+=(--min-severity "$WG_MIN_SEVERITY"); fi' in script
+    assert 'if [ "$WG_CONFIG" = none ]; then args+=(--no-config)' in script
+    assert 'elif [ -n "$WG_CONFIG" ]; then args+=(--config "$WG_CONFIG"); fi' in script

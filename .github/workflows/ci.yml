@@ -56,6 +56,12 @@ jobs:
           ignore: WG004
           fail-on: high
           format: text
+      - name: A settings file does the same
+        uses: ./
+        with:
+          paths: tests/fixtures/unsafe-workflow.yml
+          config: tests/fixtures/workflow-guard-config.yml
+          format: text
       - name: A custom action passes without script-inputs
         uses: ./
         with:

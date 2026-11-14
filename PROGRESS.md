@@ -1,5 +1,39 @@
 # Progress log
 
+## 2026-11-14 (interactive): a settings file
+
+Why: picked by the owner ("Config file"). `ignore`, the levels and `script-inputs` had to be
+repeated in the workflow, the pre-commit configuration and the shell.
+
+Acceptance criteria:
+- `.github/workflow-guard.yml` or `.yaml` with `ignore`, `min-severity`, `fail-on`,
+  `script-inputs` (lists or comma/space-separated strings); found from the current folder up
+  to the repository root (the folder with `.git`); `--config FILE`, `--no-config`.
+- Command-line options win; `ignore` and `script-inputs` add up; defaults stay `low`.
+- Errors (exit 2, message with the file name): unknown keys, unknown rule ids, bad levels, bad
+  script inputs, wrong types, invalid YAML, an unreadable `--config`. `--list-rules` doesn't
+  read the file. The file isn't checked as a workflow.
+- Action: new `config` input (`none` = `--no-config`); `fail-on`/`min-severity` default to ""
+  and are passed only when set. CI runs the action with a settings file.
+- Release notes in CHANGELOG.md in this pull request; v0.20.0's heading gets its date.
+
+Done:
+- `src/workflow_guard/config.py` (`find_config`, `parse_config`, `load_config`); `cli.py`
+  (`_settings`, `_apply`, options without defaults); `action.yml`; fixture
+  `tests/fixtures/workflow-guard-config.yml` and a CI step.
+- Tests: `test_config.py` (26), 1 more in `test_distribution.py`. 520 in total.
+- README (Settings file, inputs table, usage), CHANGELOG v0.21.0, version 0.21.0.
+
+Verified locally:
+- `pytest -q -W error`: 520 passed. `ruff check`, `ruff format --check`: clean.
+- `unsafe-workflow.yml` with `--config tests/fixtures/workflow-guard-config.yml`: exit 0;
+  without: exit 1.
+- Mutation checks: 15 mutants (search past the repository root, no `.yaml`, unknown keys or
+  rule ids accepted, no upper-casing, strings not split, script inputs unchecked, empty file,
+  ignore/script-inputs not combined, config level winning over the option, config fail-on
+  unused, `--no-config`/`--config` ignored, the action not passing `config`), all killed (one
+  after fixing a test that passed either way).
+
 ## 2026-11-14 (interactive): WG010 comment commands
 
 Why: picked by the owner ("WG010 issue_comment"). `issue_comment` runs with secrets and a write
@@ -743,7 +777,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.20.0` and publish its release from CHANGELOG.md (needs the owner's approval).
-2. A configuration file (`.github/workflow-guard.yml`) for `ignore`, `script-inputs` and the
-   severity levels, shared by the CLI, the pre-commit hook and the action.
+1. Tag `v0.21.0` and publish its release from CHANGELOG.md (needs the owner's approval).
+2. WG010: tell a weak check (`author_association != 'NONE'`, which lets every past contributor
+   in) from an allow-list.
 3. The Marketplace listing (needs the owner: it's a public listing under their account).

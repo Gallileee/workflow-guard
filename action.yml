@@ -19,15 +19,25 @@ inputs:
     required: false
     default: ""
   fail-on:
-    description: Fail the step if a finding is at this level or above (low, medium, high).
+    description: >-
+      Fail the step if a finding is at this level or above (low, medium, high). Empty uses
+      .github/workflow-guard.yml, else low.
     required: false
-    default: low
+    default: ""
   min-severity:
-    description: Only report findings at this level or above (low, medium, high).
+    description: >-
+      Only report findings at this level or above (low, medium, high). Empty uses
+      .github/workflow-guard.yml, else low.
     required: false
-    default: low
+    default: ""
+  config:
+    description: >-
+      Settings file. Empty uses .github/workflow-guard.yml (or .yaml) if the repository has one;
+      'none' reads no file.
+    required: false
+    default: ""
   ignore:
-    description: Comma-separated rule ids to skip, e.g. WG006.
+    description: Comma-separated rule ids to skip, e.g. WG006 (added to the settings file's).
     required: false
     default: ""
   script-inputs:
@@ -77,9 +87,14 @@ runs:
         WG_MIN_SEVERITY: ${{ inputs.min-severity }}
         WG_IGNORE: ${{ inputs.ignore }}
         WG_SCRIPT_INPUTS: ${{ inputs.script-inputs }}
+        WG_CONFIG: ${{ inputs.config }}
       run: |
         set -f  # split the paths on whitespace, but don't expand * or ? in them
-        args=(--format "$WG_FORMAT" --fail-on "$WG_FAIL_ON" --min-severity "$WG_MIN_SEVERITY")
+        args=(--format "$WG_FORMAT")
+        if [ -n "$WG_FAIL_ON" ]; then args+=(--fail-on "$WG_FAIL_ON"); fi
+        if [ -n "$WG_MIN_SEVERITY" ]; then args+=(--min-severity "$WG_MIN_SEVERITY"); fi
+        if [ "$WG_CONFIG" = none ]; then args+=(--no-config)
+        elif [ -n "$WG_CONFIG" ]; then args+=(--config "$WG_CONFIG"); fi
         if [ -n "$WG_IGNORE" ]; then args+=(--ignore "$WG_IGNORE"); fi
         if [ -n "$WG_OUTPUT" ]; then args+=(--output "$WG_OUTPUT"); fi
         for spec in $WG_SCRIPT_INPUTS; do args+=(--script-input "$spec"); done

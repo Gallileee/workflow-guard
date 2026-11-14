@@ -1,0 +1,4 @@
+# Settings for CI's run of the action on unsafe-workflow.yml: skip WG004 and fail only on
+# high findings, so that run passes (the same as the ignore/fail-on inputs).
+ignore: [WG004]
+fail-on: high
