@@ -1,5 +1,41 @@
 # Progress log
 
+## 2026-11-14 (interactive): WG010 comment commands
+
+Why: picked by the owner ("WG010 issue_comment"). `issue_comment` runs with secrets and a write
+token for any commenter; a `/test` job that checks out `refs/pull/N/head` and only matches
+`startsWith(github.event.comment.body, '/test')` runs a stranger's code with those secrets.
+None of WG001-WG009 looked at who triggered a comment command.
+
+Acceptance criteria:
+- Only `issue_comment` (a fork's `pull_request_review_comment` runs without secrets).
+- High, at the step: `actions/checkout` whose `ref:`/`repository:` names the PR (`refs/pull/`,
+  `github.event.issue.number`, `github.event.issue.pull_request`, `github.event.pull_request`,
+  `github.head_ref`, or a step/job output), or a script with `gh pr checkout`,
+  `pull/<n>/head|merge`, `refs/pull/`.
+- Medium, at the job: no PR checkout but `secrets.*` other than `GITHUB_TOKEN`.
+- A check: the commenter (`author_association`, login, `github.actor`, `github.triggering_actor`)
+  in the job's `if:` (with or without `${{ }}`) or the step's; a permission step (6 known
+  actions, `getCollaboratorPermissionLevel`, `collaborators/<user>/permission`); either in a job
+  reached through `needs:` (loops end).
+- A body-only `if:` is named in the message as no check.
+- Release notes in CHANGELOG.md in this pull request; v0.19.0's heading gets its date.
+
+Done:
+- `rules.py`: `comment_commands` (WG010) with `_job_checks_commenter`, `_checks_out_pr`,
+  `_checks_permission`, `_uses_secrets`, `_body_only`.
+- Tests: `test_wg010.py` (33). 493 in total. `--list-rules` lists 10 rules.
+- README (WG010 row, limitations), CHANGELOG v0.20.0, version 0.20.0.
+
+Verified locally:
+- `pytest -q -W error`: 493 passed. `ruff check`, `ruff format --check`: clean.
+- Demo: a `/test` workflow with a body-only `if:` and a `refs/pull/N/head` checkout gives the
+  high finding with the body note; adding the `author_association` allow-list gives 0.
+- Mutation checks: 21 mutants (each commenter path, permission actions and API pattern, PR
+  ref patterns, job/step/needs checks, GITHUB_TOKEN exception, secrets only without a
+  checkout, `${{ }}` in `if:`, step body note, script patterns, the trigger), all killed (one
+  after adding a `refs/pull/${{ env.PR }}` case).
+
 ## 2026-11-14 (interactive): your own actions that run a script
 
 Why: picked by the owner ("Custom script inputs"). v0.18.0's list of script-running actions is
@@ -707,7 +743,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.19.0` and publish its release from CHANGELOG.md (needs the owner's approval).
-2. WG010: `issue_comment` workflows that act on a comment command (`/deploy`) without checking
-   the commenter's `author_association`.
+1. Tag `v0.20.0` and publish its release from CHANGELOG.md (needs the owner's approval).
+2. A configuration file (`.github/workflow-guard.yml`) for `ignore`, `script-inputs` and the
+   severity levels, shared by the CLI, the pre-commit hook and the action.
 3. The Marketplace listing (needs the owner: it's a public listing under their account).

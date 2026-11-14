@@ -577,6 +577,151 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
                 )
 
 
+# --- WG010 comment commands without a check of the commenter ---------------------------------
+
+# Who wrote the comment: checking one of these in an 'if:' is a permission check.
+_COMMENTER = (
+    ("github", "event", "comment", "author_association"),
+    ("github", "event", "comment", "user", "login"),
+    ("github", "event", "sender", "login"),
+    ("github", "actor"),
+    ("github", "triggering_actor"),
+)
+_COMMENT_BODY = (("github", "event", "comment", "body"),)
+# Actions that fail (or skip) unless the commenter may write to the repository.
+_PERMISSION_ACTIONS = (
+    "actions-cool/check-user-permission",
+    "prince-chrismc/check-actor-permissions-action",
+    "sushichop/action-repository-permission",
+    "lannonbr/repo-permission-check-action",
+    "xt0rted/slash-command-action",
+    "peter-evans/slash-command-dispatch",
+)
+_PERMISSION_API = re.compile(r"getCollaboratorPermissionLevel|collaborators/\S+/permission")
+# A ref naming the pull request: its number, its head, or a value looked up at run time.
+_PR_REF = (
+    ("github", "event", "issue", "number"),
+    ("github", "event", "issue", "pull_request"),
+    ("github", "event", "pull_request"),
+    ("github", "head_ref"),
+    ("steps",),
+    ("needs",),
+)
+_PR_SCRIPT = re.compile(
+    r"\bgh\s+pr\s+checkout\b|\bpull/(?:\$\{\{[^}]*\}\}|[^\s/]+)/(?:head|merge)\b|refs/pull/"
+)
+
+
+def _if_paths(node: Node | None) -> list[ContextPath]:
+    """Context paths in an ``if:``, written with or without ``${{ }}``."""
+    text = (scalar(get(node, "if")) or "").strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    try:
+        return context_paths(text) if text else []
+    except ExpressionError:
+        return []
+
+
+def _mentions(paths: list[ContextPath], patterns: tuple[tuple[str, ...], ...]) -> bool:
+    return any(matches(path.segments, pattern) for path in paths for pattern in patterns)
+
+
+def _checks_permission(step: Step) -> bool:
+    """A step that stops the job unless the commenter may write: a known action, or an API call
+    for the commenter's permission (github-script or ``gh api`` in a script)."""
+    if (step.uses or "").split("@", 1)[0].lower() in _PERMISSION_ACTIONS:
+        return True
+    text = (scalar(get(step.node, "run")) or "") + (step.with_value("script") or "")
+    return bool(_PERMISSION_API.search(text))
+
+
+def _job_checks_commenter(wf: Workflow, job_id: str, seen: frozenset[str] = frozenset()) -> bool:
+    """The job's ``if:`` checks who commented, one of its steps checks their permission, or a
+    job it ``needs:`` (directly or further up) does."""
+    jobs = dict(wf.jobs())
+    job = jobs.get(job_id)
+    if job is None or job_id in seen:
+        return False
+    if _mentions(_if_paths(job), _COMMENTER):
+        return True
+    if any(_checks_permission(step) for step in wf.steps() if step.job_id == job_id):
+        return True
+    needs = get(job, "needs")
+    names = (
+        [n.value for n in needs.value if isinstance(n, ScalarNode)] if isinstance(needs, SequenceNode) else []
+    )
+    if isinstance(needs, ScalarNode):
+        names = [needs.value]
+    return any(_job_checks_commenter(wf, name, seen | {job_id}) for name in names)
+
+
+def _checks_out_pr(step: Step) -> bool:
+    if (step.uses or "").startswith("actions/checkout@"):
+        for key in ("ref", "repository"):
+            value = step.with_value(key) or ""
+            if "refs/pull/" in value or any(
+                _mentions(_paths(expr), _PR_REF) for expr in find_expressions(value)
+            ):
+                return True
+        return False
+    return bool(_PR_SCRIPT.search(scalar(get(step.node, "run")) or ""))
+
+
+def _uses_secrets(node: Node) -> bool:
+    """``${{ secrets.X }}`` anywhere in the job, other than the GITHUB_TOKEN."""
+    return any(
+        path.segments[0] == "secrets" and path.segments[1:2] != ("github_token",)
+        for text in _scalars(node)
+        for expr in find_expressions(text.value)
+        for path in _paths(expr)
+    )
+
+
+def _body_only(*nodes: Node | None) -> str:
+    if any(_mentions(_if_paths(node), _COMMENT_BODY) for node in nodes):
+        return " (its 'if:' only looks at the comment's text, which anyone can write)"
+    return ""
+
+
+_ASK = (
+    "check github.event.comment.author_association (OWNER, MEMBER, COLLABORATOR) in the job's"
+    " 'if:', or the commenter's permission in a first step"
+)
+
+
+def comment_commands(wf: Workflow) -> Iterator[Finding]:
+    if wf.is_action or "issue_comment" not in wf.triggers():
+        return
+    for job_id, job in wf.jobs():
+        if _job_checks_commenter(wf, job_id):
+            continue
+        reported = False
+        steps = [step for step in wf.steps() if step.job_id == job_id]
+        for step in steps:
+            if _mentions(_if_paths(step.node), _COMMENTER) or not _checks_out_pr(step):
+                continue
+            reported = True
+            yield _at(
+                wf,
+                step.node,
+                "WG010",
+                Severity.HIGH,
+                "checks out the pull request's code in a job that anyone who can comment can"
+                " start ('issue_comment' runs with secrets and a write token), without checking"
+                f" who commented{_body_only(job, step.node)}; {_ASK}",
+            )
+        if not reported and _uses_secrets(job):
+            yield _at(
+                wf,
+                key_node(get(wf.root, "jobs"), job_id) or job,
+                "WG010",
+                Severity.MEDIUM,
+                f"job '{job_id}' uses secrets and anyone who can comment can start it"
+                f" ('issue_comment'), without a check of who commented{_body_only(job)}; {_ASK}",
+            )
+
+
 RULES: tuple[Rule, ...] = (
     Rule(
         "WG001",
@@ -680,6 +825,19 @@ RULES: tuple[Rule, ...] = (
             "it may have built a fork's pull request: its commit and its artifacts are the fork "
             "author's. Don't check out that commit. Download artifacts to ${{ runner.temp }}, not "
             "the workspace, and treat them as data: never run, source or paste them into scripts."
+        ),
+    ),
+    Rule(
+        "WG010",
+        "comment-command",
+        "issue_comment jobs that check out the PR or use secrets without checking the commenter",
+        comment_commands,
+        help=(
+            "issue_comment runs with secrets and a write token, and anyone who can comment on an "
+            "issue or pull request (on a public repository: anyone) starts it. A '/deploy' or '/test' "
+            "command must check who commented: github.event.comment.author_association in "
+            "(OWNER, MEMBER, COLLABORATOR) in the job's if:, or the commenter's permission through "
+            "the API. Matching the comment's text is not a check."
         ),
     ),
 )

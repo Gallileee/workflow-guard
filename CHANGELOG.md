@@ -4,7 +4,50 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.19.0 — Your own actions that run a script
+## v0.20.0 — WG010: comment commands
+
+### New rule: WG010 comment-command
+
+`issue_comment` runs with your repository's secrets and a write token, and anyone who can
+comment starts it; on a public repository that is anyone with an account. A `/test` or
+`/deploy` command therefore has to check who wrote the comment. WG010 reports jobs that don't:
+
+- **high:** the job checks out the pull request: `ref: refs/pull/${{ github.event.issue.number }}/head`
+  (or `/merge`), a ref taken from a step or job output, `gh pr checkout`, or
+  `git fetch origin pull/N/head` in a script. The stranger's code then runs with your secrets.
+- **medium:** the job uses secrets other than `GITHUB_TOKEN`.
+
+These count as a check:
+- `github.event.comment.author_association`, `github.actor`, `github.triggering_actor` or the
+  commenter's login in the job's `if:` (in a step's `if:`, for that step);
+- a step that checks the commenter's permission: `getCollaboratorPermissionLevel` in a
+  github-script, `gh api .../collaborators/<user>/permission`, or an action such as
+  `actions-cool/check-user-permission`, `xt0rted/slash-command-action` or
+  `peter-evans/slash-command-dispatch`;
+- such a check in a job this job `needs:`.
+
+Matching the comment's text is not a check, and the message says so:
+
+```
+.github/workflows/pr-test.yml:12:9: WG010 [high] checks out the pull request's code in a job that
+anyone who can comment can start ('issue_comment' runs with secrets and a write token), without
+checking who commented (its 'if:' only looks at the comment's text, which anyone can write);
+check github.event.comment.author_association (OWNER, MEMBER, COLLABORATOR) in the job's 'if:',
+or the commenter's permission in a first step
+```
+
+**Fix:**
+
+```yaml
+if: >-
+  github.event.issue.pull_request &&
+  contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+  startsWith(github.event.comment.body, '/test')
+```
+
+Other rules' output is unchanged. `--list-rules` now lists 10 rules.
+
+## v0.19.0 — Your own actions that run a script (2026-11-14)
 
 ### `--script-input` and the `script-inputs` input
 
