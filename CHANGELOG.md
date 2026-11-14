@@ -4,7 +4,43 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.18.0 — WG004 checks actions that run a script
+## v0.19.0 — Your own actions that run a script
+
+### `--script-input` and the `script-inputs` input
+
+v0.18.0 taught WG004 and WG008 the script inputs of 14 public actions. In-house actions that
+run an input as a script weren't known. Now you can name them:
+
+```bash
+workflow-guard --script-input my-org/deploy:commands --script-input my-org/notify:message,on_failure
+```
+
+or, in the GitHub Action:
+
+```yaml
+- uses: Gallileee/workflow-guard@<sha>  # v0.19.0
+  with:
+    script-inputs: |
+      my-org/deploy:commands
+      my-org/notify:message,on_failure
+```
+
+Those inputs are then checked exactly like `run:`. The message names your action:
+
+```
+.github/workflows/deploy.yml:14:21: WG004 [high] 'github.event.pull_request.title' can be set by
+outsiders and is pasted into a script; pass it through 'env:' and use the variable instead
+(my-org/deploy runs its 'commands' input as a script)
+```
+
+- Names match without case; an action in a subfolder (`my-org/actions/deploy:run`) works too.
+- Naming a listed action adds to its inputs and keeps its advice (`appleboy/ssh-action:script_after`).
+- A malformed value (no `:`, an `@version`, a local `./` path) is an error before anything is
+  checked.
+
+Other rules' output is unchanged.
+
+## v0.18.0 — WG004 checks actions that run a script (2026-11-13)
 
 ### Script inputs of actions
 

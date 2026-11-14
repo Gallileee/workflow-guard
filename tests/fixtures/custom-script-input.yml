@@ -1,0 +1,14 @@
+# Clean for workflow-guard's built-in list; with --script-input my-org/deploy:commands
+# (the action's script-inputs) the PR title in 'commands' is a WG004 finding.
+# CI runs the action on it both ways.
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: my-org/deploy@0123456789abcdef0123456789abcdef01234567  # v2
+        with:
+          target: preview
+          commands: ./release.sh "${{ github.event.pull_request.title }}"

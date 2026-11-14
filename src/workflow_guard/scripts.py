@@ -4,10 +4,13 @@
 ``run:`` and ``actions/github-script``'s ``script``, a few widely used actions take a shell (or
 PowerShell, Python) script as an input and run it on the runner, in a container or on a server
 over SSH. The table lists them; input names are matched without case, as GitHub does.
+Users add their own (in-house actions) with ``--script-input owner/repo:input,input``.
 """
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from yaml.nodes import ScalarNode
@@ -37,6 +40,29 @@ SCRIPT_INPUTS: dict[str, tuple[tuple[str, ...], str]] = {
 }
 GITHUB_SCRIPT = "actions/github-script"
 
+_ACTION = re.compile(r"^[A-Za-z0-9_-][\w.-]*/[\w.-]+(?:/[\w./-]+)?$")
+_INPUT = re.compile(r"^[A-Za-z_][\w-]*$")
+
+
+def parse_script_input(text: str) -> tuple[str, tuple[str, ...]]:
+    """``owner/repo[/path]:input[,input...]`` -> (action in lower case, inputs in lower case)."""
+    action, sep, names = text.strip().partition(":")
+    if not sep or not _ACTION.match(action):
+        raise ValueError(f"expected owner/repo:input[,input...] (no @version), got {text!r}")
+    inputs = tuple(name.strip().lower() for name in names.split(",") if name.strip())
+    if not inputs or not all(_INPUT.match(name) for name in inputs):
+        raise ValueError(f"expected input names after ':' in {text!r}")
+    return action.lower(), inputs
+
+
+def merge_script_inputs(specs: list[str]) -> dict[str, tuple[str, ...]]:
+    """Several ``--script-input`` values; the same action twice adds up its inputs."""
+    merged: dict[str, tuple[str, ...]] = {}
+    for spec in specs:
+        action, inputs = parse_script_input(spec)
+        merged[action] = tuple(dict.fromkeys(merged.get(action, ()) + inputs))
+    return merged
+
 
 @dataclass(frozen=True)
 class Script:
@@ -64,16 +90,19 @@ def action_name(uses: str | None) -> str:
     return uses.split("@", 1)[0].lower()
 
 
-def scripts(step: Step) -> list[Script]:
-    """The step's script texts, in file order: ``run:`` or the action's script inputs."""
+def scripts(step: Step, extra: Mapping[str, tuple[str, ...]] | None = None) -> list[Script]:
+    """The step's script texts, in file order: ``run:`` or the action's script inputs.
+    ``extra``: the user's own actions and inputs (``--script-input``), added to the table."""
     found = []
     if isinstance(run := get(step.node, "run"), ScalarNode):
         found.append(Script(run, "run"))
     action = action_name(step.uses)
+    added = (extra or {}).get(action, ())
     if action == GITHUB_SCRIPT:
-        inputs, note, label = ("script",), "", ""
-    elif action in SCRIPT_INPUTS:
-        (inputs, note), label = SCRIPT_INPUTS[action], action
+        inputs, note, label = ("script", *added), "", ""
+    elif action in SCRIPT_INPUTS or added:
+        known, note = SCRIPT_INPUTS.get(action, ((), ""))
+        inputs, label = (*known, *added), action
     else:
         return found
     for key, value in items(get(step.node, "with")):

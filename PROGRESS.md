@@ -1,5 +1,38 @@
 # Progress log
 
+## 2026-11-14 (interactive): your own actions that run a script
+
+Why: picked by the owner ("Custom script inputs"). v0.18.0's list of script-running actions is
+fixed; an in-house `my-org/deploy` with `commands: ./release.sh "${{ github.event.pull_request.title }}"`
+stayed unreported.
+
+Acceptance criteria:
+- `--script-input owner/repo[/path]:input[,input]`, repeatable; the same action twice adds up;
+  names without case. Malformed values (no `:`, no inputs, `@version`, `./local`, `docker://`,
+  odd characters) fail argument parsing (exit 2) with a clear message.
+- The action's `script-inputs` input (spaces or new lines) passes one `--script-input` per value,
+  through `env:` (no `${{ }}` in the script) and after `set -f`.
+- WG004 and WG008 check the named inputs like `run:`; the message names the action; a listed
+  action keeps its own inputs and advice; github-script keeps its message.
+- CI runs the action on a fixture both ways (clean without, failing with `script-inputs`).
+- Release notes in CHANGELOG.md in this pull request; v0.18.0's heading gets its date.
+
+Done:
+- `scripts.py`: `parse_script_input`, `merge_script_inputs`, `scripts(step, extra)`;
+  `Workflow.script_inputs`; `cli.py`: `--script-input`; `action.yml`: `script-inputs`;
+  `tests/fixtures/custom-script-input.yml` and two steps in the CI action job.
+- Tests: 21 more in `test_script_inputs.py`, 1 in `test_distribution.py`. 460 in total.
+- README (option, action input, "Your own actions", limitations), CHANGELOG v0.19.0, version
+  0.19.0.
+
+Verified locally:
+- `pytest -q -W error`: 460 passed. `ruff check`, `ruff format --check`: clean.
+- The fixture: 0 findings without the option; WG004 naming `my-org/deploy` with
+  `--script-input other-org/tool:run --script-input my-org/deploy:commands`.
+- Mutation checks: 13 mutants (extra inputs ignored, for github-script or a listed action,
+  merging, lower-casing, both validations, a leading dot allowed, rules not passing the
+  inputs, the CLI not setting or validating them, the action not passing them), all killed.
+
 ## 2026-11-13 (interactive): WG004 for actions that run a script
 
 Why: picked by the owner ("WG004 for more actions"). WG004 and WG008 only looked at `run:` and
@@ -674,7 +707,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.18.0` and publish its release from CHANGELOG.md (needs the owner's approval).
-2. Let users add their own script-running actions (a config file or `--script-input
-   owner/repo:input`), for in-house actions.
+1. Tag `v0.19.0` and publish its release from CHANGELOG.md (needs the owner's approval).
+2. WG010: `issue_comment` workflows that act on a comment command (`/deploy`) without checking
+   the commenter's `author_association`.
 3. The Marketplace listing (needs the owner: it's a public listing under their account).

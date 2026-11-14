@@ -56,6 +56,22 @@ For SSH and container actions the step's `env:` doesn't reach the script by itse
 says how to pass a variable there (`envs:` for `appleboy/ssh-action`, `options: -e NAME` for
 `addnab/docker-run-action`, ...). The list lives in `src/workflow_guard/scripts.py`.
 
+**Your own actions.** An in-house action that runs an input as a script isn't on the list.
+Name it with `--script-input owner/repo:input` (several inputs separated by commas, the option
+repeated for more actions; a path inside the repository works too, `my-org/actions/deploy:run`),
+or with the action's `script-inputs` input:
+
+```yaml
+- uses: Gallileee/workflow-guard@<sha>  # vX.Y.Z
+  with:
+    script-inputs: |
+      my-org/deploy:commands
+      my-org/actions/notify:message,on_failure
+```
+
+Those inputs are then checked like `run:` by WG004 and WG008; for a listed action the inputs
+are added to its own.
+
 ### Actions too
 
 Besides workflows, workflow-guard reads **action metadata files** (`action.yml`), recognised by
@@ -111,6 +127,7 @@ Pin the action to a commit like any other: `workflow-guard --fix` turns `@v0.4.0
 | `fail-on` | `low` | fail the step on findings at this level or above |
 | `min-severity` | `low` | hide findings below this level |
 | `ignore` | `""` | comma-separated rule ids, e.g. `WG006` |
+| `script-inputs` | `""` | your own actions that run an input as a script: `owner/repo:input[,input]`, separated by spaces or new lines (see [Actions that run a script](#actions-that-run-a-script)) |
 | `python-version` | `3.12` | Python that runs the tool; the job's own Python isn't changed |
 
 How the action is built (`action.yml`, a composite action):
@@ -162,6 +179,7 @@ workflow-guard --format sarif --output results.sarif  # for GitHub code scanning
 workflow-guard --min-severity medium    # hide low findings
 workflow-guard --fail-on high           # show everything, but only fail on high
 workflow-guard --ignore WG006           # skip rules
+workflow-guard --script-input my-org/deploy:commands  # an action of yours that runs an input
 workflow-guard --list-rules
 workflow-guard --fix                    # pin actions to commit SHAs (rewrites the files)
 ```
@@ -424,7 +442,8 @@ CHANGELOG.md.
   access to PyPI for PyYAML.
 - Not on PyPI or the GitHub Marketplace yet; install from the repository.
 - WG004 looks at `run:`, `actions/github-script` and the actions listed under "Actions that run
-  a script". Other actions can also run an input as code; they aren't known.
+  a script", plus the ones named with `--script-input`. Other actions can also run an input as
+  code; they aren't known.
 - WG009 looks for `actions/checkout`, git/gh commands in `run:` (one line at a time, with
   `\` continuations joined; the head reference must be on the same line as the command) and
   four common ways to download artifacts. Shell variables set inside the script (`SHA=...; git
