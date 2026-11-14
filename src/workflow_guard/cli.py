@@ -17,6 +17,7 @@ from typing import TextIO
 from . import __version__
 from .annotations import to_annotations
 from .calls import link_local_calls
+from .config import Config, ConfigError, find_config, load_config
 from .fix import GitHubResolver, Resolver, fallback_gap, pin_actions
 from .model import Finding, Severity
 from .rules import RULE_IDS, RULES, check
@@ -111,23 +112,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ignore",
         type=_parse_ids,
-        default=frozenset(),
         metavar="IDS",
-        help="comma-separated rule ids to skip, e.g. WG006",
+        help="comma-separated rule ids to skip, e.g. WG006 (added to the config file's)",
     )
     parser.add_argument(
         "--min-severity",
         type=_severity,
-        default=Severity.LOW,
         metavar="LEVEL",
-        help="only show findings at this level or above (low, medium, high)",
+        help="only show findings at this level or above (low, medium, high; default: the config "
+        "file's, else low)",
     )
     parser.add_argument(
         "--fail-on",
         type=_severity,
-        default=Severity.LOW,
         metavar="LEVEL",
-        help="exit with 1 if a shown finding is at this level or above (default: low)",
+        help="exit with 1 if a shown finding is at this level or above (default: the config "
+        "file's, else low)",
     )
     parser.add_argument(
         "--fix",
@@ -152,6 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(several inputs separated by commas; repeat the option for more actions); WG004 and "
         "WG008 then check those inputs like run:",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="FILE",
+        help="settings file (default: .github/workflow-guard.yml in this folder or the nearest "
+        "one above it, up to the repository root)",
+    )
+    parser.add_argument("--no-config", action="store_true", help="don't read a settings file")
     parser.add_argument("--list-rules", action="store_true", help="print the rules and exit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -183,6 +191,24 @@ def _token() -> str | None:
     return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or None
 
 
+def _settings(args: argparse.Namespace) -> Config:
+    """The settings file this run uses (an empty Config for none)."""
+    if args.no_config:
+        return Config()
+    if args.config is not None:
+        return load_config(args.config)
+    found = find_config(Path.cwd())
+    return load_config(found) if found is not None else Config()
+
+
+def _apply(args: argparse.Namespace, config: Config) -> None:
+    """Command-line options win; ignore and script-inputs from both add up."""
+    args.ignore = (args.ignore or frozenset()) | config.ignore
+    args.min_severity = args.min_severity or config.min_severity or Severity.LOW
+    args.fail_on = args.fail_on or config.fail_on or Severity.LOW
+    args.script_input = [*config.script_inputs, *args.script_input]
+
+
 def run(
     argv: Sequence[str] | None = None,
     out: TextIO = sys.stdout,
@@ -190,14 +216,24 @@ def run(
     resolver: Resolver | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
-    fixer: Resolver | None = None
-    if args.fix and "WG001" not in args.ignore:
-        fixer = resolver or GitHubResolver(token=_token())
-
     if args.list_rules:
         for rule in RULES:
             print(f"{rule.id}  {rule.name:<22} {rule.summary}", file=out)
         return 0
+
+    try:
+        config = _settings(args)
+    except ConfigError as e:
+        path = (args.config or find_config(Path.cwd()) or Path("config")).resolve()
+        cwd = Path.cwd().resolve()
+        shown = path.relative_to(cwd) if path.is_relative_to(cwd) else path
+        print(f"workflow-guard: {shown.as_posix()}: {e}", file=err)
+        return 2
+    _apply(args, config)
+
+    fixer: Resolver | None = None
+    if args.fix and "WG001" not in args.ignore:
+        fixer = resolver or GitHubResolver(token=_token())
 
     paths = args.paths or default_paths()
     missing = [p for p in paths if not p.exists()]

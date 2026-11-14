@@ -4,7 +4,42 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.20.0 — WG010: comment commands
+## v0.21.0 — A settings file
+
+### `.github/workflow-guard.yml`
+
+The same options used to be repeated in three places: the workflow that runs the action, the
+pre-commit configuration and the command line. Now they can live in one file:
+
+```yaml
+ignore: [WG006]
+min-severity: low
+fail-on: medium
+script-inputs:
+  - my-org/deploy:commands
+```
+
+- The command line and the pre-commit hook find it in the current folder or the nearest one
+  above it, up to the repository root; the action reads it from the checked-out repository.
+- Options given directly win (`--fail-on high` over `fail-on:`); `ignore` and `script-inputs`
+  from both are combined.
+- `--config FILE` / `--no-config`, and the action's new `config` input (`none` for no file).
+- An unknown key, rule id or level is an error (exit 2) instead of a silently ignored setting:
+
+```
+workflow-guard: .github/workflow-guard.yml: unknown setting(s): fail_on; known: ignore,
+min-severity, fail-on, script-inputs
+```
+
+### Action inputs
+
+`fail-on` and `min-severity` now default to empty, which means "the settings file's level, else
+`low`", so a level in the settings file isn't overridden by the input's default. Without a
+settings file nothing changes.
+
+Other rules' output is unchanged.
+
+## v0.20.0 — WG010: comment commands (2026-11-14)
 
 ### New rule: WG010 comment-command
 
