@@ -4,7 +4,37 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.21.0 — A settings file
+## v0.22.0 — WG010: weak checks of the commenter
+
+### An `if:` that looks at who commented isn't always a check
+
+Until now any mention of `github.event.comment.author_association` or `github.actor` in a
+job's `if:` counted as a check of who commented. But a deny-list keeps almost no one out:
+
+```yaml
+if: github.event.comment.author_association != 'NONE'
+```
+
+lets in everyone with a merged pull request (`CONTRIBUTOR`) or an open one
+(`FIRST_TIME_CONTRIBUTOR`), none of whom can write to the repository. Now the `if:` is
+evaluated for every commenter who can't write, and only a condition that keeps all of them out
+counts:
+
+```
+wf.yml:9:9: WG010 [high] checks out the pull request's code in a job that anyone who can
+comment can start (...), without checking who commented (its 'if:' looks at who commented but
+still lets CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER and MANNEQUIN in: author_association
+values of people who can't write to the repository); ...
+```
+
+- Still a check: `== 'OWNER' || == 'MEMBER'`, `contains(fromJSON('["OWNER","MEMBER"]'), ...)`,
+  `github.actor == 'me'`, `contains(fromJSON(vars.MAINTAINERS), github.actor)`.
+- Not a check any more: `!= 'NONE'`, `github.actor != 'renovate[bot]'`,
+  `contains('alice,bob', github.actor)` (a new account can be called `ice`),
+  `startsWith(github.actor, 'team-')`, and an allow-list joined with `||` to the comment's text.
+- The same goes for a step's `if:` and for a check in a job named in `needs:`.
+
+## v0.21.0 — A settings file (2026-11-14)
 
 ### `.github/workflow-guard.yml`
 

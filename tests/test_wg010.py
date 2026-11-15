@@ -104,6 +104,70 @@ def test_a_step_if_on_the_commenter_covers_that_step():
 
 
 @pytest.mark.parametrize(
+    ("cond", "who"),
+    [
+        (
+            "github.event.comment.author_association != 'NONE'",
+            "CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER and MANNEQUIN",
+        ),
+        (
+            'contains(fromJSON(\'["OWNER", "CONTRIBUTOR"]\'), github.event.comment.author_association)',
+            "CONTRIBUTOR",
+        ),
+    ],
+)
+def test_a_weak_association_check_is_named(cond, who):
+    ((_, severity, message),) = wg010(on_comment(*CHECKOUT_PR, job_if=cond))
+    assert severity == Severity.HIGH
+    assert f"(its 'if:' looks at who commented but still lets {who} in: author_association" in message
+
+
+def test_a_weak_login_check_is_named():
+    text = on_comment(
+        "- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}", job_if="github.actor != 'renovate[bot]'"
+    )
+    ((_, severity, message),) = wg010(text)
+    assert severity == Severity.MEDIUM
+    assert "(its 'if:' looks at who commented but still lets in every account it doesn't name)" in message
+
+
+def test_a_weak_step_if_doesnt_cover_the_step():
+    text = on_comment(*CHECKOUT_PR, "  if: github.event.comment.author_association != 'NONE'")
+    ((_, _, message),) = wg010(text)
+    assert "still lets CONTRIBUTOR" in message
+
+
+def test_a_weak_check_with_a_body_match_names_the_weak_check():
+    cond = "contains(github.event.comment.body, '/test') && github.event.comment.author_association != 'NONE'"
+    ((_, _, message),) = wg010(on_comment(*CHECKOUT_PR, job_if=cond))
+    assert "still lets CONTRIBUTOR" in message
+    assert "only looks at the comment's text" not in message
+
+
+def test_an_if_that_isnt_an_expression_is_no_check():
+    text = on_comment(*CHECKOUT_PR, job_if="github.actor == 'me' &&")
+    assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]
+
+
+def test_a_weak_check_in_a_needed_job_doesnt_count():
+    text = on_comment(*CHECKOUT_PR).replace(
+        "jobs:\n  test:\n",
+        "jobs:\n  gate:\n    if: github.event.comment.author_association != 'NONE'\n    runs-on: x\n"
+        "    steps:\n      - run: echo ok\n  test:\n    needs: gate\n",
+    )
+    assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]
+
+
+def test_a_weak_job_if_with_a_strong_step_if_is_covered():
+    text = on_comment(
+        *CHECKOUT_PR,
+        "  if: github.event.comment.author_association == 'MEMBER'",
+        job_if="github.event.comment.author_association != 'NONE'",
+    )
+    assert wg010(text) == []
+
+
+@pytest.mark.parametrize(
     "step",
     [
         (f"- uses: actions-cool/check-user-permission@{SHA}", "  with:", "    require: write"),

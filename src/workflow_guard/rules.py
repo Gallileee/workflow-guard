@@ -14,6 +14,7 @@ from pathlib import Path
 
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
+from .conditions import ASSOCIATION, lets_in
 from .expressions import (
     ContextPath,
     Expression,
@@ -614,13 +615,39 @@ _PR_SCRIPT = re.compile(
 
 def _if_paths(node: Node | None) -> list[ContextPath]:
     """Context paths in an ``if:``, written with or without ``${{ }}``."""
-    text = (scalar(get(node, "if")) or "").strip()
-    if text.startswith("${{") and text.endswith("}}"):
-        text = text[3:-2]
+    text = _if_text(node)
     try:
         return context_paths(text) if text else []
     except ExpressionError:
         return []
+
+
+def _if_text(node: Node | None) -> str:
+    text = (scalar(get(node, "if")) or "").strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    return text
+
+
+def _commenter_gate(node: Node | None) -> tuple[bool, str]:
+    """Whether the ``if:`` of ``node`` keeps out commenters who can't write, and if it looks at
+    who commented but doesn't, a note naming who still gets in."""
+    paths = _if_paths(node)
+    if not _mentions(paths, _COMMENTER):
+        return False, ""
+    try:
+        passing = lets_in(_if_text(node))
+    except ExpressionError:
+        return False, ""
+    if not passing:
+        return True, ""
+    if _mentions(paths, (ASSOCIATION,)):
+        who = ", ".join(passing[:-1]) + (" and " if len(passing) > 1 else "") + passing[-1]
+        return False, (
+            f" (its 'if:' looks at who commented but still lets {who} in: author_association"
+            " values of people who can't write to the repository)"
+        )
+    return False, " (its 'if:' looks at who commented but still lets in every account it doesn't name)"
 
 
 def _mentions(paths: list[ContextPath], patterns: tuple[tuple[str, ...], ...]) -> bool:
@@ -643,7 +670,7 @@ def _job_checks_commenter(wf: Workflow, job_id: str, seen: frozenset[str] = froz
     job = jobs.get(job_id)
     if job is None or job_id in seen:
         return False
-    if _mentions(_if_paths(job), _COMMENTER):
+    if _commenter_gate(job)[0]:
         return True
     if any(_checks_permission(step) for step in wf.steps() if step.job_id == job_id):
         return True
@@ -678,7 +705,12 @@ def _uses_secrets(node: Node) -> bool:
     )
 
 
-def _body_only(*nodes: Node | None) -> str:
+def _why_open(*nodes: Node | None) -> str:
+    """Why an ``if:`` that is there doesn't count as a check."""
+    for node in nodes:
+        note = _commenter_gate(node)[1]
+        if note:
+            return note
     if any(_mentions(_if_paths(node), _COMMENT_BODY) for node in nodes):
         return " (its 'if:' only looks at the comment's text, which anyone can write)"
     return ""
@@ -699,7 +731,7 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
         reported = False
         steps = [step for step in wf.steps() if step.job_id == job_id]
         for step in steps:
-            if _mentions(_if_paths(step.node), _COMMENTER) or not _checks_out_pr(step):
+            if _commenter_gate(step.node)[0] or not _checks_out_pr(step):
                 continue
             reported = True
             yield _at(
@@ -709,7 +741,7 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
                 Severity.HIGH,
                 "checks out the pull request's code in a job that anyone who can comment can"
                 " start ('issue_comment' runs with secrets and a write token), without checking"
-                f" who commented{_body_only(job, step.node)}; {_ASK}",
+                f" who commented{_why_open(job, step.node)}; {_ASK}",
             )
         if not reported and _uses_secrets(job):
             yield _at(
@@ -718,7 +750,7 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
                 "WG010",
                 Severity.MEDIUM,
                 f"job '{job_id}' uses secrets and anyone who can comment can start it"
-                f" ('issue_comment'), without a check of who commented{_body_only(job)}; {_ASK}",
+                f" ('issue_comment'), without a check of who commented{_why_open(job)}; {_ASK}",
             )
 
 

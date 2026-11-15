@@ -31,7 +31,7 @@ deliberately small and readable: one file per concern, every rule explained belo
 | WG007 | untrusted-github-env | high (medium for inputs from unknown callers) | Untrusted text appended to `$GITHUB_ENV` or `$GITHUB_PATH` in `run:`, directly or through `env:`/shell variables (`echo "T=$TITLE" >> "$GITHUB_ENV"`). Every later step reads those files: a PR title with a line break such as `x` + newline + `BASH_ENV=/tmp/evil.sh` sets a variable that makes bash run the sender's script, and `$GITHUB_PATH` can put their directory first in `PATH`. No `${{ }}` in the script is needed for this, so WG004 alone doesn't catch it. Pass the value to the step that needs it via `env:` or a step output. |
 | WG008 | secrets-exposure | medium; high for `toJSON(secrets)` | `${{ secrets.X }}` pasted into `run:` or a github-script: the secret becomes part of the script text, quotes or `$` in it break the script, and `set -x`, an error message or a process listing can show it (GitHub's log masking only catches exact matches). Pass it through `env:` and use `"$X"`. Also `toJSON(secrets)` anywhere (every secret in one value) and `secrets: inherit` on a reusable workflow from another repository (all secrets handed to code that lives elsewhere). Passing a secret to an action's `with:` is fine. |
 | WG009 | workflow-run | high for a checkout of the triggering commit or artifacts unpacked into the workspace before a `run:` step; medium for other artifact downloads | A `workflow_run` workflow runs with secrets and a write token, but the run that triggered it may have built a fork's pull request. Checking out `github.event.workflow_run.head_sha` (or `head_branch`, `head_repository`, `pull_requests`) runs the fork's code with those secrets; so does doing it in a script (`git checkout`, `git fetch`, `git switch`, `git reset`, `git pull`, `git worktree add` of the head, also through an `env:` variable, or `gh pr checkout` of its pull request). Its artifacts (`actions/download-artifact` with `run-id:`, `dawidd6/action-download-artifact`, `gh run download`, `downloadArtifact` in a github-script) are the fork author's files: unpacked into the workspace they can replace the repository's scripts and config that later steps run. Download to `${{ runner.temp }}` and treat the contents as data. When every workflow named under `on.workflow_run.workflows` is among the checked files and none runs on `pull_request` (or another `workflow_run`), nothing is reported: those runs only build this repository's own commits. A `branches:` filter under `on.workflow_run` doesn't change that and is named in the message: it matches the head branch of the fork's pull request, whose name the fork picks (`main` too). |
-| WG010 | comment-command | high for a checkout of the pull request; medium for a job with secrets | `issue_comment` runs with secrets and a write token, and anyone who can comment (on a public repository: anyone) starts it. A `/test` or `/deploy` job that checks out the pull request (`ref: refs/pull/${{ github.event.issue.number }}/head`, a ref from a step or job output, `gh pr checkout`, `git fetch origin pull/N/head`) or uses secrets other than `GITHUB_TOKEN` must check who commented. Counted as a check: `github.event.comment.author_association`, `github.actor` / `github.triggering_actor` or the commenter's login in the job's `if:` (or the step's, for that step); a step that checks the commenter's permission (`getCollaboratorPermissionLevel`, `gh api .../collaborators/<user>/permission`, `actions-cool/check-user-permission`, `xt0rted/slash-command-action`, `peter-evans/slash-command-dispatch` and similar); or such a check in a job it `needs:`. Matching the comment's text (`startsWith(github.event.comment.body, '/test')`) is not a check, and the message says so. |
+| WG010 | comment-command | high for a checkout of the pull request; medium for a job with secrets | `issue_comment` runs with secrets and a write token, and anyone who can comment (on a public repository: anyone) starts it. A `/test` or `/deploy` job that checks out the pull request (`ref: refs/pull/${{ github.event.issue.number }}/head`, a ref from a step or job output, `gh pr checkout`, `git fetch origin pull/N/head`) or uses secrets other than `GITHUB_TOKEN` must check who commented. Counted as a check: a job `if:` (or a step's, for that step) on `github.event.comment.author_association`, `github.actor` / `github.triggering_actor` or the commenter's login that is false for everyone who can't write (an allow-list such as `== 'OWNER'`, `contains(fromJSON('["OWNER","MEMBER"]'), ...)` or `contains(fromJSON(vars.MAINTAINERS), github.actor)`); a deny-list such as `author_association != 'NONE'` or `github.actor != 'renovate[bot]'` is not, and the message names who still gets in; a step that checks the commenter's permission (`getCollaboratorPermissionLevel`, `gh api .../collaborators/<user>/permission`, `actions-cool/check-user-permission`, `xt0rted/slash-command-action`, `peter-evans/slash-command-dispatch` and similar); or such a check in a job it `needs:`. Matching the comment's text (`startsWith(github.event.comment.body, '/test')`) is not a check, and the message says so. |
 
 ### Actions that run a script
 
@@ -314,6 +314,13 @@ be read or parsed, or bad arguments.
   `'github.head_ref'` is text, not a context, and a `}}` inside it doesn't end the expression.
   `toJSON(github.event)` is reported too: it prints every field, titles and bodies included.
   The paths are then compared with a list of outsider-controlled fields.
+- WG010 **evaluates** a job's `if:` (`conditions.py`): a small parser (`!` > comparisons > `&&`
+  > `||`) and an evaluator with three-valued logic. The condition is evaluated once for each
+  `author_association` of people who can't write (`CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`,
+  `FIRST_TIMER`, `MANNEQUIN`, `NONE`), with the commenter's login set to a *stranger* (equal to
+  no login in the workflow) and everything else unknown. `x && false` is false whatever `x` is;
+  `x && true` is unknown. Only a condition that is certainly false for all five keeps strangers
+  out.
 - WG004 also follows untrusted values on a **detour** (`taint.py`). The steps of each job are
   walked in order, like the runner does, keeping track of which values are *tainted*:
   `env:` at workflow, job and step level (a clean value at a lower level removes the taint),
@@ -387,6 +394,7 @@ src/workflow_guard/
   workflow.py  loading workflows and actions, node helpers, jobs/steps/triggers, inline ignores
   rules.py     the eight rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
+  conditions.py   if: parser and three-valued evaluator (WG010: who does the check let in?)
   taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
   calls.py     local reusable workflows and actions: what callers pass into each input
   project.py   the files checked together; which file a uses: ./... runs
@@ -469,9 +477,9 @@ CHANGELOG.md.
 - WG004 looks at `run:`, `actions/github-script` and the actions listed under "Actions that run
   a script", plus the ones named with `--script-input`. Other actions can also run an input as
   code; they aren't known.
-- WG010 doesn't judge the check itself: `author_association != 'NONE'` (which lets every past
-  contributor in) counts like an allow-list, and a permission step counts even if its result
-  isn't used. Only `issue_comment` is checked: `pull_request_review_comment` on a fork's pull
+- WG010 judges a check in an `if:` but not a permission step: such a step counts even if its
+  result isn't used. A weak check in a job named in `needs:` doesn't count, but the message
+  doesn't say why. `vars.*` and `secrets.*` are trusted as lists of people the owners chose. Only `issue_comment` is checked: `pull_request_review_comment` on a fork's pull
   request runs without secrets, like `pull_request`.
 - WG009 looks for `actions/checkout`, git/gh commands in `run:` (one line at a time, with
   `\` continuations joined; the head reference must be on the same line as the command) and
