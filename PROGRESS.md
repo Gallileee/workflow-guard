@@ -1,5 +1,47 @@
 # Progress log
 
+## 2026-11-15 (scheduled run): WG010 weak checks
+
+Why: next step 2 (step 1, the v0.21.0 release, was already published). Any mention of the
+commenter in an `if:` counted as a check, so `author_association != 'NONE'` (CONTRIBUTOR and
+FIRST_TIME_CONTRIBUTOR still get in) silenced WG010. Projects gate `issue_comment` jobs on
+OWNER/MEMBER/COLLABORATOR (e.g. google/adk-python), and Wiz's "Pwn Request Reckoning" warns that
+author_association is easy to get wrong.
+
+Acceptance criteria:
+- A job or step `if:` counts as a check only if it is certainly false for every
+  author_association that can't write (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER,
+  MANNEQUIN, NONE) and for a commenter login that equals no login written in the workflow.
+- Allow-lists still pass: `==`, `contains(fromJSON('[...]'), ...)`, `contains('A,B', assoc)`,
+  `vars.*` / `secrets.*` lists. Deny-lists, substring login checks, `startsWith(github.actor..)`,
+  `|| <comment text>` and `|| always()` don't.
+- The message names who still gets in (the associations, or "every account it doesn't name");
+  this replaces the "only looks at the comment's text" note when both apply.
+- An `if:` that isn't a valid expression is no check (as before). A weak check in a `needs:` job
+  doesn't count.
+- Release notes in CHANGELOG.md; v0.21.0's heading gets its date.
+
+Done:
+- `src/workflow_guard/conditions.py`: recursive-descent parser on the existing tokenizer,
+  three-valued evaluator (UNKNOWN, STRANGER, OWNERS_LIST), GitHub's loose equality and
+  case-insensitive strings, contains/startsWith/endsWith/fromJSON/always; `lets_in()`.
+- `rules.py`: `_commenter_gate()` replaces the mention test in the job, step and `needs:` checks;
+  `_why_open()` replaces `_body_only()`.
+- Tests: `test_conditions.py` (61), 8 more in `test_wg010.py`. 589 in total.
+- README (WG010 row, How it works, layout, limitations), CHANGELOG v0.22.0, version 0.22.0.
+
+Verified locally:
+- `pytest -q -W error`: 589 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.22.0, 0 errors (warning: v0.22.0 not tagged yet).
+- CLI on a workflow with `author_association != 'NONE'` and `gh pr checkout`: one WG010 high
+  naming the four associations, exit 1. lendloop, fitness-workout-log, transit-raptor,
+  GaTe-parking: unchanged (no issue_comment workflows).
+- Mutation checks: 12 mutants (case-sensitive strings, unknown `&&` taking the right side, a
+  stranger equal to nothing known, owners' lists not excluding strangers, substring login check
+  counted as safe, only certain-true counted as letting in, `!` dropped, owners' values truthy,
+  no short-circuit, no number coercion, `always()` unknown), all killed (one after adding a
+  test for `!vars.LOCKED`).
+
 ## 2026-11-14 (interactive): a settings file
 
 Why: picked by the owner ("Config file"). `ignore`, the levels and `script-inputs` had to be
@@ -777,7 +819,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.21.0` and publish its release from CHANGELOG.md (needs the owner's approval).
-2. WG010: tell a weak check (`author_association != 'NONE'`, which lets every past contributor
-   in) from an allow-list.
+1. Tag `v0.22.0` on the merge commit and publish its release from CHANGELOG.md.
+2. WG010: say in the message when a `needs:` job's check is the weak one, and check that a
+   permission step's result is used (`core.setFailed`, `exit 1`, `--jq` compared).
 3. The Marketplace listing (needs the owner: it's a public listing under their account).
