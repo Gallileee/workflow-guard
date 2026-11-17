@@ -1,5 +1,46 @@
 # Progress log
 
+## 2026-11-17 (scheduled run): WG010 permission steps that only report
+
+Why: next step 2 (step 1, tagging v0.22.0, needs the owner). A permission step counted as a
+check whatever it did with the answer. `actions-cool/check-user-permission` only sets
+`require-result` unless `error-if-missing: true` (its README), `sushichop/action-repository-permission`
+exits 0 with `relax: true`, and a github-script that `return`s the answer never fails. A weak
+check in a `needs:` job didn't count, but the message didn't say so.
+
+Acceptance criteria:
+- A permission step covers the whole job only if it fails on a no: known actions (with their
+  switch input), `core.setFailed`/`throw`/`process.exit(1)` in a github-script, `exit 1` or a
+  bare `| grep -q` in a script; `continue-on-error: true` turns that off.
+- A step that only reports covers the steps whose `if:` reads `steps.<id>` (ids without case),
+  and the jobs whose `if:` reads a job output carrying it (`needs.<job>.outputs.<name>`).
+  Secrets only in covered steps aren't reported.
+- Messages name the permission step (and its job, when it's a needed one) and a weak `if:` in a
+  needed job.
+- v0.22.0 isn't tagged yet, so the notes go into its CHANGELOG section (a v0.23.0 section would
+  fail release_check: a version that is neither in the code nor tagged).
+
+Done:
+- `rules.py`: `_PERMISSION_ACTIONS` dict with switch inputs, `_STOPS`, `_permission_check`
+  (`_FAILS`/`_REPORTS`), `_answers`, `_waits_for_answer`, `_answer_outputs`, `_needed_jobs`,
+  `_weak_note`; `_why_open(wf, job_id, what, ...)`; `_scalars(skip=)` for secrets.
+- Tests: 20 more in `test_wg010.py` (2 old cases changed: actions-cool without
+  `error-if-missing` and `gh api ... --jq .permission` alone are no check any more). 609 in total.
+- README (WG010 row, How it works, limitations), CHANGELOG v0.22.0 section.
+
+Verified locally:
+- `pytest -q -W error`: 609 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.22.0, 0 errors (warning: v0.22.0 not tagged yet).
+- CLI on a `/test` workflow with `actions-cool/check-user-permission` (id, no
+  `error-if-missing`) before a PR checkout: one WG010 high naming line 11, exit 1; with
+  `error-if-missing: true`: 0 findings, exit 0. workflow-guard, lendloop, fitness-workout-log,
+  transit-raptor, GaTe-parking: same output as main.
+- Mutation checks: 15 mutants (switch inputs flipped, continue-on-error ignored, grep/exit not
+  stops, grep in an `if` or before `||` counted, step `if:` on the answer ignored or any `if:`
+  accepted, job outputs ignored, needs answer ignored, answers counted as failing, covered
+  secrets counted, needed weak note dropped, ids case-sensitive), all killed (two after adding
+  tests: the needed-job note assertion hadn't been applied, and a mixed-case id).
+
 ## 2026-11-15 (scheduled run): WG010 weak checks
 
 Why: next step 2 (step 1, the v0.21.0 release, was already published). Any mention of the
@@ -819,7 +860,7 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.22.0` on the merge commit and publish its release from CHANGELOG.md.
-2. WG010: say in the message when a `needs:` job's check is the weak one, and check that a
-   permission step's result is used (`core.setFailed`, `exit 1`, `--jq` compared).
+1. Tag `v0.22.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. WG010: check that the permission step comes before the checkout or secret step it guards,
+   and evaluate an `if:` on the answer (`!= 'false'` vs `== 'true'`).
 3. The Marketplace listing (needs the owner: it's a public listing under their account).
