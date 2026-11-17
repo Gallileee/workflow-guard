@@ -155,7 +155,12 @@ def test_a_weak_check_in_a_needed_job_doesnt_count():
         "jobs:\n  gate:\n    if: github.event.comment.author_association != 'NONE'\n    runs-on: x\n"
         "    steps:\n      - run: echo ok\n  test:\n    needs: gate\n",
     )
-    assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]
+    ((_, severity, message),) = wg010(text)
+    assert severity == Severity.HIGH
+    assert (
+        "(the 'if:' of job 'gate', which it needs, looks at who commented but still lets"
+        " CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER and MANNEQUIN in" in message
+    )
 
 
 def test_a_weak_job_if_with_a_strong_step_if_is_covered():
@@ -170,7 +175,17 @@ def test_a_weak_job_if_with_a_strong_step_if_is_covered():
 @pytest.mark.parametrize(
     "step",
     [
-        (f"- uses: actions-cool/check-user-permission@{SHA}", "  with:", "    require: write"),
+        (
+            f"- uses: actions-cool/check-user-permission@{SHA}",
+            "  with:",
+            "    require: write",
+            "    error-if-missing: true",
+        ),
+        (
+            f"- uses: sushichop/action-repository-permission@{SHA}",
+            "  with:",
+            "    required-permission: write",
+        ),
         (f"- uses: xt0rted/slash-command-action@{SHA}", "  with:", "    command: test"),
         (
             f"- uses: actions/github-script@{SHA}",
@@ -180,7 +195,12 @@ def test_a_weak_job_if_with_a_strong_step_if_is_covered():
             " username: context.actor});",
             "      if (r.data.permission !== 'admin') core.setFailed('no');",
         ),
-        ("- run: gh api repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission --jq .permission",),
+        ("- run: gh api repos/$R/collaborators/$U/permission --jq .permission | grep -qE 'admin|write'",),
+        (
+            "- run: |",
+            "    p=$(gh api repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission --jq .permission)",
+            '    if [ "$p" != admin ]; then exit 1; fi',
+        ),
     ],
 )
 def test_a_permission_step_is_a_check(step):
@@ -250,3 +270,134 @@ def test_ignore_comment():
         "    ref: refs/pull/${{ github.event.issue.number }}/head",
     )
     assert wg010(text) == []
+
+
+# --- a permission step whose answer nothing acts on ----------------------------------------------
+
+ASK_ONLY = (
+    f"- uses: actions-cool/check-user-permission@{SHA}",
+    "  id: perm",
+    "  with:",
+    "    require: write",
+)
+GITHUB_SCRIPT_ASK = (
+    f"- uses: actions/github-script@{SHA}",
+    "  id: perm",
+    "  with:",
+    "    script: |",
+    "      const r = await github.rest.repos.getCollaboratorPermissionLevel({...context.repo,"
+    " username: context.actor});",
+    "      return ['admin', 'write'].includes(r.data.permission);",
+)
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        ASK_ONLY,
+        GITHUB_SCRIPT_ASK,
+        (
+            f"- uses: sushichop/action-repository-permission@{SHA}",
+            "  with:",
+            "    required-permission: write",
+            "    relax: true",
+        ),
+        (f"- uses: xt0rted/slash-command-action@{SHA}", "  continue-on-error: true"),
+        (
+            "- run: |",
+            "    if gh api repos/$R/collaborators/$U/permission --jq .permission | grep -q admin; then",
+            '      echo "ok=true" >> "$GITHUB_OUTPUT"',
+            "    fi",
+        ),
+        ("- run: gh api repos/$R/collaborators/$U/permission --jq .permission | grep -q admin || true",),
+    ],
+)
+def test_a_permission_step_that_doesnt_fail_is_no_check(step):
+    ((line, severity, message),) = wg010(on_comment(*step, *CHECKOUT_PR))
+    assert severity == Severity.HIGH
+    assert (
+        "(the step at line 9 asks for the commenter's permission but doesn't fail on a no,"
+        " and this step's 'if:' doesn't check its answer)" in message
+    )
+
+
+@pytest.mark.parametrize(
+    ("ask", "cond"),
+    [
+        (ASK_ONLY, "steps.perm.outputs.require-result == 'true'"),
+        (GITHUB_SCRIPT_ASK, "${{ steps.perm.outputs.result == 'true' }}"),
+        (GITHUB_SCRIPT_ASK, "steps.Perm.outcome == 'success'"),
+    ],
+)
+def test_a_step_if_on_the_answer_covers_that_step(ask, cond):
+    assert wg010(on_comment(*ask, *CHECKOUT_PR, f"  if: {cond}")) == []
+
+
+def test_the_answer_covers_only_the_steps_that_check_it():
+    text = on_comment(
+        *ASK_ONLY,
+        *CHECKOUT_PR,
+        "  if: steps.perm.outputs.require-result == 'true'",
+        "- run: gh pr checkout ${{ github.event.issue.number }}",
+    )
+    assert [line for line, _, _ in wg010(text)] == [18]
+
+
+def test_an_answer_without_an_id_cant_be_checked():
+    step = tuple(line for line in ASK_ONLY if "id:" not in line)
+    text = on_comment(*step, *CHECKOUT_PR, "  if: steps.perm.outputs.require-result == 'true'")
+    assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]
+
+
+def test_secrets_only_in_steps_that_wait_for_the_answer_are_fine():
+    gated = (
+        "- run: ./deploy.sh",
+        "  if: steps.perm.outputs.require-result == 'true'",
+        "  env:",
+        "    T: ${{ secrets.X }}",
+    )
+    assert wg010(on_comment(*ASK_ONLY, *gated)) == []
+    ungated = ("- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}")
+    ((_, severity, message),) = wg010(on_comment(*ASK_ONLY, *ungated))
+    assert severity == Severity.MEDIUM
+    assert "doesn't fail on a no, and this job's 'if:' doesn't check its answer)" in message
+
+
+def gated_by(job_if: str, output: str = "${{ steps.perm.outputs.require-result }}") -> str:
+    gate = "\n".join(f"      {line}" for line in ASK_ONLY)
+    return on_comment(*CHECKOUT_PR, job_if=job_if).replace(
+        "jobs:\n  test:\n",
+        f"jobs:\n  gate:\n    runs-on: x\n    outputs:\n      allowed: {output}\n    steps:\n{gate}\n"
+        "  test:\n    needs: gate\n",
+    )
+
+
+def test_a_job_if_on_a_needed_jobs_answer_is_a_check():
+    assert wg010(gated_by("needs.gate.outputs.allowed == 'true'")) == []
+
+
+@pytest.mark.parametrize(
+    ("job_if", "output"),
+    [
+        ("", "${{ steps.perm.outputs.require-result }}"),
+        ("needs.gate.outputs.other == 'true'", "${{ steps.perm.outputs.require-result }}"),
+        ("needs.gate.outputs.allowed == 'true'", "${{ steps.other.outputs.x }}"),
+    ],
+)
+def test_a_needed_jobs_answer_the_job_doesnt_check_is_named(job_if, output):
+    ((line, severity, message),) = wg010(gated_by(job_if, output))
+    assert severity == Severity.HIGH
+    assert (
+        "(the step at line 11 in job 'gate', which it needs, asks for the commenter's permission" in message
+    )
+    assert "this job's 'if:' doesn't check the answer in needs.gate.outputs)" in message
+
+
+def test_secrets_in_a_step_with_a_strong_if_are_fine():
+    step = ("- run: ./deploy.sh", "  if: github.actor == 'me'", "  env:", "    T: ${{ secrets.X }}")
+    assert wg010(on_comment(*step)) == []
+
+
+def test_step_ids_dont_depend_on_case():
+    ask = tuple(line.replace("id: perm", "id: CheckPerm") for line in ASK_ONLY)
+    assert wg010(on_comment(*ask, *CHECKOUT_PR, "  if: steps.checkperm.outputs.require-result")) == []

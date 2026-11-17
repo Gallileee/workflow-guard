@@ -34,6 +34,36 @@ values of people who can't write to the repository); ...
   `startsWith(github.actor, 'team-')`, and an allow-list joined with `||` to the comment's text.
 - The same goes for a step's `if:` and for a check in a job named in `needs:`.
 
+### A permission step only counts if it stops the job
+
+A step that asks GitHub for the commenter's permission used to count as a check whatever it did
+with the answer. But some only report it:
+
+```yaml
+- uses: actions-cool/check-user-permission@v2
+  id: perm
+  with:
+    require: write          # sets outputs.require-result; doesn't fail without error-if-missing
+- uses: actions/checkout@v4
+  with:
+    ref: refs/pull/${{ github.event.issue.number }}/head
+```
+
+Now a permission step is a check for the whole job only if it fails on a no
+(`error-if-missing: true`, `core.setFailed` or `throw` in a github-script, `exit 1` or a
+`| grep -q` in a script, and no `continue-on-error: true`). One that only reports the answer
+covers the steps whose `if:` reads `steps.<id>...`, and the jobs whose `if:` reads it through
+`needs.<job>.outputs`. The message says which step asked:
+
+```
+wf.yml:15:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 11 asks for the commenter's permission but doesn't fail on a no,
+and this step's 'if:' doesn't check its answer); ...
+```
+
+A weak `if:` in a job named in `needs:` is now named too: "(the 'if:' of job 'gate', which it
+needs, looks at who commented but still lets CONTRIBUTOR, ... in ...)".
+
 ## v0.21.0 — A settings file (2026-11-14)
 
 ### `.github/workflow-guard.yml`
