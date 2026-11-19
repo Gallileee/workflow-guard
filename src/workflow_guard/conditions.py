@@ -394,3 +394,36 @@ def lets_in(condition: str) -> tuple[str, ...]:
         for association in UNTRUSTED_ASSOCIATIONS
         if truthy(evaluate(tree, _stranger_lookup(association))) is not False
     )
+
+
+# --- the answer of a permission step that only reports ------------------------------------------
+
+NO_ANSWERS = ("", "false", "none", "read")
+"""What a permission step that only reports may put in its outputs for a commenter who can't
+write: nothing (the step didn't set it), ``false`` (a yes/no output), or the permission level
+GitHub gives them (``none``, or ``read`` on a public repository)."""
+
+
+def may_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bool:
+    """Whether ``condition`` may be true for a commenter who can't write. The commenter's
+    association, login, ``vars`` and ``secrets`` are set as for ``lets_in``; ``lookup`` gives
+    every other value (UNKNOWN for none). Raises ``ExpressionError``."""
+    tree = parse(condition)
+    for association in UNTRUSTED_ASSOCIATIONS:
+        stranger = _stranger_lookup(association)
+
+        def both(path: tuple[str, ...], stranger: Callable[[tuple[str, ...]], object] = stranger) -> object:
+            value = stranger(path)
+            return lookup(path) if value is UNKNOWN else value
+
+        if truthy(evaluate(tree, both)) is not False:
+            return True
+    return False
+
+
+def text_value(expression: str, lookup: Callable[[tuple[str, ...]], object]) -> object:
+    """The text ``${{ expression }}`` puts in its place, or UNKNOWN. Raises ``ExpressionError``."""
+    value = evaluate(parse(expression), lookup)
+    if value is UNKNOWN or value is STRANGER or value is OWNERS_LIST:
+        return UNKNOWN
+    return _text(value)

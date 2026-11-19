@@ -3,12 +3,15 @@
 import pytest
 
 from workflow_guard.conditions import (
+    OWNERS_LIST,
     STRANGER,
     UNKNOWN,
     UNTRUSTED_ASSOCIATIONS,
     evaluate,
     lets_in,
+    may_pass,
     parse,
+    text_value,
     truthy,
 )
 from workflow_guard.expressions import ExpressionError
@@ -150,3 +153,58 @@ def test_allow_lists_let_no_one_in(cond):
 )
 def test_weak_checks_name_who_gets_in(cond, who):
     assert lets_in(cond) == who
+
+
+# --- may_pass and text_value ---------------------------------------------------------------------
+
+
+def _answer(value: str):
+    def lookup(path):
+        if path == ("steps", "perm", "outputs", "ok"):
+            return value
+        if path == ("github", "actor"):
+            return STRANGER
+        if path[0] == "vars":
+            return OWNERS_LIST
+        return UNKNOWN
+
+    return lookup
+
+
+@pytest.mark.parametrize(
+    ("condition", "answer", "passes"),
+    [
+        ("steps.perm.outputs.ok == 'true'", "false", False),
+        ("steps.perm.outputs.ok", "false", True),
+        ("steps.perm.outputs.ok", "", False),
+        ("steps.perm.outputs.ok != 'false'", "", True),
+        ("steps.perm.outputs.ok != 'false'", "false", False),
+        ("steps.perm.outputs.ok == 'true' || github.event.comment.author_association == 'OWNER'", "", False),
+        ("steps.perm.outputs.ok == 'true' || github.event.comment.author_association != 'NONE'", "", True),
+        ("steps.perm.outputs.ok == 'true' || success()", "", True),
+        ("steps.other.outputs.ok == 'true'", "", True),
+    ],
+)
+def test_may_pass(condition, answer, passes):
+    assert may_pass(condition, _answer(answer)) is passes
+
+
+@pytest.mark.parametrize(
+    ("expression", "value"),
+    [
+        ("steps.perm.outputs.ok", "read"),
+        ("steps.perm.outputs.ok == 'read'", "true"),
+        ("steps.perm.outputs.ok == 'true' && 'yes' || 'no'", "no"),
+        ("1", "1"),
+        ("github.actor", UNKNOWN),
+        ("vars.X", UNKNOWN),
+        ("steps.perm.outputs.ok && format('{0}', 1)", UNKNOWN),
+    ],
+)
+def test_text_value(expression, value):
+    assert text_value(expression, _answer("read")) == value
+
+
+def test_text_value_rejects_bad_expressions():
+    with pytest.raises(ExpressionError):
+        text_value("steps.perm.outputs.ok ==", _answer(""))
