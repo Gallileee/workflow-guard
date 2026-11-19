@@ -1,5 +1,52 @@
 # Progress log
 
+## 2026-11-19 (scheduled run): WG010 permission checks that come too late or let a no through
+
+Why: next step 2 (step 1, tagging v0.22.0, was done on 2026-11-17). A permission step that fails
+on a no covered the whole job, even a `gh pr checkout` that runs before it. And any `if:` that
+mentioned a reporting step's answer covered its step: `steps.perm.outputs.require-result`
+alone (the text `false` is truthy), `!= 'false'` (fails open on an empty or misspelt output) and
+`steps.perm.outcome == 'success'` on a step that never fails all counted.
+
+Acceptance criteria:
+- A failing permission step covers only the steps after it in its job; a checkout before it is
+  high, secrets before it are medium, and the message names the late step. Job-level `env:`
+  secrets don't count when nothing before the check uses secrets. In a needed job, order
+  doesn't matter.
+- An `if:` reading `steps.<id>` of a reporting step counts only if it is false for every
+  answer in `NO_ANSWERS` (empty, `false`, `none`, `read`) and every association that can't
+  write; `outcome` is `success`, or `failure` for a failing step with `continue-on-error`.
+- The same for a job `if:` on `needs.<job>.outputs.<name>`, after working out the output's own
+  expression (text around it kept; an unknown part makes it unknown).
+- Messages name the answers that still pass ("is still true when it answers nothing, 'none' or
+  'read'", or "anything").
+- v0.22.0 heading gets its date; v0.23.0 section and version.
+
+Done:
+- `conditions.py`: `NO_ANSWERS`, `may_pass(condition, lookup)`, `text_value(expression, lookup)`.
+- `rules.py`: `_asks` (fails on a no before continue-on-error), `_stop_step`, `_no_answers`,
+  `_passing`, `_answer_words`, `_answer_gate`, `_output_text`, `_needed_answer_gate`;
+  `_answer_outputs` returns the raw values; `_why_open(..., stop=)`; `comment_commands` only
+  looks at the steps before the first failing permission step.
+- Tests: 2 old cases changed (`outcome == 'success'` on a github-script that never fails, and a
+  bare `steps.checkperm.outputs.require-result`, are no check any more), 43 new
+  (`test_wg010.py`, `test_conditions.py`). 652 in total.
+- README (WG010 row, How it works, limitations), CHANGELOG v0.23.0, version 0.23.0.
+
+Verified locally:
+- `pytest -q -W error`: 652 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.23.0, 0 errors (warning: v0.23.0 not tagged yet).
+- CLI on a demo workflow (a `test` job gated by `!= 'false'`, a `deploy` job with
+  `gh pr checkout` before `xt0rted/slash-command-action`): main 0 findings, exit 0; this branch
+  two WG010 high (lines 13 and 22), exit 1. workflow-guard, LendLoop, fitness-workout-log,
+  transit-raptor, GaTe-parking, market-pulse, tracker, DriverBro: same output as main (none has
+  an `issue_comment` workflow, so this only shows nothing else moved).
+- Mutation checks: 15 mutants (outcome always success, an answer dropped from NO_ANSWERS twice,
+  order ignored, nothing before the stop, needed-job gate always true, job-level secrets with a
+  stop, stop in needed job ignored, conclusion failure, bad `if:` passing nothing, unknown
+  output parts, text around an output dropped, `may_pass` only on certain truth, stop note
+  dropped, "anything" wording), all killed (three after adding tests).
+
 ## 2026-11-17 (scheduled run): WG010 permission steps that only report
 
 Why: next step 2 (step 1, tagging v0.22.0, needs the owner). A permission step counted as a
@@ -860,7 +907,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.22.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. WG010: check that the permission step comes before the checkout or secret step it guards,
-   and evaluate an `if:` on the answer (`!= 'false'` vs `== 'true'`).
-3. The Marketplace listing (needs the owner: it's a public listing under their account).
+1. Tag `v0.23.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. WG010 on real workflows: collect a few public `issue_comment` workflows (GitHub code search
+   for `getCollaboratorPermissionLevel`, `check-user-permission`) and look for false positives,
+   e.g. `!= 'false'` on an action whose output is never empty (per-action answer sets would fix it).
+3. WG010: a job `if:` on `needs.<job>.result` (a needed job that failed on a no) counts only
+   through `needs:` today; `always()` in a dependent job skips that and isn't reported.
+4. The Marketplace listing (needs the owner: it's a public listing under their account).

@@ -4,7 +4,55 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.22.0 — WG010: weak checks of the commenter
+## v0.23.0 — WG010: a permission check that comes too late or lets a no through
+
+### A permission step only covers the steps after it
+
+A step that fails unless the commenter may write (`xt0rted/slash-command-action`,
+`core.setFailed` in a github-script, `exit 1`...) used to count for the whole job. But the
+steps before it have already run by the time it fails:
+
+```yaml
+- run: gh pr checkout ${{ github.event.issue.number }}
+- uses: xt0rted/slash-command-action@v2
+  with:
+    command: deploy
+```
+
+Now it covers only the steps after it. A checkout or a secret before it is reported:
+
+```
+wf.yml:22:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 23 fails unless the commenter may write, but this step runs before
+it); ...
+```
+
+In a job named in `needs:` the order doesn't matter: when that job fails, the jobs that need it
+don't run.
+
+### An `if:` on the answer has to keep a no out
+
+A step that only reports the answer covered every step whose `if:` read it, whatever it did
+with it. Now the `if:` is evaluated for each answer someone who can't write may get: nothing
+(an output that wasn't set, or a misspelt name), `false`, `none` or `read`.
+
+- Still a check: `steps.perm.outputs.require-result == 'true'`,
+  `contains(fromJSON('["admin","write"]'), steps.perm.outputs.result)`, and
+  `steps.perm.outcome == 'success'` for a step that would fail but has `continue-on-error`.
+- Not a check any more: `steps.perm.outputs.require-result` alone (the text `false` is true in
+  an `if:`), `!= 'false'` (an empty answer gets through: it fails open),
+  `steps.perm.outcome == 'success'` for a step that never fails, and an answer check joined
+  with `||` to the comment's text or `always()`.
+- The same goes for a job's `if:` on `needs.<job>.outputs.<name>`: the output's own expression
+  is worked out first, so `${{ steps.perm.outputs.require-result == 'true' }}` gives `false`.
+
+```
+wf.yml:13:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 9 asks for the commenter's permission but doesn't fail on a no, and
+this step's 'if:' is still true when it answers nothing, 'none' or 'read'); ...
+```
+
+## v0.22.0 — WG010: weak checks of the commenter (2026-11-17)
 
 ### An `if:` that looks at who commented isn't always a check
 

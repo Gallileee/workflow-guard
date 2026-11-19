@@ -280,6 +280,7 @@ ASK_ONLY = (
     "  with:",
     "    require: write",
 )
+CONTINUING_ASK = (f"- uses: xt0rted/slash-command-action@{SHA}", "  id: perm", "  continue-on-error: true")
 GITHUB_SCRIPT_ASK = (
     f"- uses: actions/github-script@{SHA}",
     "  id: perm",
@@ -326,7 +327,10 @@ def test_a_permission_step_that_doesnt_fail_is_no_check(step):
     [
         (ASK_ONLY, "steps.perm.outputs.require-result == 'true'"),
         (GITHUB_SCRIPT_ASK, "${{ steps.perm.outputs.result == 'true' }}"),
-        (GITHUB_SCRIPT_ASK, "steps.Perm.outcome == 'success'"),
+        (GITHUB_SCRIPT_ASK, "contains(fromJSON('[\"true\"]'), steps.perm.outputs.result)"),
+        # A step that would fail but continues on error: its outcome is the answer.
+        (CONTINUING_ASK, "steps.Perm.outcome == 'success'"),
+        (CONTINUING_ASK, "${{ success() && steps.perm.outcome != 'failure' }}"),
     ],
 )
 def test_a_step_if_on_the_answer_covers_that_step(ask, cond):
@@ -400,4 +404,150 @@ def test_secrets_in_a_step_with_a_strong_if_are_fine():
 
 def test_step_ids_dont_depend_on_case():
     ask = tuple(line.replace("id: perm", "id: CheckPerm") for line in ASK_ONLY)
-    assert wg010(on_comment(*ask, *CHECKOUT_PR, "  if: steps.checkperm.outputs.require-result")) == []
+    assert (
+        wg010(on_comment(*ask, *CHECKOUT_PR, "  if: steps.checkperm.outputs.require-result == 'true'")) == []
+    )
+
+
+# --- an if: that reads the answer but lets a no through ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ask", "cond", "who"),
+    [
+        # The string 'false' is true in an if:.
+        (ASK_ONLY, "steps.perm.outputs.require-result", "'false', 'none' or 'read'"),
+        # A misspelt output name is empty: != fails open, == fails closed.
+        (ASK_ONLY, "steps.perm.outputs.require-result != 'false'", "nothing, 'none' or 'read'"),
+        (GITHUB_SCRIPT_ASK, "steps.perm.outputs.result != 'none'", "nothing, 'false' or 'read'"),
+        # A step that never fails always succeeds.
+        (GITHUB_SCRIPT_ASK, "steps.perm.outcome == 'success'", "anything"),
+        (GITHUB_SCRIPT_ASK, "steps.perm.conclusion == 'success'", "anything"),
+        (
+            ASK_ONLY,
+            "steps.perm.outputs.require-result == 'true' || startsWith(github.event.comment.body, '/test')",
+            "anything",
+        ),
+        (ASK_ONLY, "${{ steps.perm.outputs.require-result == 'true' || always() }}", "anything"),
+        # Not an expression GitHub accepts.
+        (ASK_ONLY, "steps.perm.outputs.require-result ==", "anything"),
+    ],
+)
+def test_an_if_that_lets_a_no_through_is_named(ask, cond, who):
+    ((_, severity, message),) = wg010(on_comment(*ask, *CHECKOUT_PR, f"  if: {cond}"))
+    assert severity == Severity.HIGH
+    assert f"and this step's 'if:' is still true when it answers {who})" in message
+
+
+def test_an_if_on_the_answer_and_a_strong_commenter_check_is_covered():
+    cond = (
+        "steps.perm.outputs.require-result != 'false' && github.event.comment.author_association == 'OWNER'"
+    )
+    assert wg010(on_comment(*ASK_ONLY, *CHECKOUT_PR, f"  if: {cond}")) == []
+
+
+def test_secrets_in_a_step_that_lets_a_no_through_are_medium():
+    step = (
+        "- run: ./deploy.sh",
+        "  if: steps.perm.outputs.require-result",
+        "  env:",
+        "    T: ${{ secrets.X }}",
+    )
+    ((_, severity, message),) = wg010(on_comment(*ASK_ONLY, *step))
+    assert severity == Severity.MEDIUM
+    assert "doesn't fail on a no, and this job's 'if:' doesn't check its answer)" in message
+
+
+@pytest.mark.parametrize(
+    ("job_if", "output", "who"),
+    [
+        (
+            "needs.gate.outputs.allowed != 'false'",
+            "${{ steps.perm.outputs.require-result }}",
+            "nothing, 'none' or 'read'",
+        ),
+        ("needs.gate.outputs.allowed", "${{ steps.perm.outputs.require-result == 'true' }}", "anything"),
+        # Part of the output is unknown, so the whole of it is.
+        (
+            "contains(needs.gate.outputs.allowed, 'true')",
+            "${{ github.run_id }}-${{ steps.perm.outputs.require-result }}",
+            "anything",
+        ),
+        (
+            "needs.gate.outputs.allowed == 'yes'",
+            "${{ steps.perm.outputs.require-result && 'yes' }}",
+            "'false', 'none' or 'read'",
+        ),
+    ],
+)
+def test_a_job_if_that_lets_a_needed_jobs_no_through_is_named(job_if, output, who):
+    ((_, severity, message),) = wg010(gated_by(job_if, output))
+    assert severity == Severity.HIGH
+    assert (
+        f"this job's 'if:' reads the answer in needs.gate.outputs but is still true when it answers {who})"
+        in message
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_if", "output"),
+    [
+        ("needs.gate.outputs.allowed == 'true'", "${{ steps.perm.outputs.require-result == 'true' }}"),
+        ("needs.gate.outputs.allowed == 'ok-true'", "ok-${{ steps.perm.outputs.require-result }}"),
+        ("needs.gate.outputs.allowed != 'ok-false'", "ok-${{ steps.perm.outputs.require-result == 'true' }}"),
+        ("needs.gate.outputs.allowed", "${{ steps.perm.outputs.require-result == 'true' && 'yes' || '' }}"),
+    ],
+)
+def test_a_job_if_that_keeps_a_needed_jobs_no_out_is_a_check(job_if, output):
+    assert wg010(gated_by(job_if, output)) == []
+
+
+# --- a permission step that comes too late -------------------------------------------------------
+
+STOP = (f"- uses: xt0rted/slash-command-action@{SHA}", "  with:", "    command: test")
+
+
+def test_a_checkout_before_the_permission_step_is_high():
+    ((line, severity, message),) = wg010(on_comment(*CHECKOUT_PR, *STOP))
+    assert (line, severity) == (9, Severity.HIGH)
+    assert (
+        "(the step at line 13 fails unless the commenter may write, but this step runs before it)" in message
+    )
+
+
+def test_only_the_steps_before_the_permission_step_are_open():
+    text = on_comment(
+        "- run: gh pr checkout ${{ github.event.issue.number }}", *STOP, "- run: gh pr checkout 1"
+    )
+    assert [line for line, _, _ in wg010(text)] == [9]
+
+
+def test_a_gated_step_before_the_permission_step_is_covered():
+    text = on_comment(*CHECKOUT_PR, "  if: github.event.comment.author_association == 'MEMBER'", *STOP)
+    assert wg010(text) == []
+
+
+def test_secrets_before_the_permission_step_are_medium():
+    secret = ("- run: ./notify.sh", "  env:", "    T: ${{ secrets.X }}")
+    ((_, severity, message),) = wg010(on_comment(*secret, *STOP))
+    assert severity == Severity.MEDIUM
+    assert (
+        "(the step at line 12 fails unless the commenter may write,"
+        " but the steps that use secrets run before it)" in message
+    )
+    assert wg010(on_comment(*STOP, *secret)) == []
+
+
+def test_job_env_secrets_with_a_permission_step_first_are_fine():
+    text = on_comment(*STOP, "- run: ./deploy.sh").replace(
+        "    runs-on: x\n", "    runs-on: x\n    env:\n      T: ${{ secrets.X }}\n"
+    )
+    assert wg010(text) == []
+
+
+def test_order_in_a_needed_job_doesnt_matter_for_the_jobs_that_need_it():
+    gate = "\n".join(f"      {line}" for line in ("- run: echo hi", *STOP))
+    text = on_comment(*CHECKOUT_PR).replace(
+        "jobs:\n  test:\n", f"jobs:\n  gate:\n    runs-on: x\n    steps:\n{gate}\n  test:\n    needs: gate\n"
+    )
+    assert wg010(text) == []
