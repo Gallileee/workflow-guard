@@ -415,10 +415,14 @@ def test_step_ids_dont_depend_on_case():
 @pytest.mark.parametrize(
     ("ask", "cond", "who"),
     [
-        # The string 'false' is true in an if:.
-        (ASK_ONLY, "steps.perm.outputs.require-result", "'false', 'none' or 'read'"),
+        # The string 'false' is true in an if:. With `require:` set, require-result is never
+        # empty, so 'false' is the only answer a no gets.
+        (ASK_ONLY, "steps.perm.outputs.require-result", "'false'"),
+        (ASK_ONLY, "steps.perm.outputs.user-permission", "'none' or 'read'"),
+        # Without `require:` it isn't set at all.
+        (ASK_ONLY[:2], "steps.perm.outputs.require-result != 'false'", "nothing, 'none' or 'read'"),
         # A misspelt output name is empty: != fails open, == fails closed.
-        (ASK_ONLY, "steps.perm.outputs.require-result != 'false'", "nothing, 'none' or 'read'"),
+        (ASK_ONLY, "steps.perm.outputs.require-reslut != 'false'", "nothing, 'none' or 'read'"),
         (GITHUB_SCRIPT_ASK, "steps.perm.outputs.result != 'none'", "nothing, 'false' or 'read'"),
         # A step that never fails always succeeds.
         (GITHUB_SCRIPT_ASK, "steps.perm.outcome == 'success'", "anything"),
@@ -426,9 +430,10 @@ def test_step_ids_dont_depend_on_case():
         (
             ASK_ONLY,
             "steps.perm.outputs.require-result == 'true' || startsWith(github.event.comment.body, '/test')",
-            "anything",
+            "'false'",
         ),
-        (ASK_ONLY, "${{ steps.perm.outputs.require-result == 'true' || always() }}", "anything"),
+        (ASK_ONLY, "${{ steps.perm.outputs.require-result == 'true' || always() }}", "'false'"),
+        (GITHUB_SCRIPT_ASK, "${{ steps.perm.outputs.result == 'true' || always() }}", "anything"),
         # Not an expression GitHub accepts.
         (ASK_ONLY, "steps.perm.outputs.require-result ==", "anything"),
     ],
@@ -463,10 +468,10 @@ def test_secrets_in_a_step_that_lets_a_no_through_are_medium():
     [
         (
             "needs.gate.outputs.allowed != 'false'",
-            "${{ steps.perm.outputs.require-result }}",
-            "nothing, 'none' or 'read'",
+            "${{ steps.perm.outputs.user-permission }}",
+            "'none' or 'read'",
         ),
-        ("needs.gate.outputs.allowed", "${{ steps.perm.outputs.require-result == 'true' }}", "anything"),
+        ("needs.gate.outputs.allowed", "${{ steps.perm.outputs.require-result == 'true' }}", "'false'"),
         # Part of the output is unknown, so the whole of it is.
         (
             "contains(needs.gate.outputs.allowed, 'true')",
@@ -476,7 +481,7 @@ def test_secrets_in_a_step_that_lets_a_no_through_are_medium():
         (
             "needs.gate.outputs.allowed == 'yes'",
             "${{ steps.perm.outputs.require-result && 'yes' }}",
-            "'false', 'none' or 'read'",
+            "'false'",
         ),
     ],
 )
@@ -717,3 +722,142 @@ def test_cancelled_counts_as_running_anyway():
     # Another comment can cancel the run (concurrency: cancel-in-progress), and then it runs.
     ((_, _, message),) = wg010(on_comment(*STOP, *CHECKOUT_PR, "  if: cancelled()"))
     assert "this step's 'if:' uses cancelled(), so it runs even when that step fails)" in message
+
+
+# --- false positives found on public workflows (2026-11-20) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "job_if",
+    [
+        # Workflows with more triggers: a comment's run is always 'issue_comment'.
+        f"github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && {OWNER_ONLY})",
+        f"github.event_name != 'issue_comment' || {OWNER_ONLY}",
+        # A job that never runs for a comment.
+        "github.event_name == 'push'",
+        "github.event_name == 'schedule' && contains(github.event.comment.body, '/x')",
+    ],
+)
+def test_the_event_name_is_issue_comment(job_if):
+    assert wg010(on_comment(*CHECKOUT_PR, job_if=job_if)) == []
+
+
+def test_the_event_name_alone_is_no_check():
+    ((_, _, message),) = wg010(on_comment(*CHECKOUT_PR, job_if="github.event_name == 'issue_comment'"))
+    assert "without checking who commented;" in message
+
+
+DENY = ("- run: exit 1", "  if: steps.perm.outputs.require-result != 'true'")
+
+
+def test_a_step_that_exits_on_a_reported_no_stops_the_job():
+    assert wg010(on_comment(*ASK_ONLY, *DENY, *CHECKOUT_PR)) == []
+    secret = ("- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}")
+    assert wg010(on_comment(*ASK_ONLY, *DENY, *secret)) == []
+
+
+@pytest.mark.parametrize(
+    "deny",
+    [
+        ("- run: exit 1", "  if: steps.perm.outputs.require-result == 'false'"),
+        (
+            "- run: |",
+            '    echo "$ACTOR may not run this"',
+            "    exit 1",
+            "  if: ${{ steps.perm.outputs.user-permission != 'write' }}",
+        ),
+        (
+            f"- uses: actions/github-script@{SHA}",
+            "  if: steps.perm.outputs.require-result != 'true'",
+            "  with:",
+            "    script: core.setFailed('no')",
+        ),
+    ],
+)
+def test_ways_to_exit_on_a_reported_no(deny):
+    assert wg010(on_comment(*ASK_ONLY, *deny, *CHECKOUT_PR)) == []
+
+
+@pytest.mark.parametrize(
+    ("ask", "deny"),
+    [
+        # Not every no: require-result is empty without `require:`.
+        (ASK_ONLY[:2], ("- run: exit 1", "  if: steps.perm.outputs.require-result == 'false'")),
+        # Only some of the no answers.
+        (ASK_ONLY, ("- run: exit 1", "  if: steps.perm.outputs.user-permission == 'none'")),
+        # Maybe: it depends on something else too.
+        (ASK_ONLY, ("- run: exit 1", f"  {DENY[1].strip()} && github.event.issue.locked")),
+        # Doesn't fail.
+        (ASK_ONLY, ("- run: echo no", "  if: steps.perm.outputs.require-result != 'true'")),
+        (ASK_ONLY, (*DENY, "  continue-on-error: true")),
+        # Doesn't read the answer.
+        (ASK_ONLY, ("- run: exit 1", "  if: github.event.issue.locked")),
+    ],
+)
+def test_a_step_that_doesnt_exit_on_every_reported_no_is_no_stop(ask, deny):
+    ((_, severity, _),) = wg010(on_comment(*ask, *deny, *CHECKOUT_PR))
+    assert severity == Severity.HIGH
+
+
+def test_steps_between_the_answer_and_the_exit_are_open():
+    ((line, _, message),) = wg010(on_comment(*ASK_ONLY, *CHECKOUT_PR, *DENY))
+    assert line == 13
+    assert (
+        "(the step at line 17 fails unless the commenter may write, but this step runs before it)" in message
+    )
+
+
+def test_a_job_with_more_needs_knows_how_each_ends():
+    # One needed job checks, the other only runs for workflow_dispatch: both don't succeed.
+    text = needing(
+        STOP, "(needs.gate.result == 'success' || needs.manual.result == 'success') && !cancelled()"
+    )
+    text = text.replace("    needs: gate\n", "    needs: [gate, manual]\n").replace(
+        "jobs:\n",
+        "jobs:\n  manual:\n    if: github.event_name == 'workflow_dispatch'\n    runs-on: x\n"
+        "    steps:\n      - run: echo ok\n",
+    )
+    assert wg010(text.replace("&& !cancelled()", "&& always()")) == []
+    open_ = text.replace("needs.manual.result == 'success'", "needs.manual.result == 'skipped'")
+    assert len(wg010(open_.replace("&& !cancelled()", "&& always()"))) == 1
+
+
+def test_a_failing_permission_step_that_also_writes_its_answer():
+    gate = (
+        f"- uses: actions/github-script@{SHA}",
+        "  id: perm",
+        "  with:",
+        "    script: |",
+        "      const r = await github.rest.repos.getCollaboratorPermissionLevel({...context.repo,"
+        " username: context.actor});",
+        "      core.setOutput('ok', r.data.permission === 'admin');",
+        "      if (r.data.permission === 'none') core.setFailed('no');",
+    )
+    text = needing(gate, "${{ !cancelled() && needs.gate.outputs.ok == 'true' }}").replace(
+        "    runs-on: x\n    steps:\n      - uses: actions/github",
+        "    runs-on: x\n    outputs:\n      ok: ${{ steps.perm.outputs.ok }}\n"
+        "    steps:\n      - uses: actions/github",
+    )
+    assert wg010(text) == []
+    assert (
+        len(wg010(text.replace("needs.gate.outputs.ok == 'true'", "needs.gate.outputs.ok != 'false'"))) == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        'echo "REF=refs/pull/${{ github.event.issue.number }}/merge" >> "$GITHUB_ENV"',
+        "echo ref=refs/pull/1/head >> $GITHUB_OUTPUT",
+        "gh api repos/$R/pulls/1 --jq .head.sha  # not refs/pull/1/head",
+    ],
+)
+def test_a_pr_ref_that_is_only_saved_is_no_checkout(script):
+    assert wg010(on_comment(f"- run: {script}")) == []
+
+
+def test_a_git_command_split_over_lines_is_a_checkout():
+    text = on_comment(
+        "- run: |", "    git fetch origin \\", "      refs/pull/${{ github.event.issue.number }}/head"
+    )
+    assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]

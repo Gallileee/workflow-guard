@@ -4,7 +4,48 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.24.0 — WG010: a check that `always()` runs past
+## v0.25.0 — WG010 on public workflows: fewer false positives
+
+### Checked against 148 public `issue_comment` workflows
+
+WG010 ran on 148 public workflows found with GitHub code search
+(`getCollaboratorPermissionLevel`, `check-user-permission`, `slash-command-action`,
+`author_association` with `refs/pull`). It reported 100 findings. The changes below remove 77
+of them; each kind was traced to a check WG010 didn't understand. 23 remain.
+
+- **The event is known.** In a run started by a comment, `github.event_name` is
+  `issue_comment`. Workflows with more triggers write
+  `github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && ...)`;
+  that `if:` is now evaluated, and a job whose `if:` is never true for a comment
+  (`github.event_name == 'push'`) isn't reported.
+- **Exit on a reported no.** An action that only reports, followed by a step that fails
+  whenever its `if:` lets it run, is a check for the steps after that step:
+
+  ```yaml
+  - uses: actions-cool/check-user-permission@v2
+    id: perm
+    with:
+      require: write
+  - if: steps.perm.outputs.require-result != 'true'
+    run: exit 1
+  ```
+
+- **What an action answers.** `actions-cool/check-user-permission` always sets
+  `user-permission`, and `require-result` when `require:` is given (its `src/main.js`), so
+  only `false` (or `none`/`read`) is tried for those outputs, not an empty answer.
+  `require-result == 'false'` then `exit 1` counts, and so does `!= 'false'`.
+- **Every needed job at once.** `(needs.check.result == 'success' || needs.manual.result ==
+  'success') && !cancelled()` is false when `check` fails for a stranger and `manual` only runs
+  on `workflow_dispatch`; until now only one needed job's result was known at a time.
+- **A failing check that also writes its answer.** A dependent job's `if:` on
+  `needs.<job>.outputs` is evaluated for a permission step that fails on a no too, not only for
+  one that reports.
+- **Not a checkout.** A script that only saves a pull request's ref
+  (`echo "REF=refs/pull/1/merge" >> $GITHUB_ENV`, `>> $GITHUB_OUTPUT`) isn't a checkout; a git
+  command (`fetch`, `checkout`, `switch`, `pull`, `reset`, `worktree add`) or `gh pr checkout`
+  on the same line as the ref is.
+
+## v0.24.0 — WG010: a check that `always()` runs past (2026-11-20)
 
 ### A failed check stops only what doesn't run after a failure
 
