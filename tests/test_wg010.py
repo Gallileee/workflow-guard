@@ -551,3 +551,169 @@ def test_order_in_a_needed_job_doesnt_matter_for_the_jobs_that_need_it():
         "jobs:\n  test:\n", f"jobs:\n  gate:\n    runs-on: x\n    steps:\n{gate}\n  test:\n    needs: gate\n"
     )
     assert wg010(text) == []
+
+
+# --- running anyway: always(), failure(), !cancelled() ---------------------------------------------
+
+STATUS_IFS = ["always()", "failure()", "${{ !cancelled() }}", "success() || failure()", "${{ always() }}"]
+
+
+def needing(gate_lines: tuple[str, ...], job_if: str = "", gate_if: str = "") -> str:
+    gate = "\n".join(f"      {line}" for line in gate_lines)
+    cond = f"    if: {gate_if}\n" if gate_if else ""
+    return on_comment(*CHECKOUT_PR, job_if=job_if).replace(
+        "jobs:\n  test:\n",
+        f"jobs:\n  gate:\n{cond}    runs-on: x\n    steps:\n{gate}\n  test:\n    needs: gate\n",
+    )
+
+
+OWNER_ONLY = "github.event.comment.author_association == 'OWNER'"
+
+
+@pytest.mark.parametrize("job_if", STATUS_IFS)
+def test_a_job_that_runs_after_a_failed_check_is_open(job_if):
+    ((_, severity, message),) = wg010(needing(STOP, job_if))
+    assert severity == Severity.HIGH
+    assert (
+        "(job 'gate', which it needs, fails for commenters who can't write, but this job's 'if:' uses"
+        in message
+    )
+    assert "so it runs anyway); check github.event" in message
+
+
+def test_the_message_names_every_status_function():
+    ((_, _, message),) = wg010(needing(STOP, "success() || failure()"))
+    assert "this job's 'if:' uses success() and failure(), so it runs anyway)" in message
+    ((_, _, message),) = wg010(needing(STOP, "${{ !cancelled() }}"))
+    assert "this job's 'if:' uses cancelled(), so it runs anyway)" in message
+
+
+@pytest.mark.parametrize(
+    "job_if",
+    ["success()", "success() && always()", "${{ !failure() }}", "always() && needs.gate.result == 'success'"],
+)
+def test_a_job_that_doesnt_run_after_a_failed_check_is_covered(job_if):
+    assert wg010(needing(STOP, job_if)) == []
+
+
+@pytest.mark.parametrize(
+    "job_if",
+    ["always()", "${{ !failure() }}", "${{ !cancelled() }}", "always() && needs.gate.result != 'failure'"],
+)
+def test_a_job_that_runs_after_a_skipped_check_is_open(job_if):
+    ((_, severity, message),) = wg010(needing(("- run: echo ok",), job_if, OWNER_ONLY))
+    assert severity == Severity.HIGH
+    assert "(job 'gate', which it needs, is skipped for commenters who can't write" in message
+
+
+@pytest.mark.parametrize(
+    "job_if",
+    [
+        "failure()",
+        "always() && needs.gate.result == 'success'",
+        "${{ !cancelled() && needs.gate.outputs.ok == 'true' }}",
+        "always() && github.event.comment.author_association == 'MEMBER'",
+    ],
+)
+def test_a_job_that_doesnt_run_after_a_skipped_check_is_covered(job_if):
+    assert wg010(needing(("- run: echo ok",), job_if, OWNER_ONLY)) == []
+
+
+def test_without_a_status_function_a_skipped_or_failed_check_still_counts():
+    assert wg010(needing(STOP, "github.event.issue.pull_request")) == []
+    assert wg010(needing(("- run: echo ok",), "contains(github.event.comment.body, '/t')", OWNER_ONLY)) == []
+
+
+def test_running_anyway_breaks_the_chain_further_up():
+    text = on_comment(*CHECKOUT_PR).replace(
+        "jobs:\n  test:\n",
+        f"jobs:\n  gate:\n    if: {OWNER_ONLY}\n    runs-on: x\n"
+        "    steps:\n      - run: echo ok\n  middle:\n    needs: gate\n    if: always()\n    runs-on: x\n"
+        "    steps:\n      - run: echo ok\n  test:\n    needs: [middle]\n",
+    )
+    assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]
+    # without always() in 'middle' it is skipped too, and so is 'test'
+    assert wg010(text.replace("    if: always()\n", "")) == []
+
+
+def test_one_needed_check_that_holds_is_enough():
+    text = (
+        needing(STOP, "always()")
+        .replace("    needs: gate\n", "    needs: [gate, owner]\n")
+        .replace(
+            "jobs:\n",
+            f"jobs:\n  owner:\n    if: {OWNER_ONLY}\n    runs-on: x\n    steps:\n      - run: echo ok\n",
+        )
+    )
+    assert len(wg010(text)) == 1
+    covered = text.replace("    if: always()\n", "    if: always() && needs.owner.result == 'success'\n")
+    assert wg010(covered) == []
+
+
+@pytest.mark.parametrize("step_if", STATUS_IFS)
+def test_a_step_that_runs_after_the_permission_step_fails_is_open(step_if):
+    ((line, severity, message),) = wg010(on_comment(*STOP, *CHECKOUT_PR, f"  if: {step_if}"))
+    assert (line, severity) == (12, Severity.HIGH)
+    assert "(the step at line 9 fails unless the commenter may write, but this step's 'if:' uses" in message
+    assert "so it runs even when that step fails); check github.event" in message
+
+
+@pytest.mark.parametrize(
+    "step_if",
+    [
+        "success()",
+        "${{ !failure() }}",
+        "always() && false",
+        f"failure() && {OWNER_ONLY}",
+        "always(",
+    ],
+)
+def test_a_step_that_doesnt_run_after_the_permission_step_fails_is_covered(step_if):
+    assert wg010(on_comment(*STOP, *CHECKOUT_PR, f"  if: {step_if}")) == []
+
+
+def test_a_step_that_runs_anyway_but_checks_the_answer_is_covered():
+    text = on_comment(
+        *ASK_ONLY, *STOP, *CHECKOUT_PR, "  if: always() && steps.perm.outputs.require-result == 'true'"
+    )
+    assert wg010(text) == []
+
+
+def test_secrets_in_a_step_that_runs_after_the_permission_step_fails_are_medium():
+    secret = ("- run: ./report.sh", "  if: always()", "  env:", "    T: ${{ secrets.X }}")
+    ((_, severity, message),) = wg010(on_comment(*STOP, *secret))
+    assert severity == Severity.MEDIUM
+    assert (
+        "(the step at line 9 fails unless the commenter may write, but the 'if:' of a step that"
+        " uses secrets uses always(), so it runs even when that step fails)" in message
+    )
+
+
+def test_secrets_before_and_after_name_the_early_ones():
+    early = ("- run: ./notify.sh", "  env:", "    T: ${{ secrets.X }}")
+    late = ("- run: ./report.sh", "  if: always()", "  env:", "    T: ${{ secrets.Y }}")
+    ((_, _, message),) = wg010(on_comment(*early, *STOP, *late))
+    assert "but the steps that use secrets run before it)" in message
+
+
+def test_failure_after_a_skipped_check_is_open_when_another_job_can_fail():
+    text = (
+        needing(("- run: echo ok",), "failure()", OWNER_ONLY)
+        .replace("    needs: gate\n", "    needs: [gate, build]\n")
+        .replace("jobs:\n", "jobs:\n  build:\n    runs-on: x\n    steps:\n      - run: make\n")
+    )
+    ((_, _, message),) = wg010(text)
+    assert "is skipped for commenters who can't write, but this job's 'if:' uses failure()" in message
+
+
+def test_failure_after_a_skipped_check_is_open_when_a_job_before_it_can_fail():
+    text = needing(("- run: echo ok",), "failure()", OWNER_ONLY).replace(
+        "  gate:\n", "  build:\n    runs-on: x\n    steps:\n      - run: make\n  gate:\n    needs: build\n"
+    )
+    assert len(wg010(text)) == 1
+
+
+def test_cancelled_counts_as_running_anyway():
+    # Another comment can cancel the run (concurrency: cancel-in-progress), and then it runs.
+    ((_, _, message),) = wg010(on_comment(*STOP, *CHECKOUT_PR, "  if: cancelled()"))
+    assert "this step's 'if:' uses cancelled(), so it runs even when that step fails)" in message

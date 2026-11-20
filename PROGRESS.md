@@ -1,5 +1,46 @@
 # Progress log
 
+## 2026-11-20 (scheduled run): WG010 checks that `always()` runs past
+
+Why: next step 3 (step 1, tagging v0.23.0, was done on 2026-11-19; step 2 needs a survey of
+public workflows). A step that fails on a no, or a needed job that fails or is skipped for a
+stranger, counted as a check for everything after it. GitHub only adds `success() &&` to an
+`if:` without a status function, so `always()`, `failure()` or `${{ !cancelled() }}` ran the
+step or job anyway.
+
+Acceptance criteria:
+- A dependent job whose `if:` has a status function counts a needed job's check only if the
+  `if:` is false for a stranger with `success()` false, `failure()` true after a failure,
+  `cancelled()` unknown, `always()` true and `needs.<job>.result` set (`failure`/`skipped`;
+  a skipped job's outputs empty). Without a status function nothing changes.
+- The same for a step after a step that fails on a no (high for a checkout, medium for secrets).
+- Chains: a job in the middle that runs anyway passes nothing on.
+- Messages name the job or step check and the functions ("uses always(), so it runs anyway").
+- v0.23.0 heading gets its date; v0.24.0 section and version.
+
+Done:
+- `conditions.py`: `STATUS_FUNCTIONS`, `status_functions(text)`; `evaluate` asks the lookup
+  for `success()`, `failure()`, `cancelled()`.
+- `rules.py`: `_runs_anyway`, `_output_paths`, `_function_words`, `_stranger_result`
+  ("skipped"/"failure"/None), `_alone`; `_job_checks_commenter` uses them for every needed
+  job; `comment_commands` opens steps after the stop that run anyway; `_why_open(anyway=)` and
+  a note for a needed job that the job runs past.
+- Tests: 45 new (`test_wg010.py`, `test_conditions.py`), 697 in total.
+- README (WG010 row, How it works, limitations), CHANGELOG v0.24.0, version 0.24.0.
+
+Verified locally:
+- `pytest -q -W error`: 697 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.24.0, 0 errors (warning: v0.24.0 not tagged yet).
+- CLI on a demo workflow (`test` needs a `gate` with `xt0rted/slash-command-action` and has
+  `${{ !cancelled() }}`; `report` has `if: always()` with a secret after its own check): main
+  0 findings, exit 0; this branch WG010 high (line 17) and medium (line 18), exit 1.
+  workflow-guard, LendLoop, fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 13 mutants (success() unknown, failure() unknown/always false, cancelled()
+  false, needs.result unset, skipped outputs not empty, needed-job check ignoring status
+  functions, steps after the stop never open, late secret note always, `_alone` ignoring
+  ancestors, "is skipped" wording, status functions not looked up, duplicates), all killed
+  (two after adding tests).
+
 ## 2026-11-19 (scheduled run): WG010 permission checks that come too late or let a no through
 
 Why: next step 2 (step 1, tagging v0.22.0, was done on 2026-11-17). A permission step that fails
@@ -907,10 +948,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.23.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+1. Tag `v0.24.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
 2. WG010 on real workflows: collect a few public `issue_comment` workflows (GitHub code search
    for `getCollaboratorPermissionLevel`, `check-user-permission`) and look for false positives,
    e.g. `!= 'false'` on an action whose output is never empty (per-action answer sets would fix it).
-3. WG010: a job `if:` on `needs.<job>.result` (a needed job that failed on a no) counts only
-   through `needs:` today; `always()` in a dependent job skips that and isn't reported.
+3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
+   look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
 4. The Marketplace listing (needs the owner: it's a public listing under their account).

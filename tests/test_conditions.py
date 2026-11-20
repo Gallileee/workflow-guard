@@ -11,6 +11,7 @@ from workflow_guard.conditions import (
     lets_in,
     may_pass,
     parse,
+    status_functions,
     text_value,
     truthy,
 )
@@ -208,3 +209,38 @@ def test_text_value(expression, value):
 def test_text_value_rejects_bad_expressions():
     with pytest.raises(ExpressionError):
         text_value("steps.perm.outputs.ok ==", _answer(""))
+
+
+# --- status functions ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"{ASSOC} == 'OWNER'", ()),
+        ("always()", ("always",)),
+        ("!cancelled() && (failure() || SUCCESS())", ("cancelled", "failure", "success")),
+        ("always() || always()", ("always",)),
+        ("format('{0}', success())", ("success",)),
+        ("success('x')", ()),
+    ],
+)
+def test_status_functions_are_found(text, expected):
+    assert status_functions(text) == expected
+
+
+def test_status_functions_need_an_expression():
+    with pytest.raises(ExpressionError):
+        status_functions("always(")
+
+
+def test_status_functions_come_from_the_lookup():
+    status = {("success()",): False, ("failure()",): True, ("cancelled()",): UNKNOWN}
+
+    def lookup(path):
+        return status.get(path, UNKNOWN)
+
+    assert evaluate(parse("success()"), lookup) is False
+    assert evaluate(parse("failure() && always()"), lookup) is True
+    assert evaluate(parse("!cancelled()"), lookup) is UNKNOWN
+    assert evaluate(parse("success() && x"), lookup) is False
