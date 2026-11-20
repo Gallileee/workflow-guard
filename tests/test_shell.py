@@ -66,10 +66,10 @@ def test_scripts_that_exit_for_everyone_who_cant_write(script):
         'if [ "$A" = OWNER ]; then true; fi && exit 1',
         # Never exits.
         'echo "$A"',
-        # Not followed: loops, functions, subshells, background jobs, heredocs, bad syntax.
+        # Not followed: loops, subshells, background jobs, heredocs, bad syntax.
         "for x in a; do exit 1; done",
         "while true; do exit 1; done",
-        "check() { exit 1; }\ncheck",
+        "for x in a b; do echo $x; done\nexit 1",
         "( exit 1 )",
         "exit 1 &",
         "cat <<EOF\nx\nEOF\nexit 1",
@@ -210,7 +210,7 @@ def test_api_scripts_that_may_let_a_stranger_through(script):
         # Not the permission API.
         '[ "$U" = octocat ] || exit 1',
         # Something it doesn't follow.
-        f"check() {{ {API}; }}\ncheck || exit 1",
+        f"while read -r p; do echo $p; done < <({API})\nexit 1",
         f"{API} | grep -q admin file.txt || exit 1",
         f"{API} | grep --quiet admin || exit 1",
         f"{API} | grep -qE 'a(' || exit 1",  # not a regex
@@ -241,3 +241,89 @@ def test_the_api_answer_is_used_only_in_an_assignment():
 )
 def test_api_details(script, expected):
     assert api(script) is expected
+
+
+# --- functions and groups -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "check() { exit 1; }\ncheck",
+        'check() {\n  case "$A" in OWNER|MEMBER) return 0 ;; esac\n  return 1\n}\ncheck || exit 1',
+        'function check { [ "$A" = OWNER ]; }\nif ! check; then exit 1; fi',
+        'function check() {\n  [ "$1" = OWNER ] && return 0\n  echo "no"\n  exit 3\n}\ncheck "$A"\necho ok',
+        # The function's last command is its status; under -e a failing call ends the script.
+        'is_owner() { [ "$A" = OWNER ]; }\nis_owner\necho go',
+        # $1 is the argument; locals are put back.
+        'allowed() {\n  local who="$1"\n  [ "$who" = OWNER ]\n}\nallowed "$A" || exit 1',
+        'pretend() { local A=OWNER; }\npretend\n[ "$A" = OWNER ] || exit 1',
+        'set_one() { echo; }\nset_one OWNER\n[ "$1" = OWNER ] || exit 1',
+        '{ [ "$A" = OWNER ] || [ "$A" = MEMBER ]; } || exit 1',
+        '{\n  echo "checking"\n  [ "$A" = OWNER ]\n} >> "$GITHUB_STEP_SUMMARY" || exit 1',
+        'if [ "$A" != OWNER ]; then exit 1; fi 2>&1',
+        # The permission API inside a function.
+        f'perm() {{ P=$({API} --jq .permission); [ "$P" = admin ]; }}\nperm || exit 1',
+    ],
+)
+def test_functions_that_exit_for_strangers(script):
+    assert fails(script, U=STRANGER) is True
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Defined but never called.
+        "check() { exit 1; }\necho go",
+        # return ends the function, not the script.
+        "check() { return 1; }\ncheck || echo no\necho go",
+        "check() {\n  return 0\n  exit 1\n}\ncheck",
+        # -e doesn't act inside a function called in a condition or before || ...
+        'check() {\n  [ "$A" = OWNER ]\n  echo "the last command decides"\n}\ncheck || exit 1',
+        "check() {\n  false\n  true\n}\nif check; then echo ok; else exit 1; fi",
+        # ... nor inside a group before ||.
+        "{ false; true; } || exit 1",
+        # Unknown return status.
+        "check() { return $CODE; }\ncheck || exit 1",
+        'check() { return; }\n[ "$A" = OWNER ] || check || exit 1',
+        # $1 is what was passed, not the caller's $1.
+        'check() { [ "$1" = OWNER ]; }\ncheck OWNER || exit 1',
+    ],
+)
+def test_functions_that_may_let_strangers_through(script):
+    assert fails(script) is False
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "return 1",  # outside a function
+        "local x=1",
+        "f() { f; }\nf",  # too deep
+        "f() ( exit 1 )\nf",  # a subshell body
+        "function 1x { exit 1; }",
+        "f() { local 'a b'; }\nf",
+    ],
+)
+def test_function_forms_it_doesnt_follow(script):
+    assert always_fails(script, {}) is False
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        # return ends the function: nothing after it in the body runs, nor after it in a list.
+        ("check() {\n  return 0\n  exit 1\n  echo skipped\n}\ncheck", False),
+        ("check() { return 1 || exit 1; }\ncheck || true", False),
+        # A negated call: -e doesn't act inside it.
+        ("check() {\n  false\n  true\n}\n! check\necho go", False),
+        # A group's last command: -e acts on it.
+        ('{ [ "$A" = OWNER ]; }\necho go', True),
+    ],
+)
+def test_more_functions(script, expected):
+    assert fails(script) is expected
+
+
+def test_return_outside_a_function_is_not_followed():
+    assert api(f"P=$({API} --jq .permission)\nreturn 1") is None

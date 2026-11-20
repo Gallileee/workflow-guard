@@ -1,5 +1,42 @@
 # Progress log
 
+## 2026-11-20 (interactive, user picked "Funkce v shell.py"): functions in the bash evaluator
+
+Why: next step 2. Functions were the most common reason a permission script fell back to the
+text guess (8 of 22 in the corpora).
+
+Acceptance criteria:
+- `name() { ...; }` and `function name [()] { ...; }` are parsed; a call runs the body with
+  `$1`... from its arguments, then puts `$1`... and `local` variables back; `return [N]` ends
+  the function (status N, or unknown without N); without it the last command's status counts.
+- `{ ...; }` groups; redirections after `}`, `fi`, `esac`, `]]`.
+- `set -e` doesn't act inside a function or group called in a condition, negated, or before the
+  last command of a `&&`/`||` list (this also fixes `if`/`case` bodies in those places).
+- Top-level `$1`... are empty (GitHub passes no arguments).
+- Unsupported: `return`/`local` outside a function, recursion past 8 calls, a `( )` body.
+
+Done:
+- `shell.py`: `_Group`, `_Define`, `_Function`; parser `group`, `define`, `redirections`;
+  `_call` (positional, locals, depth), `return`/`local` in `_simple`; `_RETURNED` marker skipped
+  by `_run_seq`, `_seq_status` and `_and_or`; `_pipe(last=)` runs non-last and negated
+  pipelines with `-e` off.
+- Tests: 32 more in `test_shell.py` (3 old ones that expected functions to be unsupported now use
+  loops); 889 in total.
+- README (How it works, limitations), CHANGELOG v0.28.0, version 0.28.0, v0.27.0 heading dated.
+
+What the corpora showed: 21 of 40 permission scripts decided (was 18); one more only reports
+(qd-today-style: the issue's author may run it too, and `exit 0` skips). 19 still fall back:
+`while`/`for` (5), arrays and `< <(...)` (3), a heredoc, and calls about someone other than the
+commenter. WG010 findings unchanged (22 and 18).
+
+Verified locally:
+- `pytest -q -W error`: 889 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.28.0, 0 errors (warning: v0.28.0 not tagged yet).
+- Both corpora: same WG010 output as main, all rules without errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 16 mutants on functions/groups/`-e` contexts, all killed (5 after adding
+  tests).
+
 ## 2026-11-20 (interactive, user picked "API skripty na papíře"): permission API scripts on paper
 
 Why: next step 2. A `run:` script with the permission API counted as failing on a no when it
@@ -1089,10 +1126,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.27.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `shell.py`: simple functions (`check() { ...; }` then `check`), the most common reason a
-   permission script falls back to the text guess (8 of 22 in the corpora); then `while read`.
-3. WG010: a permission step's own `if:` (a check that may be skipped doesn't stop anything).
+1. Tag `v0.28.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. WG010: a permission step's own `if:` (a check that may be skipped doesn't stop anything).
+3. `shell.py`: `for`/`while` loops (5 of the 19 fallbacks), e.g. by running the body zero and
+   one times when the loop's words are unknown.
 4. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
 5. The Marketplace listing (needs the owner: it's a public listing under their account).

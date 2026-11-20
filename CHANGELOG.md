@@ -4,7 +4,36 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.27.0 — WG010: permission API scripts run on paper
+## v0.28.0 — WG010: functions in bash checks
+
+### Scripts with functions are run on paper too
+
+A permission check is often written as a function:
+
+```bash
+check() {
+  local perm
+  perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$1/permission" --jq .permission)
+  [[ "$perm" == admin || "$perm" == write ]]
+}
+check "$GITHUB_ACTOR" || { echo "::error::write access needed"; exit 1; }
+```
+
+The bash evaluator gave up on any function, so such a script was judged from its text. Now
+functions (`name() { ...; }`, `function name { ...; }`) run where they're called: `$1`... come
+from the call, `local` variables are put back afterwards, and `return` ends the function with
+its status (the last command's without one). `{ ...; }` groups run in place, and redirections
+after a compound command (`} >> "$GITHUB_OUTPUT"`) are skipped.
+
+`set -e` follows bash: inside a function or group that is called in a condition, negated, or
+before the last command of a `&&`/`||` list, a failing command doesn't end the script, so
+`check || exit 1` depends on what `check` returns.
+
+On the public workflows from v0.25.0, 21 of the 40 permission scripts are now decided (18
+before). One more turns out to only report: it also lets the issue's author through on purpose.
+No finding changed.
+
+## v0.27.0 — WG010: permission API scripts run on paper (2026-11-20)
 
 ### A script that exits only when the API call fails is no check
 
