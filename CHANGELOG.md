@@ -4,7 +4,45 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.28.0 — WG010: functions in bash checks
+## v0.29.0 — WG010: a check that may be skipped
+
+### A permission check with its own `if:` covers only steps with the same condition
+
+A step that fails unless the commenter may write covered every step after it, even when its own
+`if:` could skip it:
+
+```yaml
+- uses: xt0rted/slash-command-action@v2
+  if: contains(github.event.comment.body, '/test')
+  with:
+    command: test
+- uses: actions/checkout@v4
+  with:
+    ref: refs/pull/${{ github.event.issue.number }}/head
+```
+
+A comment without `/test` skips the check, and the checkout still runs. Now such a check covers
+only the later steps whose `if:` has the same condition (every part of it, joined by `&&`), and
+the rest are reported:
+
+```
+wf.yml:13:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 9 fails unless the commenter may write, but its 'if:' may skip it,
+and this step doesn't have the same condition); ...
+```
+
+- A check whose `if:` is true for every stranger (`github.event_name == 'issue_comment'`) still
+  covers everything after it, and so does a later check that always runs.
+- A job that needs the job with a check that may be skipped is covered only if its own `if:`
+  has the check's condition, read through the needed job's outputs: `proceed: ${{
+  steps.command.outputs.proceed }}` turns the check's `steps.command.outputs.proceed == 'true'`
+  into `needs.authorize.outputs.proceed == 'true'`.
+- A bash script check (v0.26.0) with an `if:` no longer has to always run; it follows the same
+  rule.
+- The `exit 1` step after an action that only reports (v0.25.0) is unchanged: its `if:` is about
+  that answer, so it runs whenever it should.
+
+## v0.28.0 — WG010: functions in bash checks (2026-11-20)
 
 ### Scripts with functions are run on paper too
 

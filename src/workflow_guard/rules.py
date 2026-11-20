@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import groupby
 from pathlib import Path
@@ -27,6 +27,8 @@ from .conditions import (
     stranger_text,
     text_value,
 )
+from .conditions import Node as ConditionNode
+from .conditions import parse as parse_condition
 from .expressions import (
     ContextPath,
     Expression,
@@ -760,19 +762,74 @@ def _job_steps(wf: Workflow, job_id: str) -> list[Step]:
     return [step for step in wf.steps() if step.job_id == job_id]
 
 
-def _stop_step(wf: Workflow, job_id: str) -> Step | None:
-    """The job's first step that fails unless the commenter may write: one that asks and fails
-    on a no, one that fails on the answer of a step before it that only reports, or a script
-    that checks who commented and exits for everyone who can't write."""
+@dataclass(frozen=True)
+class _Stop:
+    """A step that fails unless the commenter may write."""
+
+    index: int
+    step: Step
+    sure: bool
+    """It runs for every commenter who can't write (no ``if:``, or one that is true for them);
+    otherwise it covers only the steps whose ``if:`` has its condition too."""
+
+
+def _stops(wf: Workflow, job_id: str) -> list[_Stop]:
+    """The job's steps that fail unless the commenter may write: one that asks and fails on a no,
+    one that fails on the answer of a step before it that only reports (its ``if:`` is about
+    that answer, so it always runs when it should), or a script that checks who commented and
+    exits for everyone who can't write."""
     steps = _job_steps(wf, job_id)
+    stops = []
     for i, step in enumerate(steps):
-        if _permission_check(step) == _FAILS:
-            return step
         if _denies(step, [s for s in steps[:i] if _permission_check(s) == _REPORTS]):
-            return step
-        if _shell_check(wf, step) == () and not _continues(step) and _always_runs(step):
-            return step
-    return None
+            stops.append(_Stop(i, step, True))
+        elif _permission_check(step) == _FAILS or (_shell_check(wf, step) == () and not _continues(step)):
+            stops.append(_Stop(i, step, _always_runs(step)))
+    return stops
+
+
+def _stop_step(wf: Workflow, job_id: str) -> Step | None:
+    """The job's first step that fails unless the commenter may write and that always runs for
+    them: then the whole job fails for them."""
+    return next((stop.step for stop in _stops(wf, job_id) if stop.sure), None)
+
+
+def _condition(node: Node | None) -> ConditionNode | None:
+    """A node's ``if:`` parsed, None if it has none or it isn't an expression."""
+    text = _if_text(node)
+    if not text:
+        return None
+    try:
+        return parse_condition(text)
+    except ExpressionError:
+        return None
+
+
+def _conjuncts(node: Node | None) -> set[str] | None:
+    """The parts of a node's ``if:`` joined by ``&&`` at the top (as parsed trees), None if it
+    has no ``if:`` or isn't an expression."""
+    tree = _condition(node)
+    return None if tree is None else _parts(tree)
+
+
+def _parts(tree: ConditionNode) -> set[str]:
+    parts, todo = set(), [tree]
+    while todo:
+        part = todo.pop()
+        if part.kind == "and":
+            todo += part.children
+        else:
+            parts.add(repr(part))
+    return parts
+
+
+def _covers(stop: _Stop, step: Step) -> bool:
+    """A stop before ``step`` stops a stranger before it: it always runs, or ``step``'s
+    ``if:`` has every condition of the stop's (so when the stop is skipped, so is ``step``)."""
+    if stop.sure:
+        return True
+    needed, has = _conjuncts(stop.step.node), _conjuncts(step.node)
+    return needed is not None and has is not None and needed <= has
 
 
 def _always_runs(step: Step) -> bool:
@@ -1081,13 +1138,47 @@ def _failure_after(wf: Workflow, job: Node | None, results: dict[str, str]) -> o
 
 def _needed_results(wf: Workflow, job_id: str, seen: frozenset[str] = frozenset()) -> dict[str, str]:
     """How the jobs ``job_id`` needs end for a commenter who can't write, for the ones that
-    don't succeed for them (see ``_stranger_result``)."""
+    don't succeed for them (see ``_stranger_result``). A needed job with a stop that may be
+    skipped counts as failing when this job's ``if:`` has the stop's condition, read through
+    the needed job's outputs: when the stop is skipped, this job is skipped too."""
+    job = dict(wf.jobs()).get(job_id)
     results = {}
-    for name in _needs(dict(wf.jobs()).get(job_id)):
+    for name in _needs(job):
         result = _stranger_result(wf, name, seen | {job_id})
+        if result is None and any(_covers_through(wf, stop, name, job) for stop in _stops(wf, name)):
+            result = "failure"
         if result is not None:
             results[name] = result
     return results
+
+
+def _covers_through(wf: Workflow, stop: _Stop, name: str, job: Node | None) -> bool:
+    """A stop in job ``name`` that may be skipped, whose condition ``job`` (which needs ``name``)
+    has too: each ``steps.<id>.outputs.<x>`` in it read as the job output that carries exactly
+    that value (``needs.<name>.outputs.<o>``)."""
+    tree, has = _condition(stop.step.node), _conjuncts(job)
+    if stop.sure or tree is None or has is None:
+        return False
+    carried = {}
+    for key, value in items(get(dict(wf.jobs()).get(name), "outputs")):
+        text = value.value.strip() if isinstance(value, ScalarNode) else ""
+        exprs = list(find_expressions(text))
+        if len(exprs) == 1 and exprs[0].start == 0 and exprs[0].end == len(text):  # exactly ${{ x }}
+            try:
+                inner = parse_condition(exprs[0].inner)
+            except ExpressionError:
+                continue
+            if inner.kind == "path" and inner.value[0] == "steps":
+                carried[inner.value] = ("needs", name.lower(), "outputs", key.lower())
+
+    def through(part: ConditionNode) -> ConditionNode:
+        # A steps.* path that no output carries stays as it is: a job's if: can't read steps,
+        # so a part with one never matches.
+        if part.kind == "path":
+            return replace(part, value=carried.get(part.value, part.value))
+        return replace(part, children=tuple(through(child) for child in part.children))
+
+    return _parts(through(tree)) <= has
 
 
 def _output_paths(node: Node | None, needed: str) -> list[tuple[str, ...]]:
@@ -1176,6 +1267,7 @@ def _why_open(
     *nodes: Node | None,
     stop: Step | None = None,
     anyway: tuple[str, ...] = (),
+    skipped: bool = False,
 ) -> str:
     """Why the checks that are there don't cover the reported ``what`` ("step" or "job"): a
     permission step that comes too late (or that a step runs after anyway, through the status
@@ -1187,6 +1279,9 @@ def _why_open(
         if anyway:
             who = "this step's 'if:'" if what == "step" else "the 'if:' of a step that uses secrets"
             late = f"{who} uses {_function_words(anyway)}, so it runs even when that step fails"
+        elif skipped:
+            who = "this step" if what == "step" else "a step that uses secrets"
+            late = f"its 'if:' may skip it, and {who} doesn't have the same condition"
         elif what == "step":
             late = "this step runs before it"
         else:
@@ -1262,24 +1357,41 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
         if _job_checks_commenter(wf, job_id):
             continue
         steps = _job_steps(wf, job_id)
-        stop = _stop_step(wf, job_id)
-        # Steps after one that fails on a no only run for people who may write, unless their
-        # 'if:' runs them after a failure too (always(), failure()...).
-        at = [s.node for s in steps].index(stop.node) if stop else len(steps)
-        anyway = {id(s.node): _runs_anyway(s.node) for s in steps[at + 1 :]}
+        stops = _stops(wf, job_id)
+        stop_ids = {id(stop.step.node) for stop in stops}
+        # A step after a stop that covers it only runs for people who may write, unless its
+        # 'if:' runs it after a failure too (always(), failure()...).
+        anyway: dict[int, tuple[str, ...]] = {}
+        before: dict[int, _Stop] = {}  # the first stop before a step, for the message
+        open_steps = []
         answers = _answers(wf, job_id)
-        open_steps = [
-            step
-            for step in steps[:at] + [s for s in steps[at + 1 :] if anyway[id(s.node)]]
-            if not (_commenter_gate(step.node)[0] or _answer_gate(step.node, answers)[0])
-        ]
+        for j, step in enumerate(steps):
+            prior = [stop for stop in stops if stop.index < j]
+            if prior:
+                before[id(step.node)] = prior[0]
+                anyway[id(step.node)] = _runs_anyway(step.node)
+            if id(step.node) in stop_ids:
+                continue
+            if not anyway.get(id(step.node)) and any(_covers(stop, step) for stop in prior):
+                continue
+            if not (_commenter_gate(step.node)[0] or _answer_gate(step.node, answers)[0]):
+                open_steps.append(step)
+        first = stops[0].step if stops else None
         reported = False
         for step in open_steps:
             if not _checks_out_pr(step):
                 continue
             reported = True
+            after = before.get(id(step.node))
             why = _why_open(
-                wf, job_id, "step", job, step.node, stop=stop, anyway=anyway.get(id(step.node), ())
+                wf,
+                job_id,
+                "step",
+                job,
+                step.node,
+                stop=after.step if after else first,
+                anyway=anyway.get(id(step.node), ()),
+                skipped=after is not None,
             )
             yield _at(
                 wf,
@@ -1293,11 +1405,15 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
         if reported:
             continue
         late: tuple[str, ...] = ()
-        if stop is not None:
+        skipped = False
+        stop = first
+        if stops:
             leaking = [step for step in open_steps if _uses_secrets(step.node)]
             secrets = bool(leaking)
-            if leaking and all(id(step.node) in anyway for step in leaking):
+            if leaking and all(id(step.node) in before for step in leaking):
+                stop = before[id(leaking[0].node)].step
                 late = anyway[id(leaking[0].node)]
+                skipped = not late
         else:
             open_ids = {id(step.node) for step in open_steps}
             secrets = _uses_secrets(job, tuple(s.node for s in steps if id(s.node) not in open_ids))
@@ -1309,7 +1425,7 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
                 Severity.MEDIUM,
                 f"job '{job_id}' uses secrets and anyone who can comment can start it"
                 f" ('issue_comment'), without a check of who commented"
-                f"{_why_open(wf, job_id, 'job', job, stop=stop, anyway=late)}; {_ASK}",
+                f"{_why_open(wf, job_id, 'job', job, stop=stop, anyway=late, skipped=skipped)}; {_ASK}",
             )
 
 
