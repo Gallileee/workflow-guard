@@ -1,5 +1,46 @@
 # Progress log
 
+## 2026-11-20 (interactive, user picked "Shell kontrola asociace"): WG010 checks written in bash
+
+Why: next step 2 of the previous entry. A check of `author_association` in a `run:` script
+(`case ... in OWNER|MEMBER|COLLABORATOR) ;; *) exit 1`) wasn't recognised.
+
+Acceptance criteria:
+- A bash script that exits non-zero on every path for every association that can't write,
+  in a step that always runs (no `continue-on-error`), stops the job like a failing permission
+  step. Unknown tests go both ways; unsupported syntax means no check.
+- `set -e` as bash applies it (not in conditions, negations, or before the last of `&&`/`||`).
+- A script with an exit that still lets some through is named in the message.
+- Not for pwsh/python steps or a Windows runner's default shell; only env vars the script uses.
+- No change on the four own repositories; check both public corpora.
+
+Done:
+- `shell.py` (new): `_prepare` (continuations, comments, `$(...)`/backticks unknown), shlex
+  tokens, parser (`if`, `case`, `[[ ]]`, pipelines, and-or lists, redirections), path-following
+  evaluator with per-path variables, `_Test` for `[ ]`/`test`/`[[ ]]`, 64-path cap.
+- `conditions.py`: `stranger_text` (an `env:` value for a stranger).
+- `rules.py`: `_shell`, `_shell_inputs`, `_shell_check`, cached `_shell_passing`, `_always_runs`;
+  `_stop_step` uses them; `_why_open` names a weak script; `_who`; `_PERMISSION_API` allows
+  `${{ }}` in the URL.
+- Tests: `test_shell.py` (60) and 28 more in `test_wg010.py`/`test_conditions.py`; 816 in total.
+- README (WG010 row, How it works, modules, limitations), CHANGELOG v0.26.0, version 0.26.0,
+  v0.25.0 heading dated.
+
+What the corpora showed: real bash checks mostly test the permission API's answer
+(`P=$(gh api .../permission)`), which the `exit 1` heuristic already counted; checks of the
+association were few and mostly let more people in on purpose (the pull request's author, or
+contributors with five merged pull requests): those stay reported, now with the reason. A
+second corpus (56 files: `AUTHOR_ASSOCIATION "exit 1"`, `author_association case esac`)
+didn't change (18 findings). The first corpus went 23 -> 22 (the `${{ }}` in a permission URL).
+
+Verified locally:
+- `pytest -q -W error`: 816 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.26.0, 0 errors (warning: v0.26.0 not tagged yet).
+- Corpora: 148 files 22 WG010 findings, 56 files 18; all rules run on both without errors.
+  workflow-guard, LendLoop, fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 27 mutants on `shell.py`, the wiring and `stranger_text`, all killed (11
+  after adding tests; one showed a redundant branch in `_value`, removed).
+
 ## 2026-11-20 (interactive, "pokračuj podle plánu"): WG010 on public workflows
 
 Why: next step 2 (step 1, tagging v0.24.0, was done the same day at the owner's request). Look
@@ -1008,10 +1049,12 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.25.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. WG010: go through the 23 findings left on the public corpus one by one (rerun the searches
-   in the 2026-11-20 entry). Recognise a shell check of the association
-   (`case "$AUTHOR_ASSOCIATION" in OWNER|MEMBER|COLLABORATOR) exit 0`, then `exit 1`).
-3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
+1. Tag `v0.26.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. WG010: run permission-API scripts on paper too: `P=$(gh api .../permission --jq .permission)`
+   is `none`/`read` for a stranger (or the command fails, which ends the script under `-e`).
+   That would replace the `exit 1` text guess (`_STOPS`), which counts a script that exits only
+   on an API error but just reports a no.
+3. WG010: a permission step's own `if:` (a check that may be skipped doesn't stop anything).
+4. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
-4. The Marketplace listing (needs the owner: it's a public listing under their account).
+5. The Marketplace listing (needs the owner: it's a public listing under their account).
