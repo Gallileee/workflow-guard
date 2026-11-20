@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import groupby
 from pathlib import Path
 
@@ -18,10 +19,12 @@ from .conditions import (
     ASSOCIATION,
     NO_ANSWERS,
     UNKNOWN,
+    UNTRUSTED_ASSOCIATIONS,
     lets_in,
     may_pass,
     must_pass,
     status_functions,
+    stranger_text,
     text_value,
 )
 from .expressions import (
@@ -35,6 +38,7 @@ from .expressions import (
 from .model import Finding, Severity
 from .project import repo_root
 from .scripts import scripts
+from .shell import always_fails
 from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
 from .workflow import Step, Workflow, get, items, key_node, scalar
 
@@ -624,7 +628,9 @@ _ACTION_ANSWERS: dict[str, dict[str, tuple[tuple[str, ...], str]]] = {
         "require-result": (("false",), "require"),
     },
 }
-_PERMISSION_API = re.compile(r"getCollaboratorPermissionLevel|collaborators/\S+/permission")
+_PERMISSION_API = re.compile(
+    r"getCollaboratorPermissionLevel|collaborators/(?:\$\{\{[^}]*\}\}|[^\s/])+/permission"
+)
 # A script that fails when the answer is no: github-script (core.setFailed, throw,
 # process.exit(1)) or shell (exit 1; a `| grep -q` that isn't the condition of an if, && or ||,
 # which fails the step under bash -e).
@@ -691,10 +697,15 @@ def _commenter_gate(node: Node | None) -> tuple[bool, str]:
     paths = _if_paths(node)
     if not _mentions(paths, _COMMENTER):
         return False, ""
-    if _mentions(paths, (ASSOCIATION,)):
-        who = ", ".join(passing[:-1]) + (" and " if len(passing) > 1 else "") + passing[-1]
-        return False, (f"{who} in: author_association values of people who can't write to the repository")
-    return False, "in every account it doesn't name"
+    return False, _who(passing, _mentions(paths, (ASSOCIATION,)))
+
+
+def _who(passing: tuple[str, ...], by_association: bool = True) -> str:
+    """Who a weak check still lets in (to follow "still lets")."""
+    if not by_association:
+        return "in every account it doesn't name"
+    who = ", ".join(passing[:-1]) + (" and " if len(passing) > 1 else "") + passing[-1]
+    return f"{who} in: author_association values of people who can't write to the repository"
 
 
 def _weak_note(node: Node | None, subject: str) -> str:
@@ -743,14 +754,89 @@ def _job_steps(wf: Workflow, job_id: str) -> list[Step]:
 
 def _stop_step(wf: Workflow, job_id: str) -> Step | None:
     """The job's first step that fails unless the commenter may write: one that asks and fails
-    on a no, or one that fails on the answer of a step before it that only reports."""
+    on a no, one that fails on the answer of a step before it that only reports, or a script
+    that checks who commented and exits for everyone who can't write."""
     steps = _job_steps(wf, job_id)
     for i, step in enumerate(steps):
         if _permission_check(step) == _FAILS:
             return step
         if _denies(step, [s for s in steps[:i] if _permission_check(s) == _REPORTS]):
             return step
+        if _shell_check(wf, step) == () and not _continues(step) and _always_runs(step):
+            return step
     return None
+
+
+def _always_runs(step: Step) -> bool:
+    """The step's ``if:`` (if any) is true for every commenter who can't write: a script that
+    exits for them only stops them if it runs."""
+    text = _if_text(step.node)
+    if not text:
+        return True
+    try:
+        return must_pass(text, lambda path: UNKNOWN)
+    except ExpressionError:
+        return False
+
+
+def _shell(wf: Workflow, step: Step) -> str | None:
+    """The shell a ``run:`` step uses: its ``shell:``, the job's or workflow's
+    ``defaults.run.shell``, else bash (pwsh on a Windows runner, None when unknown)."""
+    job = dict(wf.jobs()).get(step.job_id)
+    for node in (step.node, get(get(job, "defaults"), "run"), get(get(wf.root, "defaults"), "run")):
+        shell = scalar(get(node, "shell"))
+        if shell:
+            return shell.split()[0].lower()
+    runs_on = scalar(get(job, "runs-on")) or ""
+    return "pwsh" if "windows" in runs_on.lower() else "bash"
+
+
+def _shell_check(wf: Workflow, step: Step) -> tuple[str, ...] | None:
+    """For a bash ``run:`` script that looks at who commented (through ``${{ }}`` or an
+    ``env:`` variable): the associations without write access it may let through, empty if it
+    exits for all of them (``shell.always_fails``). None for any other step."""
+    found = _shell_inputs(wf, step, _COMMENTER)
+    return None if found is None else _shell_passing(*found)
+
+
+def _shell_inputs(
+    wf: Workflow, step: Step, about: tuple[tuple[str, ...], ...]
+) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+    """A bash ``run:`` script and the ``env:`` values it sees (workflow, job, step), if one of
+    them mentions one of the paths ``about``."""
+    script = scalar(get(step.node, "run"))
+    if not script or _shell(wf, step) not in ("bash", "sh"):
+        return None
+    job = dict(wf.jobs()).get(step.job_id)
+    env: dict[str, str] = {}
+    for node in (wf.root, job, step.node):
+        env.update(
+            {key: value.value for key, value in items(get(node, "env")) if isinstance(value, ScalarNode)}
+        )
+    env = {name: value for name, value in env.items() if re.search(rf"\$\{{?{re.escape(name)}\b", script)}
+    texts = [script, *env.values()]
+    if not any(_mentions(_paths(expr), about) for text in texts for expr in find_expressions(text)):
+        return None
+    return script, tuple(sorted(env.items()))
+
+
+@lru_cache(maxsize=1024)
+def _shell_passing(script: str, env: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
+    """``_shell_check`` for a script and its ``env:`` values (cached: the rules ask often)."""
+    inline: dict[str, str] = {}
+    parts, pos = [], 0
+    for i, expr in enumerate(find_expressions(script)):
+        name = f"__WG_E{i}"
+        inline[name] = script[expr.start : expr.end]
+        parts += [script[pos : expr.start], "${" + name + "}"]
+        pos = expr.end
+    body = "".join(parts) + script[pos:]
+    texts = {**dict(env), **inline}
+    return tuple(
+        association
+        for association in UNTRUSTED_ASSOCIATIONS
+        if not always_fails(body, {name: stranger_text(text, association) for name, text in texts.items()})
+    )
 
 
 def _denies(step: Step, answers: list[Step]) -> bool:
@@ -1095,6 +1181,16 @@ def _why_open(
         note = _weak_note(jobs[name], f"the 'if:' of job '{name}', which it needs,")
         if note:
             return note
+    for name in (job_id, *needed):
+        for step in _job_steps(wf, name):
+            script = scalar(get(step.node, "run")) or ""
+            tries = _permission_check(step) is None and _ALWAYS_FAILS.search(script)
+            passing = _shell_check(wf, step) if tries else None  # a script that tries to stop someone
+            if passing:
+                where = "" if name == job_id else f" in job '{name}', which it needs,"
+                line = step.node.start_mark.line + 1
+                who = _who(passing, _shell_inputs(wf, step, (ASSOCIATION,)) is not None)
+                return f" (the script at line {line}{where} looks at who commented but still lets {who})"
     for name in (job_id, *needed):
         steps = _answers(wf, name)
         if not steps:

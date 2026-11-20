@@ -861,3 +861,136 @@ def test_a_git_command_split_over_lines_is_a_checkout():
         "- run: |", "    git fetch origin \\", "      refs/pull/${{ github.event.issue.number }}/head"
     )
     assert [s for _, s, _ in wg010(text)] == [Severity.HIGH]
+
+
+# --- a script that checks who commented --------------------------------------------------------
+
+SCRIPT_GATE = (
+    "- run: |",
+    '    case "$ASSOC" in',
+    "      OWNER|MEMBER|COLLABORATOR) ;;",
+    '      *) echo "not allowed"; exit 1 ;;',
+    "    esac",
+    "  env:",
+    "    ASSOC: ${{ github.event.comment.author_association }}",
+)
+
+
+def test_a_script_that_exits_for_strangers_stops_the_job():
+    assert wg010(on_comment(*SCRIPT_GATE, *CHECKOUT_PR)) == []
+    secret = ("- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}")
+    assert wg010(on_comment(*SCRIPT_GATE, *secret)) == []
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        (
+            "- run: |",
+            '    if [ "${{ github.event.comment.author_association }}" != "OWNER" ]; then',
+            "      exit 1",
+            "    fi",
+        ),
+        ('- run: \'[[ "${{ github.actor }}" == "octocat" ]] || exit 1\'',),
+        (
+            "- run: |",
+            "    ok=false",
+            '    case "$A" in OWNER|MEMBER) ok=true ;; esac',
+            '    [ "$ok" = true ] || exit 1',
+            "  if: github.event_name == 'issue_comment'",
+            "  shell: bash",
+            "  env:",
+            "    A: ${{ github.event.comment.author_association }}",
+        ),
+    ],
+)
+def test_ways_to_check_in_a_script(gate):
+    assert wg010(on_comment(*gate, *CHECKOUT_PR)) == []
+
+
+def test_a_script_check_in_a_needed_job_counts():
+    assert wg010(needing(SCRIPT_GATE)) == []
+
+
+def test_a_checkout_before_the_script_check_is_open():
+    ((line, _, message),) = wg010(on_comment(*CHECKOUT_PR, *SCRIPT_GATE))
+    assert line == 9
+    assert (
+        "(the step at line 13 fails unless the commenter may write, but this step runs before it)" in message
+    )
+
+
+@pytest.mark.parametrize(
+    ("gate", "who"),
+    [
+        (
+            (
+                "- run: '[ \"$A\" = NONE ] && exit 1 || true'",
+                "  env:",
+                "    A: ${{ github.event.comment.author_association }}",
+            ),
+            "CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER and MANNEQUIN in: author_association values",
+        ),
+        (
+            ("- run: |", '    if [ "${{ github.actor }}" = "spam-bot" ]; then exit 1; fi'),
+            "in every account it doesn't name",
+        ),
+    ],
+)
+def test_a_script_that_lets_some_through_is_named(gate, who):
+    ((_, _, message),) = wg010(on_comment(*gate, *CHECKOUT_PR))
+    assert f"(the script at line 9 looks at who commented but still lets {who}" in message
+
+
+def test_a_weak_script_in_a_needed_job_is_named():
+    gate = ("- run: |", '    if [ "${{ github.actor }}" = "spam-bot" ]; then exit 1; fi')
+    ((_, _, message),) = wg010(needing(gate))
+    assert (
+        "(the script at line 9 in job 'gate', which it needs, looks at who commented but still lets in"
+        in message
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("  continue-on-error: true",),
+        ("  if: contains(github.event.comment.body, '/deploy')",),  # may not run
+        ("  shell: pwsh",),
+        ("  shell: python",),
+    ],
+)
+def test_a_script_check_that_may_not_stop_the_job(extra):
+    assert [s for _, s, _ in wg010(on_comment(*SCRIPT_GATE, *extra, *CHECKOUT_PR))] == [Severity.HIGH]
+
+
+def test_a_windows_runner_runs_pwsh_unless_told_otherwise():
+    text = on_comment(*SCRIPT_GATE, *CHECKOUT_PR).replace("runs-on: x", "runs-on: windows-latest")
+    assert len(wg010(text)) == 1
+    bash = text.replace("    steps:\n", "    defaults:\n      run:\n        shell: bash\n    steps:\n")
+    assert wg010(bash) == []
+
+
+def test_a_script_that_doesnt_use_the_variable_is_no_check_and_not_named():
+    text = on_comment("- run: ./build.sh || exit 1", *CHECKOUT_PR).replace(
+        "permissions: {}\n",
+        "permissions: {}\nenv:\n  ASSOC: ${{ github.event.comment.author_association }}\n",
+    )
+    ((_, _, message),) = wg010(text)
+    assert "the script at" not in message
+
+
+def test_a_permission_api_call_with_an_expression_in_the_url():
+    step = (
+        "- run: |",
+        '    U="${{ github.event.comment.user.login }}"',
+        '    P=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission")',
+        '    if [[ "$P" != "admin" ]]; then exit 1; fi',
+    )
+    assert wg010(on_comment(*step, *CHECKOUT_PR)) == []
+
+
+def test_a_script_that_tries_to_stop_no_one_is_not_named():
+    # It looks at who commented but has no exit: it isn't meant as a check.
+    ((_, _, message),) = wg010(on_comment('- run: echo "hello ${{ github.actor }}"', *CHECKOUT_PR))
+    assert "the script at" not in message

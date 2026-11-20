@@ -13,6 +13,7 @@ from workflow_guard.conditions import (
     must_pass,
     parse,
     status_functions,
+    stranger_text,
     text_value,
     truthy,
 )
@@ -271,3 +272,24 @@ def test_must_pass(text, expected):
         return lambda path: answer if path[0] == "steps" else UNKNOWN
 
     assert all(must_pass(text, answering(answer)) for answer in ("", "false", "none")) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("${{ github.event.comment.author_association }}", "NONE"),
+        ("x-${{ github.event.comment.author_association }}", "x-NONE"),
+        ("${{ github.actor }}", STRANGER),
+        (" ${{ github.actor }} ", STRANGER),
+        ("@${{ github.actor }}", UNKNOWN),
+        ("${{ github.event_name }}", "issue_comment"),
+        ("${{ github.event.comment.body }}", UNKNOWN),
+        ("${{ vars.ADMINS }}", UNKNOWN),
+        ("${{ github.event_name == 'push' }}", "false"),
+        ("${{ 1 + }}", UNKNOWN),
+        ("plain", "plain"),
+    ],
+)
+def test_stranger_text(text, expected):
+    value = stranger_text(text, "NONE")
+    assert value == expected if isinstance(expected, str) else value is expected

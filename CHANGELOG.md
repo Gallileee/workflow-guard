@@ -4,7 +4,43 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.25.0 — WG010 on public workflows: fewer false positives
+## v0.26.0 — WG010: checks written in bash
+
+### A `run:` script that exits for strangers is a check
+
+Some workflows check who commented in a script instead of an `if:`:
+
+```yaml
+- run: |
+    case "$ASSOC" in
+      OWNER|MEMBER|COLLABORATOR) ;;
+      *) echo "not allowed"; exit 1 ;;
+    esac
+  env:
+    ASSOC: ${{ github.event.comment.author_association }}
+```
+
+WG010 now runs such a script on paper (a small bash evaluator, `shell.py`), once for each
+association that can't write: `if`/`elif`/`else`, `case`, `&&`/`||`/`!`, `[ ]`, `test`,
+`[[ ]]` (with `=~`), assignments, `exit` and `set -e`. If every path exits non-zero, the step
+covers the steps after it, like a permission step that fails on a no. A test it can't decide
+goes both ways, and loops, functions, subshells and heredocs make the script unknown.
+
+A script that lets some through is named:
+
+```
+wf.yml:21:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the script at line 60 in job 'check', which it needs, looks at who commented but
+still lets CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN and NONE in: ...); ...
+```
+
+- Only bash/sh steps (not `shell: pwsh`, not a Windows runner without `shell: bash`), and only
+  when the step always runs for a stranger (no `if:`, or one that is true for them).
+- Only the `env:` variables the script uses are looked at.
+- `gh api "repos/.../collaborators/${{ github.event.comment.user.login }}/permission"` is now
+  recognised as asking for the permission (the space inside `${{ }}` hid it).
+
+## v0.25.0 — WG010 on public workflows: fewer false positives (2026-11-20)
 
 ### Checked against 148 public `issue_comment` workflows
 

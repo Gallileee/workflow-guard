@@ -32,7 +32,7 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from .expressions import ExpressionError, Token, tokenize
+from .expressions import ExpressionError, Token, find_expressions, tokenize
 
 
 class _Unknown:
@@ -469,3 +469,28 @@ def text_value(expression: str, lookup: Callable[[tuple[str, ...]], object]) -> 
     if value is UNKNOWN or value is STRANGER or value is OWNERS_LIST:
         return UNKNOWN
     return _text(value)
+
+
+def stranger_text(text: str, association: str) -> object:
+    """What ``text`` (with ``${{ }}`` in it, e.g. an ``env:`` value) becomes for a commenter
+    with ``association`` who can't write: a string, ``STRANGER`` (their login, alone) or
+    ``UNKNOWN``. Values are set as for ``lets_in``."""
+    lookup = _stranger_lookup(association)
+    expressions = list(find_expressions(text))
+    parts, pos = [], 0
+    for expr in expressions:
+        try:
+            value = evaluate(parse(expr.inner), lookup)
+        except ExpressionError:
+            return UNKNOWN
+        if (
+            value is STRANGER
+            and len(expressions) == 1
+            and not (text[: expr.start] + text[expr.end :]).strip()
+        ):
+            return STRANGER
+        if value is UNKNOWN or value is STRANGER or value is OWNERS_LIST:
+            return UNKNOWN
+        parts += [text[pos : expr.start], _text(value)]
+        pos = expr.end
+    return "".join(parts) + text[pos:]
