@@ -1046,7 +1046,7 @@ def test_an_api_script_that_reports_covers_what_reads_its_answer():
             "    exit 1",
         ),
         # Something the evaluator doesn't follow.
-        ("- run: |", f'    check() {{ {PERM}); [ "$P" = admin ]; }}', "    check || exit 1"),
+        ("- run: |", f"    for i in 1 2; do {PERM}) && break; done", '    [ "$P" = admin ] || exit 1'),
         # Another shell.
         ("- run: |", f"    {PERM} || exit 1)", "  shell: pwsh"),
     ],

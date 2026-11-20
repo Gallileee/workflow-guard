@@ -347,8 +347,13 @@ be read or parsed, or bad arguments.
   `[[ ]]` (`=`, `==`, `!=`, `=~`, `-z`, `-n`, `-a`, `-o`), assignments, `exit` and `set -e`
   (GitHub's bash runs with `-e`, so a failing test alone on a line ends the script, but not in a
   condition, a negated command or the middle of a `&&`/`||` list). A test it can't decide goes
-  both ways; the script is a check only if every path exits non-zero. Loops, functions,
-  subshells, background jobs and heredocs make it unknown (not a check). Only steps whose shell
+  both ways; the script is a check only if every path exits non-zero. Functions
+  (`name() { ...; }`, `function name { ...; }`) run where they're called, with `$1`... from the
+  call (empty at the top: GitHub passes no arguments), `local` variables put back afterwards and
+  `return`; `{ ...; }` groups run in place; redirections after them are skipped. Inside a
+  function or group called in a condition, negated or before the last command of a `&&`/`||`
+  list, `-e` doesn't act (bash's rule). Loops, subshells, arrays, process substitution
+  (`< <(...)`), background jobs and heredocs make it unknown (not a check). Only steps whose shell
   is bash or sh (the default, except on a Windows runner) and whose `if:` is true for everyone
   are looked at.
 - A bash script that asks the **permission API** about the commenter is run on paper too:
@@ -358,7 +363,7 @@ be read or parsed, or bad arguments.
   answer is JSON, equal to no word; `gh api ... | grep -q[EiwxFs] PATTERN` is followed as well.
   The user has to be the commenter (`${{ github.actor }}`, `$GITHUB_ACTOR`, a step `env:` set
   from the comment). Then the step fails on a no only if every path exits; a script that exits
-  only when the call fails just reports. Scripts it can't follow (functions, loops, another
+  only when the call fails just reports. Scripts it can't follow (loops, arrays, another
   user, another jq filter) and github-scripts are still judged from their text (`core.setFailed`,
   `throw`, `exit 1`, `grep -q`).
 - WG010 knows what some actions answer (`_ACTION_ANSWERS` in `rules.py`, from the action's
@@ -528,8 +533,8 @@ CHANGELOG.md.
   `if:` on the answer has to be false for an empty answer, `false`, `none` and `read`, so
   `!= 'false'` is reported even where the output is never empty. A check in a script of the
   repository (`require('./.github/scripts/check.js')`) isn't recognised, and a bash check of the
-  association only in the forms `shell.py` follows (no loops or functions). A script that asks the
-  permission API and that the evaluator can't follow (a function, a loop, a check of another
+  association only in the forms `shell.py` follows (no loops or arrays). A script that asks the
+  permission API and that the evaluator can't follow (a loop, an array, a check of another
   user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
   anywhere (a guess from its text). A permission step's own `if:` is not looked at. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)

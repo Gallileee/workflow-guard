@@ -15,8 +15,13 @@ assignments, ``exit`` and ``set -e``/``set +e`` (GitHub runs bash with ``-e``, s
 test on its own line ends the script too). A test it can't decide goes both ways. A script
 fails *certainly* only if every path ends in a non-zero exit.
 
-Anything else that changes the flow (loops, functions, subshells, background jobs, heredocs)
-makes the script unknown: it doesn't count as a check. Commands it doesn't know succeed or
+Functions (``name() { ...; }``, ``function name { ...; }``) run where they're called, with
+``$1``... set from the call, ``local`` variables put back afterwards and ``return``; ``{ ...; }``
+groups run in place. In a condition, a negated command or before the last command of a
+``&&``/``||`` list, ``set -e`` doesn't act inside them either (bash's rule).
+
+Anything else that changes the flow (loops, subshells, background jobs, heredocs) makes the
+script unknown: it doesn't count as a check. Commands it doesn't know succeed or
 fail, it doesn't matter which: only an ``exit`` or a failing test decides.
 
 The permission API is known too, when it asks about the commenter (a stranger's login):
@@ -45,7 +50,13 @@ _COMMAND = "__WG_CMD"
 _MAX_PATHS = 64
 _OPS = ("&&", "||", ";;", "<<", ">>", ";", "|", "&", "(", ")", "<", ">", "\n")
 _OP_CHARS = ";&|()<>\n"
-_UNSUPPORTED = {"for", "while", "until", "select", "function", "{", "(", "((", "do", "done", "return"}
+_UNSUPPORTED = {"for", "while", "until", "select", "(", "((", "do", "done"}
+_RETURNED = "\0return"  # set on a path that ran `return`: the status it returned
+_DEPTH = "\0depth"  # how many function calls deep
+_LOCALS = "\0locals"  # names declared `local` in the current call
+_FUNCTION = "\0function:"
+_MAX_DEPTH = 8
+_POSITIONAL = tuple(str(i) for i in range(1, 10))
 _SEPARATORS = (";", "\n")
 _NAME = re.compile(r"\$(?:(\w+)|\{(\w+)\})")
 _EXPANSION = re.compile(r"\$[\w{(@*#?!-]")
@@ -92,7 +103,8 @@ def _analyse(script: str, variables: Mapping[str, object]) -> tuple[bool, bool] 
     try:
         text, subs = _prepare(script)
         tree = _Parser(_tokens(text)).program()
-        env: dict[str, object] = {**variables, **subs, _ERREXIT: True}
+        # GitHub runs the script file without arguments: $1... are empty.
+        env: dict[str, object] = {**dict.fromkeys(_POSITIONAL, ""), **variables, **subs, _ERREXIT: True}
         ends, paths = _run_seq(tree, [env])
         return not paths and ends == {FAIL}, _API_SEEN.get()
     except Unsupported:
@@ -217,6 +229,27 @@ class _Case:
 
 
 @dataclass
+class _Group:
+    body: list
+
+
+@dataclass
+class _Define:
+    name: str
+    body: list
+
+
+class _Function:
+    """A defined function (compared and shown by identity: its body can be large)."""
+
+    def __init__(self, body: list) -> None:
+        self.body = body
+
+    def __repr__(self) -> str:
+        return f"<function {id(self)}>"
+
+
+@dataclass
 class _Pipe:
     negated: bool
     commands: list
@@ -290,13 +323,50 @@ class _Parser:
         token = self.peek()
         if token in _UNSUPPORTED:
             raise Unsupported(f"{token!r}")
-        if token == "if":
-            return self.if_()
-        if token == "case":
-            return self.case()
-        if token == "[[":
-            return self.double_test()
+        compound = {"if": self.if_, "case": self.case, "[[": self.double_test, "{": self.group}
+        if token in compound:
+            node = compound[token]()
+            self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`
+            return node
+        if token == "function":
+            self.i += 1
+            name = self.take()
+            if self.peek() == "(":
+                self.take("(")
+                self.take(")")
+            return self.define(name)
+        if token is not None and token not in _OPS and self.tokens[self.i + 1 : self.i + 3] == ["(", ")"]:
+            name = self.take()
+            self.take("(")
+            self.take(")")
+            return self.define(name)
         return self.simple()
+
+    def redirections(self) -> None:
+        """Skips redirections after a compound command (their target is only written)."""
+        while self.peek() in (">", ">>") or (
+            self.peek() not in (None, *_OPS) and self.tokens[self.i + 1 : self.i + 2] in ([">"], [">>"])
+        ):
+            if self.peek() not in (">", ">>"):
+                self.i += 1  # a file descriptor: 2>
+            self.i += 1
+            if self.peek() == "&":
+                self.i += 1
+            self.take()
+
+    def group(self) -> _Group:
+        self.take("{")
+        body = self.seq({"}"})
+        self.take("}")
+        return _Group(body)
+
+    def define(self, name: str) -> _Define:
+        if not re.fullmatch(r"[A-Za-z_][\w-]*", name):
+            raise Unsupported(f"function name {name!r}")
+        self.newlines()
+        if self.peek() != "{":
+            raise Unsupported("function body that isn't { ...; }")
+        return _Define(name, self.group().body)
 
     def simple(self) -> _Simple:
         words: list[str] = []
@@ -313,7 +383,7 @@ class _Parser:
             self.take()
             return self.simple()
         if self.peek() == "(":
-            raise Unsupported("function definition")
+            raise Unsupported("( after a word")
         if not words:
             raise Unsupported(f"unexpected {self.peek()!r}")
         return _Simple(words)
@@ -601,6 +671,27 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
             env[name] = _value(value, env)
         return set(), [(True, True, env)]
     name, args = words[0], words[1:]
+    function = env.get(_FUNCTION + name)
+    if isinstance(function, _Function):
+        return _call(function, args, env)
+    if name == "return":
+        if not env.get(_DEPTH):
+            raise Unsupported("return outside a function")
+        code = _value(args[0], env) if args else UNKNOWN
+        statuses = [int(code) % 256 == 0] if isinstance(code, str) and code.isdigit() else [True, False]
+        return set(), [(ok, False, {**env, _RETURNED: ok}) for ok in statuses]
+    if name == "local":
+        if not env.get(_DEPTH):
+            raise Unsupported("local outside a function")
+        env = dict(env)
+        for word in args:
+            assign = _ASSIGNMENT.fullmatch(word)
+            local = assign.group(1) if assign else word
+            if not re.fullmatch(r"[A-Za-z_]\w*", local):
+                raise Unsupported(f"local {word!r}")
+            env[_LOCALS] = (*env.get(_LOCALS, ()), local)
+            env[local] = _value(assign.group(2), env) if assign else ""
+        return set(), [(True, True, env)]
     if name == "exit":
         code = _value(args[0], env) if args else UNKNOWN
         if isinstance(code, str) and code.lstrip("-").isdigit():
@@ -629,6 +720,35 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
     return set(), _both(env, True)
 
 
+def _call(function: _Function, args: list[str], env: Env) -> tuple[set[str], list[Result]]:
+    """Runs a function's body where it's called: ``$1``... from ``args``; afterwards ``$1``...
+    and its ``local`` variables are put back. Its status is ``return``'s, or its last
+    command's; ``set -e`` acts on it like on any command."""
+    depth = int(env.get(_DEPTH) or 0)  # type: ignore[call-overload]
+    if depth >= _MAX_DEPTH:
+        raise Unsupported("functions too deep")
+    inner = {**env, _DEPTH: depth + 1, _LOCALS: ()}
+    for i, name in enumerate(_POSITIONAL):
+        inner[name] = _value(args[i], env) if i < len(args) else ""
+    ends, results = _seq_status(function.body, inner)
+    out: list[Result] = []
+    for status, _, after in results:
+        after = dict(after)
+        status = after.pop(_RETURNED, status)  # type: ignore[assignment]
+        for name in (*_POSITIONAL, *after.get(_LOCALS, ())):  # type: ignore[misc]
+            if name in env:
+                after[name] = env[name]
+            else:
+                after.pop(name, None)
+        for key in (_DEPTH, _LOCALS):
+            if key in env:
+                after[key] = env[key]
+            else:
+                after.pop(key, None)
+        out.append((bool(status), True, after))
+    return ends, out
+
+
 def _match(value: object, pattern: str) -> bool | None:
     if pattern == "*":
         return True
@@ -649,6 +769,11 @@ def _command(command: object, env: Env) -> tuple[set[str], list[Result]]:
         return _if(command.branches, command.otherwise, env)
     if isinstance(command, _Case):
         return _case(command, env)
+    if isinstance(command, _Group):
+        ends, results = _seq_status(command.body, env)
+        return ends, [(status, last and _RETURNED not in after, after) for status, last, after in results]
+    if isinstance(command, _Define):
+        return set(), [(True, True, {**env, _FUNCTION + command.name: _Function(command.body)})]
     raise Unsupported(type(command).__name__)
 
 
@@ -695,7 +820,12 @@ def _case(command: _Case, env: Env) -> tuple[set[str], list[Result]]:
     return _after_compound(ends, paths + [env])
 
 
-def _pipe(pipe: _Pipe, env: Env) -> tuple[set[str], list[Result]]:
+def _pipe(pipe: _Pipe, env: Env, last: bool = True) -> tuple[set[str], list[Result]]:
+    """``last``: the pipeline is the last of its ``&&``/``||`` list. If not, or if negated,
+    ``set -e`` doesn't act inside it (in a function or a group it runs)."""
+    if (not last or pipe.negated) and env.get(_ERREXIT):
+        ends, results = _pipe(_Pipe(pipe.negated, pipe.commands), {**env, _ERREXIT: False}, True)
+        return ends, [(status, flag, {**after, _ERREXIT: True}) for status, flag, after in results]
     if len(pipe.commands) > 1:  # each part runs in a subshell: an exit there ends only that part
         ends, results = set(), _api_pipe(pipe.commands, env) or _both(env, True)
     else:
@@ -706,12 +836,14 @@ def _pipe(pipe: _Pipe, env: Env) -> tuple[set[str], list[Result]]:
 
 
 def _and_or(command: _AndOr, env: Env) -> tuple[set[str], list[Result]]:
-    ends, results = _pipe(command.first, env)
-    for op, pipe in command.rest:
+    ends, results = _pipe(command.first, env, last=not command.rest)
+    for i, (op, pipe) in enumerate(command.rest):
         nxt: list[Result] = []
         for status, _, after in results:
-            if status == (op == "&&"):
-                more, out = _pipe(pipe, after)
+            if _RETURNED in after:
+                nxt.append((status, False, after))
+            elif status == (op == "&&"):
+                more, out = _pipe(pipe, after, last=i == len(command.rest) - 1)
                 ends |= more
                 nxt += out
             else:
@@ -738,6 +870,9 @@ def _run_seq(seq: list, paths: list[Env]) -> tuple[set[str], list[Env]]:
     for command in seq:
         nxt: list[Env] = []
         for env in paths:
+            if _RETURNED in env:  # the function has returned: skip the rest of its body
+                nxt.append(env)
+                continue
             more, results = _and_or(command, env)
             ends |= more
             for status, errexit, after in results:
@@ -758,6 +893,9 @@ def _seq_status(seq: list, env: Env) -> tuple[set[str], list[Result]]:
     ends, paths = _run_seq(seq[:-1], [env])
     results: list[Result] = []
     for after in paths:
+        if _RETURNED in after:
+            results.append((bool(after[_RETURNED]), False, after))
+            continue
         more, out = _and_or(seq[-1], after)
         ends |= more
         results += out
