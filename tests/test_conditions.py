@@ -10,6 +10,7 @@ from workflow_guard.conditions import (
     evaluate,
     lets_in,
     may_pass,
+    must_pass,
     parse,
     status_functions,
     text_value,
@@ -244,3 +245,29 @@ def test_status_functions_come_from_the_lookup():
     assert evaluate(parse("failure() && always()"), lookup) is True
     assert evaluate(parse("!cancelled()"), lookup) is UNKNOWN
     assert evaluate(parse("success() && x"), lookup) is False
+
+
+# --- the event, and conditions that must pass -----------------------------------------------------
+
+
+def test_the_event_name_is_issue_comment():
+    assert lets_in("github.event_name == 'push'") == ()
+    assert lets_in(f"github.event_name == 'workflow_dispatch' || {ASSOC} == 'OWNER'") == ()
+    assert lets_in("github.event_name == 'issue_comment'") == EVERYONE
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("steps.p.outputs.ok != 'true'", True),
+        ("steps.p.outputs.ok == 'false'", False),  # '' and 'none' aren't 'false'
+        (f"{ASSOC} != 'OWNER'", True),
+        (f"{ASSOC} == 'NONE'", False),
+        ("github.event.issue.locked", False),
+    ],
+)
+def test_must_pass(text, expected):
+    def answering(answer):
+        return lambda path: answer if path[0] == "steps" else UNKNOWN
+
+    assert all(must_pass(text, answering(answer)) for answer in ("", "false", "none")) is expected

@@ -14,6 +14,8 @@ So the condition is evaluated, once for each association that can't write, with:
 - ``vars.*`` and ``secrets.*`` to a list the owners keep: a stranger isn't on it, so
   ``contains(fromJSON(vars.MAINTAINERS), github.actor)`` and ``github.actor == vars.DEPLOYER``
   are false for them;
+- ``github.event_name`` to ``issue_comment`` (a workflow with more triggers often has
+  ``github.event_name == 'workflow_dispatch' || (...)``);
 - everything else (the comment's text, the issue, ``success()``...) unknown.
 
 Values are three-valued: a result is known only when it holds whatever the unknowns are
@@ -63,6 +65,7 @@ UNTRUSTED_ASSOCIATIONS = ("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER"
 """Every other value GitHub gives ``author_association``."""
 
 ASSOCIATION = ("github", "event", "comment", "author_association")
+EVENT_NAME = ("github", "event_name")
 LOGINS = (
     ("github", "actor"),
     ("github", "triggering_actor"),
@@ -398,6 +401,8 @@ def _stranger_lookup(association: str) -> Callable[[tuple[str, ...]], object]:
     def lookup(path: tuple[str, ...]) -> object:
         if path == ASSOCIATION:
             return association
+        if path == EVENT_NAME:
+            return "issue_comment"
         if path in LOGINS:
             return STRANGER
         if path[0] in ("vars", "secrets") and len(path) > 1:
@@ -429,11 +434,11 @@ write: nothing (the step didn't set it), ``false`` (a yes/no output), or the per
 GitHub gives them (``none``, or ``read`` on a public repository)."""
 
 
-def may_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bool:
-    """Whether ``condition`` may be true for a commenter who can't write. The commenter's
-    association, login, ``vars`` and ``secrets`` are set as for ``lets_in``; ``lookup`` gives
-    every other value (UNKNOWN for none). Raises ``ExpressionError``."""
+def _for_strangers(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> list[object]:
+    """How ``condition`` comes out (True, False or UNKNOWN) for each association that can't
+    write, with ``lookup`` for every value the stranger doesn't set."""
     tree = parse(condition)
+    results = []
     for association in UNTRUSTED_ASSOCIATIONS:
         stranger = _stranger_lookup(association)
 
@@ -441,9 +446,21 @@ def may_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> boo
             value = stranger(path)
             return lookup(path) if value is UNKNOWN else value
 
-        if truthy(evaluate(tree, both)) is not False:
-            return True
-    return False
+        results.append(truthy(evaluate(tree, both)))
+    return results
+
+
+def may_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bool:
+    """Whether ``condition`` may be true for a commenter who can't write. The commenter's
+    association, login, ``vars`` and ``secrets`` are set as for ``lets_in``; ``lookup`` gives
+    every other value (UNKNOWN for none). Raises ``ExpressionError``."""
+    return any(result is not False for result in _for_strangers(condition, lookup))
+
+
+def must_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bool:
+    """Whether ``condition`` is certainly true for every commenter who can't write (values set
+    as for ``may_pass``). Raises ``ExpressionError``."""
+    return all(result is True for result in _for_strangers(condition, lookup))
 
 
 def text_value(expression: str, lookup: Callable[[tuple[str, ...]], object]) -> object:

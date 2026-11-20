@@ -20,6 +20,7 @@ from .conditions import (
     UNKNOWN,
     lets_in,
     may_pass,
+    must_pass,
     status_functions,
     text_value,
 )
@@ -613,6 +614,16 @@ _PERMISSION_ACTIONS: dict[str, tuple[str, bool] | None] = {
     "xt0rted/slash-command-action": None,
     "peter-evans/slash-command-dispatch": None,
 }
+# Outputs of a reporting action that are never empty, with what they say to a commenter who
+# can't write, and the input that has to be set for the output to be written ("" for none).
+# actions-cool/check-user-permission (src/main.js): user-permission is always set from
+# getCollaboratorPermissionLevel, require-result only when `require` is given.
+_ACTION_ANSWERS: dict[str, dict[str, tuple[tuple[str, ...], str]]] = {
+    "actions-cool/check-user-permission": {
+        "user-permission": (("none", "read"), ""),
+        "require-result": (("false",), "require"),
+    },
+}
 _PERMISSION_API = re.compile(r"getCollaboratorPermissionLevel|collaborators/\S+/permission")
 # A script that fails when the answer is no: github-script (core.setFailed, throw,
 # process.exit(1)) or shell (exit 1; a `| grep -q` that isn't the condition of an if, && or ||,
@@ -622,6 +633,8 @@ _STOPS = re.compile(
     r"|^(?![ \t]*(?:if|elif|while|until)\b)(?!.*(?:&&|\|\|)).*\|\s*grep\s+-\w*q",
     re.MULTILINE,
 )
+# A script that fails whenever it runs (in a step whose 'if:' decides when that is).
+_ALWAYS_FAILS = re.compile(r"core\.setFailed\s*\(|\bthrow\b|process\.exit\s*\(\s*[1-9]|\bexit\s+[1-9]")
 _FAILS, _REPORTS = "fails", "reports"
 # A ref naming the pull request: its number, its head, or a value looked up at run time.
 _PR_REF = (
@@ -632,9 +645,18 @@ _PR_REF = (
     ("steps",),
     ("needs",),
 )
-_PR_SCRIPT = re.compile(
-    r"\bgh\s+pr\s+checkout\b|\bpull/(?:\$\{\{[^}]*\}\}|[^\s/]+)/(?:head|merge)\b|refs/pull/"
-)
+# A pull request's ref in a script: pull/<n>/head, pull/<n>/merge, refs/pull/...
+_PR_REF_TEXT = re.compile(r"\bpull/(?:\$\{\{[^}]*\}\}|[^\s/]+)/(?:head|merge)\b|refs/pull/")
+
+
+def _pr_script(text: str) -> bool:
+    """``gh pr checkout``, or a git command that brings a commit in (fetch, checkout...) with a
+    pull request's ref on the same line (``\\`` continuations joined). A ref that is only echoed
+    or saved (``echo "REF=refs/pull/1/merge" >> $GITHUB_ENV``) checks nothing out."""
+    if _GH_PR_CHECKOUT.search(text):
+        return True
+    lines = text.replace("\\\n", " ").splitlines()
+    return any(_GIT_CHECKOUT.search(line) and _PR_REF_TEXT.search(line) for line in lines)
 
 
 def _if_paths(node: Node | None) -> list[ContextPath]:
@@ -654,17 +676,21 @@ def _if_text(node: Node | None) -> str:
 
 
 def _commenter_gate(node: Node | None) -> tuple[bool, str]:
-    """Whether the ``if:`` of ``node`` keeps out commenters who can't write, and if it looks at
+    """Whether the ``if:`` of ``node`` keeps out commenters who can't write (by who commented,
+    or because it never runs for a comment: ``github.event_name == 'push'``), and if it looks at
     who commented but doesn't, who it still lets in (to follow "still lets")."""
-    paths = _if_paths(node)
-    if not _mentions(paths, _COMMENTER):
+    text = _if_text(node)
+    if not text:
         return False, ""
     try:
-        passing = lets_in(_if_text(node))
+        passing = lets_in(text)
     except ExpressionError:
         return False, ""
     if not passing:
         return True, ""
+    paths = _if_paths(node)
+    if not _mentions(paths, _COMMENTER):
+        return False, ""
     if _mentions(paths, (ASSOCIATION,)):
         who = ", ".join(passing[:-1]) + (" and " if len(passing) > 1 else "") + passing[-1]
         return False, (f"{who} in: author_association values of people who can't write to the repository")
@@ -716,13 +742,41 @@ def _job_steps(wf: Workflow, job_id: str) -> list[Step]:
 
 
 def _stop_step(wf: Workflow, job_id: str) -> Step | None:
-    """The job's first step that fails unless the commenter may write."""
-    return next((step for step in _job_steps(wf, job_id) if _permission_check(step) == _FAILS), None)
+    """The job's first step that fails unless the commenter may write: one that asks and fails
+    on a no, or one that fails on the answer of a step before it that only reports."""
+    steps = _job_steps(wf, job_id)
+    for i, step in enumerate(steps):
+        if _permission_check(step) == _FAILS:
+            return step
+        if _denies(step, [s for s in steps[:i] if _permission_check(s) == _REPORTS]):
+            return step
+    return None
+
+
+def _denies(step: Step, answers: list[Step]) -> bool:
+    """``step`` fails whenever it runs (``exit 1``, ``core.setFailed``...), and its ``if:`` reads
+    the answer of the permission steps ``answers`` and is true for every answer a commenter who
+    can't write gets: the "exit if no write permission" step after an action that only reports
+    (``if: steps.perm.outputs.require-result != 'true'`` then ``run: exit 1``)."""
+    if _continues(step) or not _reads_steps(_if_paths(step.node), _step_ids(answers)):
+        return False
+    if not _ALWAYS_FAILS.search((scalar(get(step.node, "run")) or "") + (step.with_value("script") or "")):
+        return False
+    try:
+        return all(must_pass(_if_text(step.node), lookup) for _, lookup in _no_answers(answers))
+    except ExpressionError:
+        return False
 
 
 def _answers(wf: Workflow, job_id: str) -> list[Step]:
     """The job's steps that ask for the commenter's permission but don't fail on a no."""
     return [step for step in _job_steps(wf, job_id) if _permission_check(step) == _REPORTS]
+
+
+def _askers(wf: Workflow, job_id: str) -> list[Step]:
+    """The job's steps that ask for the commenter's permission, whether they fail on a no or
+    not: a step that fails may still write the answer to an output first."""
+    return [step for step in _job_steps(wf, job_id) if _permission_check(step) is not None]
 
 
 def _step_ids(steps: list[Step]) -> set[str]:
@@ -737,39 +791,65 @@ def _reads_steps(paths: list[ContextPath], ids: set[str]) -> bool:
 Lookup = Callable[[tuple[str, ...]], object]
 
 
+def _possible_answers(step: Step, output: str) -> tuple[str, ...]:
+    """What output ``output`` of permission step ``step`` may say to a commenter who can't
+    write: ``NO_ANSWERS``, or fewer for a known action's output that is never empty."""
+    action = (step.uses or "").split("@", 1)[0].lower()
+    known = _ACTION_ANSWERS.get(action, {}).get(output)
+    if known is not None and (not known[1] or (step.with_value(known[1]) or "").strip()):
+        return known[0]
+    return NO_ANSWERS
+
+
 def _no_answers(steps: list[Step]) -> list[tuple[str, Lookup]]:
     """For each answer in ``NO_ANSWERS``: the ``steps.<id>`` values of these permission steps
     (which don't stop the job) for a commenter who can't write. A step that would fail but has
-    ``continue-on-error`` has the outcome ``failure``; the others succeed."""
-    outcomes = {
-        (scalar(get(step.node, "id")) or "").lower(): "failure" if _asks(step) else "success"
-        for step in steps
-    }
-    outcomes.pop("", None)
+    ``continue-on-error`` has the outcome ``failure``; the others succeed. An output that can't
+    give that answer (see ``_possible_answers``) gives its first possible one instead, so every
+    lookup is one a commenter can really meet. Each lookup notes in its ``seen`` dict whether it
+    gave its own answer ("said") or a stand-in ("swapped"), for ``_passing``."""
+    by_id = {(scalar(get(step.node, "id")) or "").lower(): step for step in steps}
+    by_id.pop("", None)
+    outcomes = {key: "failure" if _asks(step) else "success" for key, step in by_id.items()}
 
     def lookup_for(answer: str) -> Lookup:
+        seen: dict[str, bool] = {}
+
         def lookup(path: tuple[str, ...]) -> object:
             if len(path) > 2 and path[0] == "steps" and path[1] in outcomes:
                 if path[2] == "outputs":
-                    return answer if len(path) > 3 else UNKNOWN
+                    if len(path) < 4:
+                        return UNKNOWN
+                    possible = _possible_answers(by_id[path[1]], path[3])
+                    seen["said" if answer in possible else "swapped"] = True
+                    return answer if answer in possible else possible[0]
                 if path[2] == "outcome":
                     return outcomes[path[1]]
                 if path[2] == "conclusion":
                     return "success"
             return UNKNOWN
 
+        lookup.seen = seen  # type: ignore[attr-defined]
         return lookup
 
     return [(answer, lookup_for(answer)) for answer in NO_ANSWERS]
 
 
 def _passing(node: Node | None, lookups: list[tuple[str, Lookup]]) -> list[str]:
-    """The answers for which the ``if:`` of ``node`` may be true (all, if it isn't an expression)."""
+    """The answers for which the ``if:`` of ``node`` may be true (all, if it isn't an expression).
+    An answer that no output it reads can give (every one it read was a stand-in) isn't named:
+    its stand-in is named for itself."""
     text = _if_text(node)
     try:
-        return [answer for answer, lookup in lookups if may_pass(text, lookup)]
+        passing = [(answer, lookup) for answer, lookup in lookups if may_pass(text, lookup)]
     except ExpressionError:
         return [answer for answer, _ in lookups]
+    return [answer for answer, lookup in passing if _said(lookup)]
+
+
+def _said(lookup: Lookup) -> bool:
+    seen = getattr(lookup, "seen", {})
+    return bool(seen.get("said")) or not seen.get("swapped")
 
 
 def _answer_words(passing: list[str]) -> str:
@@ -808,7 +888,7 @@ def _output_text(value: str, lookup: Lookup) -> object:
 def _answer_outputs(wf: Workflow, job_id: str) -> dict[str, str]:
     """The job's outputs (names in lower case) that carry a permission step's answer, with
     their values as written."""
-    ids = _step_ids(_answers(wf, job_id))
+    ids = _step_ids(_askers(wf, job_id))
     outputs = get(dict(wf.jobs()).get(job_id), "outputs")
     return {
         key.lower(): value.value
@@ -826,22 +906,29 @@ def _needed_answer_gate(wf: Workflow, job: Node | None, name: str) -> tuple[bool
     if not any(_mentions(paths, (("needs", name.lower(), "outputs", out),)) for out in outputs):
         return False, ""
     lookups: list[tuple[str, Lookup]] = []
-    for answer, inner in _no_answers(_answers(wf, name)):
+    for answer, inner in _no_answers(_askers(wf, name)):
         values = {
             ("needs", name.lower(), "outputs", out): _output_text(raw, inner) for out, raw in outputs.items()
         }
-        lookups.append((answer, lambda path, values=values: values.get(path, UNKNOWN)))
+
+        def outer(path: tuple[str, ...], values: dict[tuple[str, ...], object] = values) -> object:
+            return values.get(path, UNKNOWN)
+
+        outer.seen = getattr(inner, "seen", {})  # type: ignore[attr-defined]
+        lookups.append((answer, outer))
     passing = _passing(job, lookups)
     return not passing, _answer_words(passing)
 
 
-def _runs_anyway(node: Node | None, result: str, needed: str = "", alone: bool = False) -> tuple[str, ...]:
+def _runs_anyway(
+    node: Node | None, results: dict[str, str] | None = None, wf: Workflow | None = None
+) -> tuple[str, ...]:
     """The status functions (``always``, ``failure``...) through which the ``if:`` of ``node``
-    may still be true for a commenter who can't write, after an earlier step failed on their
-    no (``result`` "failure"), or after a needed job (``needed``) failed or was skipped for them
-    (``result`` "failure" or "skipped"); empty if it isn't (an ``if:`` without a status function
-    gets ``success() &&`` in front of it, so it never runs then). ``alone``: the skipped job is
-    the only one before this one, so nothing else can have failed."""
+    may still be true for a commenter who can't write: for a step, after an earlier step failed
+    on their no; for a job (``results`` and ``wf`` given), after the needed jobs in ``results``
+    failed or were skipped for them (name -> "failure" or "skipped"). Empty if it isn't (an
+    ``if:`` without a status function gets ``success() &&`` in front of it, so it never runs
+    then)."""
     text = _if_text(node)
     try:
         functions = status_functions(text) if text else ()
@@ -851,14 +938,39 @@ def _runs_anyway(node: Node | None, result: str, needed: str = "", alone: bool =
         return ()
     status: dict[tuple[str, ...], object] = {
         ("success()",): False,
-        ("failure()",): True if result == "failure" else (False if alone else UNKNOWN),
+        ("failure()",): True,
         ("cancelled()",): UNKNOWN,  # another comment can cancel the run (concurrency)
     }
-    if needed:
-        status[("needs", needed.lower(), "result")] = result
-        if result == "skipped":  # a skipped job sets no outputs
-            status.update({path: "" for path in _output_paths(node, needed)})
+    if results is not None and wf is not None:
+        status[("failure()",)] = _failure_after(wf, node, results)
+        for name, result in results.items():
+            status[("needs", name.lower(), "result")] = result
+            if result == "skipped":  # a skipped job sets no outputs
+                status.update({path: "" for path in _output_paths(node, name)})
     return functions if may_pass(text, lambda path: status.get(path, UNKNOWN)) else ()
+
+
+def _failure_after(wf: Workflow, job: Node | None, results: dict[str, str]) -> object:
+    """``failure()`` in a job whose needed jobs ended as in ``results``: true if one failed,
+    false if all of them were skipped and none needs another job (so nothing failed before
+    them), else unknown."""
+    if "failure" in results.values():
+        return True
+    needs = _needs(job)
+    if all(name in results for name in needs) and not any(_needed_jobs(wf, name) for name in needs):
+        return False
+    return UNKNOWN
+
+
+def _needed_results(wf: Workflow, job_id: str, seen: frozenset[str] = frozenset()) -> dict[str, str]:
+    """How the jobs ``job_id`` needs end for a commenter who can't write, for the ones that
+    don't succeed for them (see ``_stranger_result``)."""
+    results = {}
+    for name in _needs(dict(wf.jobs()).get(job_id)):
+        result = _stranger_result(wf, name, seen | {job_id})
+        if result is not None:
+            results[name] = result
+    return results
 
 
 def _output_paths(node: Node | None, needed: str) -> list[tuple[str, ...]]:
@@ -877,11 +989,6 @@ def _stranger_result(wf: Workflow, job_id: str, seen: frozenset[str] = frozenset
     if _job_checks_commenter(wf, job_id, seen):
         return "skipped"
     return "failure" if _stop_step(wf, job_id) is not None else None
-
-
-def _alone(wf: Workflow, job: Node | None, needed: str) -> bool:
-    """``needed`` is the only job that runs before ``job``."""
-    return _needs(job) == [needed] and not _needed_jobs(wf, needed)
 
 
 def _needs(job: Node | None) -> list[str]:
@@ -903,13 +1010,10 @@ def _job_checks_commenter(wf: Workflow, job_id: str, seen: frozenset[str] = froz
         return False
     if _commenter_gate(job)[0]:
         return True
-    for name in _needs(job):
-        if _needed_answer_gate(wf, job, name)[0]:
-            return True
-        result = _stranger_result(wf, name, seen | {job_id})
-        if result is not None and not _runs_anyway(job, result, name, _alone(wf, job, name)):
-            return True
-    return False
+    if any(_needed_answer_gate(wf, job, name)[0] for name in _needs(job)):
+        return True
+    results = _needed_results(wf, job_id, seen)
+    return bool(results) and not _runs_anyway(job, results, wf)
 
 
 def _needed_jobs(wf: Workflow, job_id: str) -> list[str]:
@@ -935,7 +1039,7 @@ def _checks_out_pr(step: Step) -> bool:
             ):
                 return True
         return False
-    return bool(_PR_SCRIPT.search(scalar(get(step.node, "run")) or ""))
+    return _pr_script(scalar(get(step.node, "run")) or "")
 
 
 def _uses_secrets(node: Node, skip: tuple[Node, ...] = ()) -> bool:
@@ -973,15 +1077,15 @@ def _why_open(
         return f" (the step at line {line} fails unless the commenter may write, but {late})"
     jobs = dict(wf.jobs())
     job = jobs.get(job_id)
-    for name in _needs(job):
-        result = _stranger_result(wf, name, frozenset({job_id}))
-        functions = _runs_anyway(job, result, name, _alone(wf, job, name)) if result else ()
-        if functions:
-            how = "fails" if result == "failure" else "is skipped"
-            return (
-                f" (job '{name}', which it needs, {how} for commenters who can't write, but this"
-                f" job's 'if:' uses {_function_words(functions)}, so it runs anyway)"
-            )
+    results = _needed_results(wf, job_id)
+    functions = _runs_anyway(job, results, wf) if results else ()
+    if functions:
+        name, result = next(iter(results.items()))
+        how = "fails" if result == "failure" else "is skipped"
+        return (
+            f" (job '{name}', which it needs, {how} for commenters who can't write, but this"
+            f" job's 'if:' uses {_function_words(functions)}, so it runs anyway)"
+        )
     for node in nodes:
         note = _weak_note(node, "its 'if:'")
         if note:
@@ -1035,7 +1139,7 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
         # Steps after one that fails on a no only run for people who may write, unless their
         # 'if:' runs them after a failure too (always(), failure()...).
         at = [s.node for s in steps].index(stop.node) if stop else len(steps)
-        anyway = {id(s.node): _runs_anyway(s.node, "failure") for s in steps[at + 1 :]}
+        anyway = {id(s.node): _runs_anyway(s.node) for s in steps[at + 1 :]}
         answers = _answers(wf, job_id)
         open_steps = [
             step

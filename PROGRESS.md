@@ -1,5 +1,65 @@
 # Progress log
 
+## 2026-11-20 (interactive, "pokračuj podle plánu"): WG010 on public workflows
+
+Why: next step 2 (step 1, tagging v0.24.0, was done the same day at the owner's request). Look
+for false positives on real `issue_comment` workflows instead of guessing.
+
+How: GitHub code search (`gh api search/code`, `path:.github/workflows language:YAML`) for
+`getCollaboratorPermissionLevel issue_comment`, `check-user-permission issue_comment`,
+`slash-command-action issue_comment`, `author_association issue_comment refs/pull` and
+`collaborators permission issue_comment gh pr checkout`, 30 results each: 148 distinct files,
+downloaded into the session scratchpad (not committed: other people's code, and the remaining
+findings may be real problems in their repositories, so no repository names here). Run with
+only WG010.
+
+Acceptance criteria:
+- Every kind of finding sampled; each false-positive pattern fixed with tests, the rest left.
+- No change on workflow-guard, LendLoop, fitness-workout-log, transit-raptor.
+- v0.24.0 heading dated; v0.25.0 section and version.
+
+Findings 100 -> 23, by fix (in the order applied):
+- 100 -> 51: `github.event_name` is `issue_comment` (`conditions._stranger_lookup`), and an
+  `if:` that is never true for a comment covers the step/job (`_commenter_gate` no longer needs
+  a commenter path to say yes). Pattern: `event_name == 'workflow_dispatch' || (...)`.
+- 51 -> 46: `_denies`: a step that fails whenever it runs (`_ALWAYS_FAILS`) after a reporting
+  step, with an `if:` that `must_pass` (new in `conditions.py`) for every no answer, is a stop.
+- 46 -> 31: `_needed_results`/`_failure_after`: every needed job's stranger result at once
+  (`needs.a.result == 'success' || needs.b.result == 'success'`), which also covers the
+  generated gh-aw `.lock.yml` conclusion jobs.
+- 31 -> 29: `_pr_script`: a git command or `gh pr checkout` on the line with the ref; saving
+  a ref to `$GITHUB_ENV`/`$GITHUB_OUTPUT` isn't a checkout.
+- 29 -> 25: `_askers`: job outputs from a permission step that fails on a no are evaluated
+  too (a step with `exit 1` for API errors that writes `should_review=false` for a no).
+- 25 -> 23: `_ACTION_ANSWERS`/`_possible_answers`: actions-cool/check-user-permission's
+  `user-permission` (never empty) and `require-result` (never empty with `require:`), checked
+  against its `action.yml` and `src/main.js`. `_passing` names only answers an output can give.
+
+The 23 left, not all checked by hand: about 6 are checks WG010 can't see (a permission check in
+a script of the repository, a shell `case "$AUTHOR_ASSOCIATION"` with `exit 1`, a check passed
+through workflow `env:`); the sampled others look real (a slash-command action with
+`continue-on-error: true` and nothing reading its outcome, a reporting step nothing waits for).
+
+Done:
+- `conditions.py`: `EVENT_NAME`, `_for_strangers`, `must_pass`.
+- `rules.py`: `_ACTION_ANSWERS`, `_possible_answers`, `_said`, `_ALWAYS_FAILS`, `_denies`,
+  `_askers`, `_needed_results`, `_failure_after` (replaces `_alone`), `_PR_REF_TEXT`,
+  `_pr_script` (replaces `_PR_SCRIPT`); `_runs_anyway(node, results, wf)`.
+- Tests: 31 new, 7 old expectations changed (`require-result` answers only `'false'`). 728 in
+  total.
+- README (WG010 row, How it works, limitations), CHANGELOG v0.25.0, version 0.25.0.
+
+Verified locally:
+- `pytest -q -W error`: 728 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.25.0, 0 errors (warning: v0.25.0 not tagged yet).
+- Corpus: 100 -> 23 WG010 findings; all rules together run on all 148 files without errors.
+  workflow-guard, LendLoop, fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 15 mutants (event name unknown, must_pass as may_pass in conditions and in
+  `_denies`, no line join, any ref as checkout, old commenter-gate rule, continue-on-error
+  ignored, no deny steps, setFailed not a failure, one needed result only, `_answers` for
+  outputs, `require` ignored, no action answers, `_said` always true, only failed needs), all
+  killed (one after adding a test).
+
 ## 2026-11-20 (scheduled run): WG010 checks that `always()` runs past
 
 Why: next step 3 (step 1, tagging v0.23.0, was done on 2026-11-19; step 2 needs a survey of
@@ -948,10 +1008,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.24.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. WG010 on real workflows: collect a few public `issue_comment` workflows (GitHub code search
-   for `getCollaboratorPermissionLevel`, `check-user-permission`) and look for false positives,
-   e.g. `!= 'false'` on an action whose output is never empty (per-action answer sets would fix it).
+1. Tag `v0.25.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. WG010: go through the 23 findings left on the public corpus one by one (rerun the searches
+   in the 2026-11-20 entry). Recognise a shell check of the association
+   (`case "$AUTHOR_ASSOCIATION" in OWNER|MEMBER|COLLABORATOR) exit 0`, then `exit 1`).
 3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
 4. The Marketplace listing (needs the owner: it's a public listing under their account).
