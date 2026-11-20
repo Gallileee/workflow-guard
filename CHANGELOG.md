@@ -4,7 +4,47 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.23.0 — WG010: a permission check that comes too late or lets a no through
+## v0.24.0 — WG010: a check that `always()` runs past
+
+### A failed check stops only what doesn't run after a failure
+
+A step that fails on a no, or a needed job that fails or is skipped for a stranger, used to
+count as a check for everything after it. But GitHub only puts `success() &&` in front of an
+`if:` that has no status function of its own. With `always()`, `failure()` or `!cancelled()`
+the step or job runs anyway, after the check has said no:
+
+```yaml
+jobs:
+  gate:
+    steps:
+      - uses: xt0rted/slash-command-action@v2
+        with:
+          command: test
+  test:
+    needs: gate
+    if: ${{ !cancelled() }}
+    steps:
+      - run: gh pr checkout ${{ github.event.issue.number }} && npm test
+```
+
+Now that is reported, and the message names the function:
+
+```
+wf.yml:17:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (job 'gate', which it needs, fails for commenters who can't write, but this job's
+'if:' uses cancelled(), so it runs anyway); ...
+```
+
+- The `if:` is evaluated with `success()` false, `failure()` true after a failure, `cancelled()`
+  unknown, `always()` true and `needs.<job>.result` set to `failure` or `skipped`, so
+  `always() && needs.gate.result == 'success'` and `${{ !failure() }}` after a failed check
+  still count.
+- The same within a job: a step with `if: always()` after a step that fails on a no is open
+  again (a checkout is high, secrets are medium).
+- A chain breaks where a job in the middle runs anyway: `test` needs `middle`, which has
+  `if: always()` and needs a `gate` that keeps strangers out.
+
+## v0.23.0 — WG010: a permission check that comes too late or lets a no through (2026-11-19)
 
 ### A permission step only covers the steps after it
 

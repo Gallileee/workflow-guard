@@ -206,6 +206,29 @@ def parse(text: str) -> Node:
     return _Parser(tokenize(text)).parse()
 
 
+STATUS_FUNCTIONS = ("success", "failure", "cancelled", "always")
+"""Functions that make an ``if:`` look at how the earlier steps (or the needed jobs) ended.
+An ``if:`` that calls none of them gets ``success() &&`` in front of it, so it never runs after
+a failure. ``evaluate`` asks ``lookup`` for ``("success()",)``, ``("failure()",)`` and
+``("cancelled()",)``; ``always()`` is true."""
+
+
+def status_functions(text: str) -> tuple[str, ...]:
+    """The status functions ``text`` calls, in order of first use (``("always",)``); empty if
+    none, so the implicit ``success()`` applies. Raises ``ExpressionError``."""
+    found: list[str] = []
+
+    def walk(node: Node) -> None:
+        if node.kind == "call" and node.value in STATUS_FUNCTIONS and not node.children:
+            if node.value not in found:
+                found.append(str(node.value))
+        for child in node.children:
+            walk(child)
+
+    walk(parse(text))
+    return tuple(found)
+
+
 # --- evaluating ----------------------------------------------------------------------------------
 
 
@@ -362,7 +385,9 @@ def evaluate(node: Node, lookup: Callable[[tuple[str, ...]], object]) -> object:
             return _from_json(args[0])
         if name == "always" and not args:
             return True
-        return UNKNOWN  # success(), format(), toJSON(), hashFiles()...
+        if name in STATUS_FUNCTIONS and not args:
+            return lookup((f"{name}()",))  # success(), failure(), cancelled()
+        return UNKNOWN  # format(), toJSON(), hashFiles()...
     return UNKNOWN
 
 
