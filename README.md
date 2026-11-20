@@ -351,6 +351,16 @@ be read or parsed, or bad arguments.
   subshells, background jobs and heredocs make it unknown (not a check). Only steps whose shell
   is bash or sh (the default, except on a Windows runner) and whose `if:` is true for everyone
   are looked at.
+- A bash script that asks the **permission API** about the commenter is run on paper too:
+  `P=$(gh api .../collaborators/$USER/permission --jq .permission)` gives a stranger `none` or
+  `read`, or the call fails (a 404), which ends the script under `-e` or takes the `else` of
+  `if P=$(...)`; `|| echo X` gives `X` (maybe after gh's error text); without `--jq`/`| jq` the
+  answer is JSON, equal to no word; `gh api ... | grep -q[EiwxFs] PATTERN` is followed as well.
+  The user has to be the commenter (`${{ github.actor }}`, `$GITHUB_ACTOR`, a step `env:` set
+  from the comment). Then the step fails on a no only if every path exits; a script that exits
+  only when the call fails just reports. Scripts it can't follow (functions, loops, another
+  user, another jq filter) and github-scripts are still judged from their text (`core.setFailed`,
+  `throw`, `exit 1`, `grep -q`).
 - WG010 knows what some actions answer (`_ACTION_ANSWERS` in `rules.py`, from the action's
   source): `actions-cool/check-user-permission` always sets `user-permission` (`none` or `read`
   for a stranger), and `require-result` (`false`) when `require:` is given. For those outputs
@@ -430,7 +440,8 @@ src/workflow_guard/
   rules.py     the eight rules
   expressions.py  ${{ }} lexer and context paths (used by WG004 and WG005)
   conditions.py   if: parser and three-valued evaluator (WG010: who does the check let in?)
-  shell.py     a small bash evaluator (WG010: does a run: script exit for strangers?)
+  shell.py     a small bash evaluator (WG010: does a run: script exit for strangers? the
+               commenter's association, login and permission API answer)
   taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
   calls.py     local reusable workflows and actions: what callers pass into each input
   project.py   the files checked together; which file a uses: ./... runs
@@ -518,8 +529,9 @@ CHANGELOG.md.
   `!= 'false'` is reported even where the output is never empty. A check in a script of the
   repository (`require('./.github/scripts/check.js')`) isn't recognised, and a bash check of the
   association only in the forms `shell.py` follows (no loops or functions). A script that asks the
-  permission API still counts when it has an `exit 1` anywhere (a guess from its text, not run on
-  paper). A permission step's own `if:` is not looked at. A pull request's ref saved
+  permission API and that the evaluator can't follow (a function, a loop, a check of another
+  user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
+  anywhere (a guess from its text). A permission step's own `if:` is not looked at. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)
   is unknown as a whole. Whether a script fails on a no is guessed from its text
   (`core.setFailed`, `throw`, `exit 1`, `grep -q`); a script that fails some other way

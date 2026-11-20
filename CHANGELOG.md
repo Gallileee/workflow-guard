@@ -4,7 +4,40 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.26.0 — WG010: checks written in bash
+## v0.27.0 — WG010: permission API scripts run on paper
+
+### A script that exits only when the API call fails is no check
+
+A `run:` script that asked the permission API counted as a check whenever it had an `exit 1`
+somewhere. But this one only exits when the call itself fails, and a no goes to an output:
+
+```yaml
+- run: |
+    P=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission || exit 1)
+    echo "permission=$P" >> "$GITHUB_OUTPUT"
+```
+
+Now such a script is run on paper (`shell.py`): a stranger gets `none` or `read`, or the call
+fails (a non-collaborator can get a 404), which ends the script under `bash -e` or takes the
+`else` of `if P=$(...)`. `|| echo none` turns the failure into `none` (maybe after gh's error
+text); without `--jq` the answer is JSON. `gh api ... | grep -q PATTERN` is followed too (`-E`,
+`-i`, `-w`, `-x`, `-F`, basic regex `admin\|write`). The step fails on a no only if every path
+exits; otherwise it only reports, and the steps that don't read its answer are reported:
+
+```
+wf.yml:12:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 9 asks for the commenter's permission but doesn't fail on a no, and
+this step's 'if:' doesn't check its answer); ...
+```
+
+- Only when the user asked about is the commenter (`${{ github.actor }}`,
+  `${{ github.event.comment.user.login }}`, `$GITHUB_ACTOR`, a step `env:` set from them).
+- Scripts it can't follow (functions, loops, another user, another jq filter), PowerShell and
+  github-scripts are still judged from their text, as before.
+- On 40 permission API scripts in public workflows the evaluator decided 18: 17 as before, and
+  one that only reports `trusted=false` (its dependent job reads that, so nothing new there).
+
+## v0.26.0 — WG010: checks written in bash (2026-11-20)
 
 ### A `run:` script that exits for strangers is a check
 

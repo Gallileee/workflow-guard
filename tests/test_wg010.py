@@ -994,3 +994,62 @@ def test_a_script_that_tries_to_stop_no_one_is_not_named():
     # It looks at who commented but has no exit: it isn't meant as a check.
     ((_, _, message),) = wg010(on_comment('- run: echo "hello ${{ github.actor }}"', *CHECKOUT_PR))
     assert "the script at" not in message
+
+
+# --- permission API scripts run on paper ---------------------------------------------------------
+
+PERM = 'P=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission'
+
+
+def test_a_script_that_exits_only_on_an_api_error_is_no_stop():
+    # `exit 1` is there, but a no (none, read) only goes to an output.
+    step = ("- run: |", f"    {PERM} || exit 1)", '    echo "permission=$P" >> "$GITHUB_OUTPUT"')
+    ((line, severity, message),) = wg010(on_comment(*step, *CHECKOUT_PR))
+    assert (line, severity) == (12, Severity.HIGH)
+    assert "(the step at line 9 asks for the commenter's permission but doesn't fail on a no" in message
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        f'    {PERM} 2>/dev/null || echo none)\n    case "$P" in admin|write) ;; *) exit 1 ;; esac',
+        f'    {PERM})\n    [[ "$P" == "admin" || "$P" == "write" ]] || exit 1',
+        '    gh api "repos/$R/collaborators/$U/permission" -q .permission | grep -qE "admin|write" || exit 1',
+    ],
+)
+def test_a_script_that_exits_on_a_no_is_a_stop(check):
+    step = ("- run: |", *check.split("\n"), "  env:", "    U: ${{ github.event.comment.user.login }}")
+    assert wg010(on_comment(*step, *CHECKOUT_PR)) == []
+
+
+def test_an_api_script_that_reports_covers_what_reads_its_answer():
+    step = (
+        "- id: perm",
+        "  run: |",
+        f"    if {PERM}); then",
+        '      echo "ok=$([ "$P" = admin ] && echo true || echo false)" >> "$GITHUB_OUTPUT"',
+        "    else",
+        "      exit 1",
+        "    fi",
+    )
+    assert wg010(on_comment(*step, *CHECKOUT_PR, "  if: steps.perm.outputs.ok == 'true'")) == []
+    assert len(wg010(on_comment(*step, *CHECKOUT_PR))) == 1
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        # Not about the commenter: the text decides, as before.
+        (
+            "- run: |",
+            '    P=$(gh api "repos/$R/collaborators/$PR_AUTHOR/permission" --jq .permission)',
+            "    exit 1",
+        ),
+        # Something the evaluator doesn't follow.
+        ("- run: |", f'    check() {{ {PERM}); [ "$P" = admin ]; }}', "    check || exit 1"),
+        # Another shell.
+        ("- run: |", f"    {PERM} || exit 1)", "  shell: pwsh"),
+    ],
+)
+def test_api_scripts_it_cant_run_are_guessed_from_the_text(step):
+    assert wg010(on_comment(*step, *CHECKOUT_PR)) == []

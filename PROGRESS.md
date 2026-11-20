@@ -1,5 +1,45 @@
 # Progress log
 
+## 2026-11-20 (interactive, user picked "API skripty na papíře"): permission API scripts on paper
+
+Why: next step 2. A `run:` script with the permission API counted as failing on a no when it
+had `exit 1` anywhere (`_STOPS`), even if it only exits when the call fails.
+
+Acceptance criteria:
+- `P=$(gh api .../collaborators/<commenter>/permission ...)` is `none`/`read`, or a failed
+  call (assignment status, `-e`, the `else` of `if P=$(...)`); `|| echo X` / `|| true`
+  fallbacks (the fallback or gh's error text first); no jq -> JSON (equal to no word); other jq
+  filters -> not followed. `gh api ... | [jq -r .permission |] grep -q PATTERN` too.
+- Only for the commenter as the user; otherwise, and for anything not followed, the text guess
+  stays (no new findings from scripts it can't read).
+- A script that exits only on an API error reports (and is then reported if nothing reads it).
+
+Done:
+- `shell.py`: `_prepare` keeps each substitution's text (`_Sub`), `_api_answers`, `_grep`
+  (`-qEiwxFs`, basic regex), `_api_pipe`, API assignments branch per answer, `api_fails`,
+  `_analyse` with a `ContextVar` noting whether an API call was followed.
+- `rules.py`: `_asks` asks `_api_verdict` (cached) for bash `run:` scripts first; `_shell_run`
+  shared with `_shell_passing`; `_DEFAULT_ENV` (`GITHUB_ACTOR`, `GITHUB_TRIGGERING_ACTOR`,
+  `GITHUB_EVENT_NAME`).
+- Tests: 33 in `test_shell.py`, 8 in `test_wg010.py`; 857 in total.
+- README (How it works, modules, limitations), CHANGELOG v0.27.0, version 0.27.0, v0.26.0
+  heading dated.
+
+What the corpora showed: 40 permission API scripts. The evaluator decided 18 (12 fail on a no,
+6 only report); 17 agree with the text guess, and the one that differs (a script that writes
+`trusted=false`) didn't change any finding because its dependent job checks that output. 22
+fall back to the guess: functions (8), `while` (4), `{ }` groups (2), a heredoc, and calls about
+the pull request's author rather than the commenter. Findings: 22 and 18, as on main.
+
+Verified locally:
+- `pytest -q -W error`: 857 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.27.0, 0 errors (warning: v0.27.0 not tagged yet).
+- Both corpora: same WG010 output as main, all rules without errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 16 mutants; 14 killed (5 after adding tests), one removed with the code it
+  tested (a failed call's output is empty anyway), one equivalent kept on purpose (`_value`
+  turns a substitution into UNKNOWN, which every comparison treats the same).
+
 ## 2026-11-20 (interactive, user picked "Shell kontrola asociace"): WG010 checks written in bash
 
 Why: next step 2 of the previous entry. A check of `author_association` in a `run:` script
@@ -1049,11 +1089,9 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.26.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. WG010: run permission-API scripts on paper too: `P=$(gh api .../permission --jq .permission)`
-   is `none`/`read` for a stranger (or the command fails, which ends the script under `-e`).
-   That would replace the `exit 1` text guess (`_STOPS`), which counts a script that exits only
-   on an API error but just reports a no.
+1. Tag `v0.27.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `shell.py`: simple functions (`check() { ...; }` then `check`), the most common reason a
+   permission script falls back to the text guess (8 of 22 in the corpora); then `while read`.
 3. WG010: a permission step's own `if:` (a check that may be skipped doesn't stop anything).
 4. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.

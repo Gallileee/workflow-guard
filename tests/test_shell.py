@@ -3,7 +3,7 @@
 import pytest
 
 from workflow_guard.conditions import STRANGER, UNTRUSTED_ASSOCIATIONS
-from workflow_guard.shell import always_fails
+from workflow_guard.shell import always_fails, api_fails
 
 
 def fails(script: str, **variables: object) -> bool:
@@ -144,3 +144,100 @@ def test_too_many_paths_is_unknown():
 )
 def test_more_shell(script, expected):
     assert fails(script) is expected
+
+
+# --- the permission API ------------------------------------------------------------------------
+
+API = "gh api repos/o/r/collaborators/$U/permission"
+
+
+def api(script: str, **variables: object) -> bool | None:
+    return api_fails(script, {"U": STRANGER, **variables})
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        f'P=$({API} --jq .permission)\ncase "$P" in admin|write) ;; *) exit 1;; esac',
+        f'P="$({API} --jq \'.permission\')"\nif [ "$P" != "admin" ] && [ "$P" != "write" ]; then exit 1; fi',
+        f'P=$({API} -q .role_name)\n[[ "$P" =~ ^(admin|maintain|write)$ ]] || exit 1',
+        # A non-collaborator's 404 makes `|| echo none` give none (maybe after gh's error text).
+        f'P=$({API} --jq .permission 2>/dev/null || echo none)\ncase "$P" in admin) ;; *) exit 1;; esac',
+        f'P=$({API} --jq .permission || true)\n[ "$P" = admin ] || exit 1',
+        f'P=$({API} | jq -r .permission)\n[ "$P" = admin ] || exit 1',
+        # Without jq the output is JSON: equal to no word.
+        f'P=$({API})\n[ "$P" = "admin" ] || exit 1',
+        f"{API} --jq .permission | grep -qE 'admin|write' || exit 1",
+        f"{API} --jq .permission | grep -q 'admin\\|write' || exit 1",
+        f"{API} | jq -r .permission | grep -qx admin || exit 1",
+        f"if ! {API} --jq .permission | grep -qwF write; then exit 1; fi",
+        # The default variable for the commenter.
+        'P=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission)\n'
+        '[ "$P" = admin ] || exit 1',
+    ],
+)
+def test_api_scripts_that_exit_for_a_stranger(script):
+    assert api(script, GITHUB_ACTOR=STRANGER) is True
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Exits only when the call fails: a no is only reported.
+        f'P=$({API} --jq .permission || exit 1)\necho "permission=$P" >> "$GITHUB_OUTPUT"',
+        f'if P=$({API} --jq .permission); then echo "p=$P" >> "$GITHUB_OUTPUT"; else exit 1; fi',
+        # A check that lets read through.
+        f'P=$({API} --jq .permission)\ncase "$P" in none) exit 1;; esac',
+        f"{API} --jq .permission | grep -q 'read\\|write' || exit 1",
+        # Something unknown on the side.
+        f'P=$({API} --jq .permission)\n[ "$P" = admin ] || [ "$X" = yes ] || exit 1',
+        # set +e: the failed call doesn't end the script.
+        f'set +e\nP=$({API} --jq .permission)\n[ "$P" = none ] && exit 1\necho go',
+    ],
+)
+def test_api_scripts_that_may_let_a_stranger_through(script):
+    assert api(script) is False
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Not about the commenter.
+        'P=$(gh api repos/o/r/collaborators/octocat/permission --jq .permission)\n[ "$P" = admin ] || exit 1',
+        'P=$(gh api repos/o/r/collaborators/$PR_AUTHOR/permission --jq .permission)\n[ "$P" = admin ]',
+        # Another jq filter: unknown.
+        f'P=$({API} --jq .user.login)\n[ "$P" = admin ] || exit 1',
+        # Not the permission API.
+        '[ "$U" = octocat ] || exit 1',
+        # Something it doesn't follow.
+        f"check() {{ {API}; }}\ncheck || exit 1",
+        f"{API} | grep -q admin file.txt || exit 1",
+        f"{API} | grep --quiet admin || exit 1",
+        f"{API} | grep -qE 'a(' || exit 1",  # not a regex
+    ],
+)
+def test_api_scripts_it_cant_decide(script):
+    assert api(script) is None
+
+
+def test_the_api_answer_is_used_only_in_an_assignment():
+    # Compared directly, the substitution is unknown.
+    assert api(f'[ "$({API} --jq .permission)" = admin ] || exit 1') is None
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        # A failed call takes the else (and its output isn't an answer).
+        (f'if P=$({API} --jq .permission); then [ "$P" = admin ] || exit 1; fi', False),
+        (f'P=$({API} --jq .permission)\n[ -z "$P" ] && exit 0\n[ "$P" = admin ] || exit 1', True),
+        # After `|| echo none` the output may be gh's error text and then none.
+        (f'P=$({API} --jq .permission || echo none)\ncase "$P" in none|read) exit 1;; esac', False),
+        # grep -w, -x, -i.
+        (f"{API} --jq .permission | grep -qw rea || exit 1", True),
+        (f"{API} --jq .permission | grep -qx rea || exit 1", True),
+        (f"{API} --jq .permission | grep -qi READ || exit 1", False),
+    ],
+)
+def test_api_details(script, expected):
+    assert api(script) is expected
