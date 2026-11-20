@@ -18,6 +18,14 @@ fails *certainly* only if every path ends in a non-zero exit.
 Anything else that changes the flow (loops, functions, subshells, background jobs, heredocs)
 makes the script unknown: it doesn't count as a check. Commands it doesn't know succeed or
 fail, it doesn't matter which: only an ``exit`` or a failing test decides.
+
+The permission API is known too, when it asks about the commenter (a stranger's login):
+``P=$(gh api repos/.../collaborators/$USER/permission --jq .permission)`` gives ``none`` or
+``read``, or the command fails (a non-collaborator can get a 404), which ends the script under
+``-e`` (or takes the ``else`` of ``if P=$(...)``). ``|| echo X`` turns the failure into ``X``
+(maybe after gh's error text); without ``--jq``/``jq`` the answer is JSON, equal to no word.
+``gh api ... | grep -q PATTERN`` is followed the same way. ``api_fails`` tells whether such a
+script exits for a stranger, and None when no such call was followed.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ import fnmatch
 import re
 import shlex
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from .conditions import STRANGER, UNKNOWN
@@ -41,6 +50,21 @@ _SEPARATORS = (";", "\n")
 _NAME = re.compile(r"\$(?:(\w+)|\{(\w+)\})")
 _EXPANSION = re.compile(r"\$[\w{(@*#?!-]")
 _ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)=(.*)", re.DOTALL)
+_GH_API = re.compile(r"\bgh\s+api\b")
+_API_USER = re.compile(r"collaborators/([^/\s\"']+)/permission")
+_JQ_FIELD = re.compile(
+    r"(?:--jq|-q)[\s=]+['\"]?\.(\w+)['\"]?(?=\s|$)|\|\s*jq\s+(?:-r\s+)?['\"]?\.(\w+)['\"]?\s*$"
+)
+_ANY_JQ = re.compile(r"(?:--jq|-q)(?:\s|=)|\|\s*jq\b")
+_FALLBACK = re.compile(r"\|\|\s*(?:echo\s+['\"]?([\w-]*)['\"]?|(true|:))\s*$")
+_API_SEEN: ContextVar[bool] = ContextVar("api_seen", default=False)
+
+
+@dataclass(frozen=True)
+class _Sub:
+    """A command substitution's text: its output is unknown unless it asks the permission API."""
+
+    inner: str
 
 
 class Unsupported(Exception):
@@ -51,13 +75,30 @@ def always_fails(script: str, variables: Mapping[str, object]) -> bool:
     """True if ``script`` ends with a non-zero exit on every path, with ``variables`` (name ->
     a string, ``STRANGER`` or ``UNKNOWN``) and every other variable unknown. False when it may
     succeed, or when it uses something the evaluator doesn't follow."""
+    result = _analyse(script, variables)
+    return result is not None and result[0]
+
+
+def api_fails(script: str, variables: Mapping[str, object]) -> bool | None:
+    """Like ``always_fails`` for a script that asks the permission API about the commenter:
+    None if the evaluator doesn't follow the script or followed no such call."""
+    result = _analyse(script, variables)
+    return result[0] if result is not None and result[1] else None
+
+
+def _analyse(script: str, variables: Mapping[str, object]) -> tuple[bool, bool] | None:
+    """(fails on every path, a permission API call was followed), or None if unsupported."""
+    token = _API_SEEN.set(False)
     try:
-        tree = _Parser(_tokens(_prepare(script))).program()
-        env: dict[str, object] = {**variables, _COMMAND: UNKNOWN, _ERREXIT: True}
+        text, subs = _prepare(script)
+        tree = _Parser(_tokens(text)).program()
+        env: dict[str, object] = {**variables, **subs, _ERREXIT: True}
         ends, paths = _run_seq(tree, [env])
+        return not paths and ends == {FAIL}, _API_SEEN.get()
     except Unsupported:
-        return False
-    return not paths and ends == {FAIL}
+        return None
+    finally:
+        _API_SEEN.reset(token)
 
 
 # --- reading the script ------------------------------------------------------------------------
@@ -82,24 +123,32 @@ def _close(text: str, start: int) -> int:
     raise Unsupported("unclosed $(")
 
 
-def _prepare(script: str) -> str:
-    """Joins ``\\`` continuations, drops comments, and replaces command substitutions
-    (``$(...)``, backticks, ``$((...))``) with ``$__WG_CMD``: their output is unknown."""
+def _prepare(script: str) -> tuple[str, dict[str, _Sub]]:
+    """Joins ``\\`` continuations, drops comments, and replaces each command substitution
+    (``$(...)``, backticks, ``$((...))``) with a variable ``$__WG_CMD<n>`` holding its text."""
     text = script.replace("\\\n", " ")
     out: list[str] = []
+    subs: dict[str, _Sub] = {}
+
+    def substitute(inner: str) -> None:
+        name = f"{_COMMAND}{len(subs)}"
+        subs[name] = _Sub(inner.strip())
+        out.append("${" + name + "}")
+
     i, quote = 0, None
     while i < len(text):
         c = text[i]
         if quote != "'" and text.startswith("$(", i):
-            i = _close(text, i + 1) + 1
-            out.append("$" + _COMMAND)
+            end = _close(text, i + 1)
+            substitute(text[i + 2 : end])
+            i = end + 1
             continue
         if quote != "'" and c == "`":
             end = text.find("`", i + 1)
             if end < 0:
                 raise Unsupported("unclosed backtick")
+            substitute(text[i + 1 : end])
             i = end + 1
-            out.append("$" + _COMMAND)
             continue
         if quote:
             if c == quote:
@@ -116,7 +165,7 @@ def _prepare(script: str) -> str:
             continue
         out.append(c)
         i += 1
-    return "".join(out)
+    return "".join(out), subs
 
 
 def _split_ops(run: str) -> list[str]:
@@ -330,7 +379,8 @@ def _value(word: str, env: Env) -> object:
     """A word's value: a string, STRANGER or UNKNOWN."""
     whole = _NAME.fullmatch(word)
     if whole:
-        return env.get(whole.group(1) or whole.group(2), UNKNOWN)
+        value = env.get(whole.group(1) or whole.group(2), UNKNOWN)
+        return UNKNOWN if isinstance(value, _Sub) else value
     parts, pos = [], 0
     for m in _NAME.finditer(word):
         value = env.get(m.group(1) or m.group(2), UNKNOWN)
@@ -458,8 +508,92 @@ def _status(value: bool | None, env: Env) -> list[Result]:
     return _both(env, True) if value is None else [(value, True, env)]
 
 
+def _api_answers(text: str, env: Env) -> list[tuple[bool, object]] | None:
+    """What a permission API call (``gh api .../collaborators/<user>/permission``, maybe with
+    ``--jq``, ``| jq``, ``|| echo X``) gives a stranger: (whether it succeeds, its output) for
+    each case. None if ``text`` isn't such a call about the commenter."""
+    user = _API_USER.search(text)
+    if not _GH_API.search(text) or user is None or _value(user.group(1), env) is not STRANGER:
+        return None
+    fallback = _FALLBACK.search(text)
+    call = text[: fallback.start()] if fallback else text
+    field = _JQ_FIELD.search(call)
+    if field is None and _ANY_JQ.search(call):
+        return None  # another jq filter: its output is unknown
+    if field is None:
+        answers: list[tuple[bool, object]] = [(True, STRANGER)]  # JSON: equal to no word written
+    elif (field.group(1) or field.group(2)) in ("permission", "role_name"):
+        answers = [(True, "none"), (True, "read")]
+    else:
+        return None
+    if fallback is None:
+        answers.append((False, ""))
+    else:
+        # gh may print the error first: the output is the fallback, or something unlike any word.
+        answers += [(True, fallback.group(1) or ""), (True, STRANGER)]
+    _API_SEEN.set(True)
+    return answers
+
+
+def _grep(words: list[str], value: object) -> bool | None:
+    """Whether ``grep [-qEiwxFs] PATTERN`` finds a line in ``value``."""
+    flags, pattern = "", None
+    for word in words[1:]:
+        if pattern is None and word.startswith("-") and len(word) > 1:
+            flags += word[1:]
+        elif pattern is None:
+            pattern = word
+        else:
+            return None  # a file to read
+    if pattern is None or set(flags) - set("qEiwxFs"):
+        return None
+    if not isinstance(value, str):
+        return None
+    if "F" in flags:
+        regex = re.escape(pattern)
+    elif "E" in flags:
+        regex = pattern
+    else:  # basic regex: \| \( \) \+ \? are the operators, the bare ones are literal
+        regex = re.sub(r"\\([|()+?{}])|([|()+?{}])", lambda m: m.group(1) or "\\" + m.group(2), pattern)
+    if "w" in flags:
+        regex = rf"\b(?:{regex})\b"
+    try:
+        compiled = re.compile(regex, re.IGNORECASE if "i" in flags else 0)
+    except re.error:
+        return None
+    lines = value.split("\n")
+    if "x" in flags:
+        return any(compiled.fullmatch(line) for line in lines)
+    return any(compiled.search(line) for line in lines)
+
+
+def _api_pipe(commands: list, env: Env) -> list[Result] | None:
+    """``gh api .../permission [--jq ...] [| jq -r .permission] | grep -q PATTERN``: its status
+    for each answer (no pipefail: the last command's status, and grep reads nothing after a
+    failed call). None for any other pipeline."""
+    if not all(isinstance(c, _Simple) for c in commands) or commands[-1].words[0] != "grep":
+        return None
+    if _grep(commands[-1].words, "") is None:
+        return None  # a grep it doesn't follow
+    answers = _api_answers(" | ".join(" ".join(c.words) for c in commands[:-1]), env)
+    if answers is None:
+        return None
+    results: list[Result] = []
+    for _ok, output in answers:
+        found = _grep(commands[-1].words, output)  # a failed call's output is empty
+        results += _status(found, env)
+    return results
+
+
 def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
     words = command.words
+    if len(words) == 1 and (assign := _ASSIGNMENT.fullmatch(words[0])):
+        name, value = assign.groups()
+        whole = _NAME.fullmatch(value)
+        sub = env.get(whole.group(1) or whole.group(2)) if whole else None
+        answers = _api_answers(sub.inner, env) if isinstance(sub, _Sub) else None
+        if answers is not None:  # the assignment's status is the command's
+            return set(), [(ok, True, {**env, name: output}) for ok, output in answers]
     if all(_ASSIGNMENT.fullmatch(word) for word in words):
         env = dict(env)
         for word in words:
@@ -563,7 +697,7 @@ def _case(command: _Case, env: Env) -> tuple[set[str], list[Result]]:
 
 def _pipe(pipe: _Pipe, env: Env) -> tuple[set[str], list[Result]]:
     if len(pipe.commands) > 1:  # each part runs in a subshell: an exit there ends only that part
-        ends, results = set(), _both(env, True)
+        ends, results = set(), _api_pipe(pipe.commands, env) or _both(env, True)
     else:
         ends, results = _command(pipe.commands[0], env)
     if pipe.negated:

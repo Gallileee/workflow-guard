@@ -38,7 +38,7 @@ from .expressions import (
 from .model import Finding, Severity
 from .project import repo_root
 from .scripts import scripts
-from .shell import always_fails
+from .shell import always_fails, api_fails
 from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
 from .workflow import Step, Workflow, get, items, key_node, scalar
 
@@ -732,9 +732,17 @@ def _asks(step: Step) -> bool | None:
     if action in _PERMISSION_ACTIONS:
         switch = _PERMISSION_ACTIONS[action]
         return switch is None or _truthy(step.with_value(switch[0])) == switch[1]
-    text = (scalar(get(step.node, "run")) or "") + (step.with_value("script") or "")
+    run = scalar(get(step.node, "run")) or ""
+    text = run + (step.with_value("script") or "")
     if not _PERMISSION_API.search(text):
         return None
+    shell = (scalar(get(step.node, "shell")) or "bash").split()[0].lower()
+    if run and shell in ("bash", "sh"):
+        env = items(get(step.node, "env"))
+        verdict = _api_verdict(run, tuple(sorted((k, v.value) for k, v in env if isinstance(v, ScalarNode))))
+        if verdict is not None:
+            return verdict
+    # A github-script, or a script the evaluator doesn't follow: guess from the text.
     return bool(_STOPS.search(text))
 
 
@@ -820,9 +828,17 @@ def _shell_inputs(
     return script, tuple(sorted(env.items()))
 
 
-@lru_cache(maxsize=1024)
-def _shell_passing(script: str, env: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
-    """``_shell_check`` for a script and its ``env:`` values (cached: the rules ask often)."""
+# Variables GitHub sets for every step, as they are in a comment's run.
+_DEFAULT_ENV = {
+    "GITHUB_ACTOR": "${{ github.actor }}",
+    "GITHUB_TRIGGERING_ACTOR": "${{ github.triggering_actor }}",
+    "GITHUB_EVENT_NAME": "${{ github.event_name }}",
+}
+
+
+def _shell_run(script: str, env: tuple[tuple[str, str], ...]) -> tuple[str, dict[str, dict[str, object]]]:
+    """The script with each ``${{ }}`` turned into a variable, and for each association that
+    can't write the values of those variables and of ``env`` for a stranger."""
     inline: dict[str, str] = {}
     parts, pos = [], 0
     for i, expr in enumerate(find_expressions(script)):
@@ -830,13 +846,28 @@ def _shell_passing(script: str, env: tuple[tuple[str, str], ...]) -> tuple[str, 
         inline[name] = script[expr.start : expr.end]
         parts += [script[pos : expr.start], "${" + name + "}"]
         pos = expr.end
-    body = "".join(parts) + script[pos:]
-    texts = {**dict(env), **inline}
-    return tuple(
-        association
+    texts = {**_DEFAULT_ENV, **dict(env), **inline}
+    variables = {
+        association: {name: stranger_text(text, association) for name, text in texts.items()}
         for association in UNTRUSTED_ASSOCIATIONS
-        if not always_fails(body, {name: stranger_text(text, association) for name, text in texts.items()})
-    )
+    }
+    return "".join(parts) + script[pos:], variables
+
+
+@lru_cache(maxsize=1024)
+def _shell_passing(script: str, env: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
+    """``_shell_check`` for a script and its ``env:`` values (cached: the rules ask often)."""
+    body, variables = _shell_run(script, env)
+    return tuple(association for association, values in variables.items() if not always_fails(body, values))
+
+
+@lru_cache(maxsize=1024)
+def _api_verdict(script: str, env: tuple[tuple[str, str], ...]) -> bool | None:
+    """Whether a script that asks the permission API about the commenter exits for every
+    stranger (``shell.api_fails``); None if the evaluator doesn't follow it."""
+    body, variables = _shell_run(script, env)
+    verdicts = [api_fails(body, values) for values in variables.values()]
+    return None if None in verdicts else all(verdicts)
 
 
 def _denies(step: Step, answers: list[Step]) -> bool:
