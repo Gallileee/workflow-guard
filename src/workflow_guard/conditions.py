@@ -403,14 +403,72 @@ def evaluate(node: Node, lookup: Callable[[tuple[str, ...]], object], as_value: 
 # --- the question WG010 asks ---------------------------------------------------------------------
 
 
-def _stranger_lookup(association: str) -> Callable[[tuple[str, ...]], object]:
+# --- who the stranger is, per trigger ------------------------------------------------------------
+
+COMMENT = "issue_comment"
+FORK_PR = "pull_request_target"
+FORK_RUN = "workflow_run"
+
+_EVENT = ("github", "event")
+_PR = (*_EVENT, "pull_request")
+_RUN = (*_EVENT, "workflow_run")
+PR_ASSOCIATION = (*_PR, "author_association")
+_OWN = OWNERS_LIST  # the repository's own name or owner: a fork's is never equal to it
+_PROFILES: dict[str, dict[tuple[str, ...], object]] = {
+    COMMENT: {},
+    # A pull request from a fork, under pull_request_target.
+    FORK_PR: {
+        (*_PR, "head", "repo", "full_name"): STRANGER,
+        (*_PR, "head", "repo", "owner", "login"): STRANGER,
+        (*_PR, "head", "repo", "fork"): True,
+        (*_PR, "head", "user", "login"): STRANGER,
+        (*_PR, "user", "login"): STRANGER,
+        (*_PR, "base", "repo", "full_name"): _OWN,
+        (*_PR, "base", "repo", "owner", "login"): _OWN,
+        (*_EVENT, "sender", "login"): STRANGER,
+    },
+    # A run of a pull request from a fork, under workflow_run.
+    FORK_RUN: {
+        (*_RUN, "head_repository", "full_name"): STRANGER,
+        (*_RUN, "head_repository", "owner", "login"): STRANGER,
+        (*_RUN, "head_repository", "fork"): True,
+        (*_RUN, "actor", "login"): STRANGER,
+        (*_RUN, "triggering_actor", "login"): STRANGER,
+        (*_RUN, "event"): "pull_request",
+        (*_RUN, "repository", "full_name"): _OWN,
+        (*_EVENT, "sender", "login"): STRANGER,
+    },
+}
+_COMMON: dict[tuple[str, ...], object] = {
+    ("github", "repository"): _OWN,
+    ("github", "repository_owner"): _OWN,
+    (*_EVENT, "repository", "full_name"): _OWN,
+    (*_EVENT, "repository", "owner", "login"): _OWN,
+    ("github", "actor"): STRANGER,
+    ("github", "triggering_actor"): STRANGER,
+}
+
+
+def _stranger_lookup(association: str, profile: str = COMMENT) -> Callable[[tuple[str, ...]], object]:
+    """The values a stranger sets: for ``COMMENT`` a commenter who can't write (``association``),
+    for ``FORK_PR`` the author of a pull request from a fork (``association`` is the pull
+    request's ``author_association``), for ``FORK_RUN`` a fork's pull request whose run
+    triggered this one."""
+    known = _PROFILES[profile]
+
     def lookup(path: tuple[str, ...]) -> object:
-        if path == ASSOCIATION:
-            return association
         if path == EVENT_NAME:
-            return "issue_comment"
-        if path in LOGINS:
+            return profile
+        if profile == COMMENT and path == ASSOCIATION:
+            return association
+        if profile == COMMENT and path in LOGINS:
             return STRANGER
+        if profile == FORK_PR and path == PR_ASSOCIATION:
+            return association
+        if path in known:
+            return known[path]
+        if path in _COMMON:
+            return _COMMON[path]
         if path[0] in ("vars", "secrets") and len(path) > 1:
             return OWNERS_LIST
         return UNKNOWN
@@ -418,8 +476,9 @@ def _stranger_lookup(association: str) -> Callable[[tuple[str, ...]], object]:
     return lookup
 
 
-def lets_in(condition: str) -> tuple[str, ...]:
-    """The associations without write access for which ``condition`` may be true.
+def lets_in(condition: str, profile: str = COMMENT) -> tuple[str, ...]:
+    """The associations without write access for which ``condition`` may be true (for
+    ``profile``'s stranger, see ``_stranger_lookup``).
 
     An empty result means the condition keeps every such commenter out (whatever their login
     and whatever the comment says). Raises ``ExpressionError`` for text that isn't an
@@ -428,7 +487,7 @@ def lets_in(condition: str) -> tuple[str, ...]:
     return tuple(
         association
         for association in UNTRUSTED_ASSOCIATIONS
-        if truthy(evaluate(tree, _stranger_lookup(association))) is not False
+        if truthy(evaluate(tree, _stranger_lookup(association, profile))) is not False
     )
 
 
@@ -440,13 +499,15 @@ write: nothing (the step didn't set it), ``false`` (a yes/no output), or the per
 GitHub gives them (``none``, or ``read`` on a public repository)."""
 
 
-def _for_strangers(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> list[object]:
+def _for_strangers(
+    condition: str, lookup: Callable[[tuple[str, ...]], object], profile: str = COMMENT
+) -> list[object]:
     """How ``condition`` comes out (True, False or UNKNOWN) for each association that can't
     write, with ``lookup`` for every value the stranger doesn't set."""
     tree = parse(condition)
     results = []
     for association in UNTRUSTED_ASSOCIATIONS:
-        stranger = _stranger_lookup(association)
+        stranger = _stranger_lookup(association, profile)
 
         def both(path: tuple[str, ...], stranger: Callable[[tuple[str, ...]], object] = stranger) -> object:
             value = stranger(path)
@@ -456,11 +517,11 @@ def _for_strangers(condition: str, lookup: Callable[[tuple[str, ...]], object]) 
     return results
 
 
-def may_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bool:
-    """Whether ``condition`` may be true for a commenter who can't write. The commenter's
-    association, login, ``vars`` and ``secrets`` are set as for ``lets_in``; ``lookup`` gives
-    every other value (UNKNOWN for none). Raises ``ExpressionError``."""
-    return any(result is not False for result in _for_strangers(condition, lookup))
+def may_pass(condition: str, lookup: Callable[[tuple[str, ...]], object], profile: str = COMMENT) -> bool:
+    """Whether ``condition`` may be true for a commenter who can't write (or ``profile``'s
+    stranger). Their association, login, ``vars`` and ``secrets`` are set as for ``lets_in``;
+    ``lookup`` gives every other value (UNKNOWN for none). Raises ``ExpressionError``."""
+    return any(result is not False for result in _for_strangers(condition, lookup, profile))
 
 
 def must_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bool:
