@@ -4,7 +4,49 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.36.0 — WG010: arrays in bash checks
+## v0.37.0 — WG010: gh wrappers and functions in `$(...)`
+
+### What a function prints is followed
+
+Bash permission checks often wrap `gh` in a retry helper or a small function:
+
+```bash
+gh_retry() {
+  local n=0
+  while true; do
+    if gh "$@"; then return 0; fi
+    n=$((n+1)); [ "$n" -ge 3 ] && return 1
+    sleep $((n * 2))
+  done
+}
+P=$(gh_retry api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission)
+case "$P" in admin|maintain|write) ;; *) exit 1 ;; esac
+```
+
+The bash evaluator didn't follow the call inside the function. Now `P=$(f ...)`, where `f` is a
+function, runs `f` the way bash does, in a subshell: `set -e` isn't inherited, its variables
+stay there, and what it writes to `$GITHUB_OUTPUT` comes back. What it prints becomes the value:
+
+- `echo` (`-n` too) and `printf '%s'`; a login stays a login, none of the names written down;
+- a permission call about the commenter prints `none` or `read` on a line; a failed one prints
+  its error body (a 404's) or nothing, and a retried failure's body counts once, so retry loops
+  settle;
+- `gh "$@"` is the call the caller wrote, read with the caller's variables (a wrapper's own
+  `local` can't change it), through any number of wrappers;
+- output sent elsewhere (`>&2`, `> file`, `{ ...; } >&2`) prints nothing, `grep -q` and `sleep`
+  print nothing, and anything else (`2>&1`, another command) prints something unknown.
+
+`exit` inside `$(...)` isn't followed (the value is unknown, as before).
+
+### Fixed: an assignment's status is its command substitution's
+
+`if P=$(cmd); then exit 1; fi` was read as always taking the `then`: an assignment always
+succeeded. Its status is now the command's (unknown unless followed; `$((...))` succeeds).
+
+On the public workflows, 30 of the 40 bash permission scripts are now decided (29 before).
+No finding changed.
+
+## v0.36.0 — WG010: arrays in bash checks (2026-11-21)
 
 ### Arrays, `< <(...)` and `(( ))` are followed
 
