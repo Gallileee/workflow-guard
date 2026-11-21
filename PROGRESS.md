@@ -1,5 +1,47 @@
 # Progress log
 
+## 2026-11-20 (interactive, user picked "if: kroku kontroly"): a check that may be skipped
+
+Why: next step 2. A permission step that fails on a no covered every later step even when its
+own `if:` could skip it (only bash script checks had to always run). A known false negative.
+
+Acceptance criteria:
+- A stop whose `if:` may be false for a stranger covers only later steps whose `if:` contains
+  every top-level `&&` part of it (parsed, so `${{ }}` and spacing don't matter).
+- A stop whose `if:` is true for every stranger (or none) covers everything after it; a later
+  sure stop covers what follows it. Deny steps (`exit 1` on a reported no) stay sure.
+- A needed job only "fails" for a stranger through a sure stop; a dependent job is covered by a
+  conditional one if its `if:` has the stop's condition with `steps.<id>.outputs.<x>` read as
+  the job output carrying exactly that value.
+- Messages: "its 'if:' may skip it, and this step / a step that uses secrets doesn't have the
+  same condition".
+
+Done:
+- `rules.py`: `_Stop` (index, step, sure), `_stops`, `_stop_step` (first sure stop),
+  `_condition`, `_conjuncts`, `_parts`, `_covers`, `_covers_through` (in `_needed_results`);
+  `comment_commands` decides coverage per step; `_why_open(skipped=)`. Shell script stops no
+  longer need `_always_runs`: they follow the same rule.
+- Tests: 19 more in `test_wg010.py`; 908 in total.
+- README (WG010 row, How it works, limitations), CHANGELOG v0.29.0, version 0.29.0, v0.28.0
+  heading dated.
+
+What the corpora showed: the first version added one finding (a `sonar` job needing an
+`authorize` job whose check has `if: steps.command.outputs.proceed == 'true'`, while the
+`sonar` job has `if: needs.authorize.outputs.proceed == 'true'`): a false positive, fixed by
+reading the condition through the job outputs. After that the findings are as on main (22, 18);
+one message changed for a check that writes `trusted=false` to `$GITHUB_OUTPUT` from a `case` on
+the association and then exits in a step with `if: trusted != 'true'`: still reported (it was
+before, as "only looks at the comment's text"), because the evaluator doesn't follow what a
+script writes to `$GITHUB_OUTPUT` yet.
+
+Verified locally:
+- `pytest -q -W error`: 908 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.29.0, 0 errors (warning: v0.29.0 not tagged yet).
+- Both corpora: 22 and 18 findings, all rules without errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 13 mutants, all killed; a first run showed an equivalent branch in
+  `_covers_through` (an untranslated `steps.*` part), which was removed.
+
 ## 2026-11-20 (interactive, user picked "Funkce v shell.py"): functions in the bash evaluator
 
 Why: next step 2. Functions were the most common reason a permission script fell back to the
@@ -1126,8 +1168,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.28.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. WG010: a permission step's own `if:` (a check that may be skipped doesn't stop anything).
+1. Tag `v0.29.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `shell.py`: what a script writes to `$GITHUB_OUTPUT` (`echo "trusted=$x" >> "$GITHUB_OUTPUT"`)
+   as the step's outputs, so a script that only reports its check (a `case` on the association,
+   or the permission API) is evaluated like a reporting action (`_no_answers`).
 3. `shell.py`: `for`/`while` loops (5 of the 19 fallbacks), e.g. by running the body zero and
    one times when the loop's words are unknown.
 4. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't

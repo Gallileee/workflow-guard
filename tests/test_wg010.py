@@ -1053,3 +1053,113 @@ def test_an_api_script_that_reports_covers_what_reads_its_answer():
 )
 def test_api_scripts_it_cant_run_are_guessed_from_the_text(step):
     assert wg010(on_comment(*step, *CHECKOUT_PR)) == []
+
+
+# --- a permission step that may be skipped -----------------------------------------------------
+
+MAYBE = "  if: contains(github.event.comment.body, '/test')"
+
+
+def test_a_check_that_may_be_skipped_doesnt_cover_the_steps_after_it():
+    ((line, severity, message),) = wg010(on_comment(*STOP, MAYBE, *CHECKOUT_PR))
+    assert (line, severity) == (13, Severity.HIGH)
+    assert (
+        "(the step at line 9 fails unless the commenter may write, but its 'if:' may skip it,"
+        " and this step doesn't have the same condition)" in message
+    )
+
+
+@pytest.mark.parametrize(
+    "step_if",
+    [
+        "contains(github.event.comment.body, '/test')",
+        "${{ contains(github.event.comment.body, '/test') }}",
+        "github.event.issue.pull_request && contains(github.event.comment.body, '/test')",
+        "contains(github.event.comment.body, '/test') && (github.event.issue.pull_request || false)",
+    ],
+)
+def test_a_step_with_the_checks_condition_is_covered(step_if):
+    assert wg010(on_comment(*STOP, MAYBE, *CHECKOUT_PR, f"  if: {step_if}")) == []
+
+
+@pytest.mark.parametrize(
+    "step_if",
+    [
+        "github.event.issue.pull_request",
+        "contains(github.event.comment.body, '/test') || github.event.issue.pull_request",
+        "contains(github.event.comment.body, '/other')",
+    ],
+)
+def test_a_step_without_the_checks_condition_is_open(step_if):
+    assert len(wg010(on_comment(*STOP, MAYBE, *CHECKOUT_PR, f"  if: {step_if}"))) == 1
+
+
+def test_a_check_whose_if_always_holds_covers_everything():
+    assert wg010(on_comment(*STOP, "  if: github.event_name == 'issue_comment'", *CHECKOUT_PR)) == []
+    assert wg010(on_comment(*STOP, "  if: '!cancelled() || true'", *CHECKOUT_PR)) == []
+
+
+def test_a_later_check_that_always_runs_covers_what_follows_it():
+    assert wg010(on_comment(*STOP, MAYBE, *STOP, *CHECKOUT_PR)) == []
+
+
+def test_secrets_after_a_check_that_may_be_skipped_are_medium():
+    secret = ("- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}")
+    ((_, severity, message),) = wg010(on_comment(*STOP, MAYBE, *secret))
+    assert severity == Severity.MEDIUM
+    assert (
+        "but its 'if:' may skip it, and a step that uses secrets doesn't have the same condition)" in message
+    )
+    assert wg010(on_comment(*STOP, MAYBE, *secret, MAYBE)) == []
+
+
+def test_a_script_check_that_may_be_skipped_covers_steps_with_its_condition():
+    gate = (*SCRIPT_GATE, MAYBE)
+    assert len(wg010(on_comment(*gate, *CHECKOUT_PR))) == 1
+    assert wg010(on_comment(*gate, *CHECKOUT_PR, MAYBE)) == []
+
+
+# --- ... in a needed job ------------------------------------------------------------------------
+
+
+def needing_maybe(job_if: str, output: str = "${{ steps.cmd.outputs.go }}") -> str:
+    gate = "\n".join(
+        f"      {line}"
+        for line in (
+            "- id: cmd",
+            "  run: echo go=true >> $GITHUB_OUTPUT",
+            *STOP,
+            "  if: steps.cmd.outputs.go == 'true'",
+        )
+    )
+    cond = f"    if: {job_if}\n" if job_if else ""
+    return on_comment(*CHECKOUT_PR).replace(
+        "jobs:\n  test:\n",
+        f"jobs:\n  gate:\n    runs-on: x\n    outputs:\n      go: {output}\n    steps:\n{gate}\n"
+        f"  test:\n    needs: gate\n{cond}",
+    )
+
+
+def test_a_needed_check_that_may_be_skipped_doesnt_cover_the_job():
+    assert len(wg010(needing_maybe(""))) == 1
+
+
+@pytest.mark.parametrize(
+    "job_if", ["needs.gate.outputs.go == 'true'", "${{ needs.gate.outputs.go == 'true' && true }}"]
+)
+def test_a_job_with_the_needed_checks_condition_is_covered(job_if):
+    assert wg010(needing_maybe(job_if)) == []
+
+
+@pytest.mark.parametrize(
+    ("job_if", "output"),
+    [
+        ("needs.gate.outputs.go != 'true'", "${{ steps.cmd.outputs.go }}"),
+        # The output carries more than the value.
+        ("needs.gate.outputs.go == 'true'", "x${{ steps.cmd.outputs.go }}"),
+        ("needs.gate.outputs.go == 'true'", "${{ steps.other.outputs.go }}"),
+        ("needs.gate.outputs.go == 'true'", "${{ steps.cmd.outputs.go || 'true' }}"),
+    ],
+)
+def test_a_job_without_the_needed_checks_condition_is_open(job_if, output):
+    assert len(wg010(needing_maybe(job_if, output))) == 1
