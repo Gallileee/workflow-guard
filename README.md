@@ -375,9 +375,13 @@ be read or parsed, or bad arguments.
   `while`/`until` the body runs round after round from every state the last round left, until
   no new state turns up (at most 8 rounds, else unknown); `break` and `continue` end a round,
   `done < file` is fine. Commands that set variables are followed: `read` (unknown values),
-  `export`/`declare`/`readonly NAME=value`, `unset`, `printf -v`, and `NAME=value command`
-  prefixes. `eval`, `source`, `shift`, `let`, `getopts`, `((...))`, subshells, arrays, process
-  substitution (`< <(...)`), background jobs and heredocs make it unknown (not a check). Only steps whose shell
+  `export`/`declare`/`readonly NAME=value`, `unset`, `printf -v`, `mapfile`/`readarray`
+  (an unknown array), `x+=text`, and `NAME=value command` prefixes. Arrays: `a=(x y)` (also
+  over several lines, after `declare -a` or `local -a`), `a+=(z)`, `"${a[@]}"` (its elements,
+  in a `for` too), `${a[*]}`, `${a[N]}`, `${#a[@]}`; `$a` is the first element. `<(cmd)` and
+  `>(cmd)` are a file with unknown contents; `(( expr ))` has an unknown status and, when it
+  assigns, makes its variables unknown. `eval`, `source`, `shift`, `let`, `getopts`, associative
+  arrays, subshells, background jobs and heredocs make it unknown (not a check). Only steps whose shell
   is bash or sh (the default, except on a Windows runner) and whose `if:` is true for everyone
   are looked at.
 - A bash script that asks the **permission API** about the commenter is run on paper too:
@@ -387,7 +391,7 @@ be read or parsed, or bad arguments.
   answer is JSON, equal to no word; `gh api ... | grep -q[EiwxFs] PATTERN` is followed as well.
   The user has to be the commenter (`${{ github.actor }}`, `$GITHUB_ACTOR`, a step `env:` set
   from the comment). Then the step fails on a no only if every path exits; a script that exits
-  only when the call fails just reports. Scripts it can't follow (arrays, `eval`, another
+  only when the call fails just reports. Scripts it can't follow (`eval`, a heredoc, another
   user, another jq filter) are still judged from their text (`core.setFailed`, `throw`,
   `exit 1`, `grep -q`).
 - An `actions/github-script` step is run on paper too (`jscript.py`), for a stranger:
@@ -598,8 +602,8 @@ CHANGELOG.md.
   `if:` on the answer has to be false for an empty answer, `false`, `none` and `read`, so
   `!= 'false'` is reported even where the output is never empty. A check in a script of the
   repository (`require('./.github/scripts/check.js')`) isn't recognised, and a bash check of the
-  association only in the forms `shell.py` follows (no arrays or `eval`). A script that asks the
-  permission API and that the evaluator can't follow (an array, `eval`, a check of another
+  association only in the forms `shell.py` follows (no `eval` or heredocs). A script that asks the
+  permission API and that the evaluator can't follow (a heredoc, `eval`, a wrapper function around `gh`, a check of another
   user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
   anywhere (a guess from its text), and so does a github-script with a `while`/`for (;;)` loop, `switch`, a class or an array pattern (`core.setFailed`, `throw` or `process.exit(1)` in its text). A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)

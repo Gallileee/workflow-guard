@@ -1,5 +1,40 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "Pole v shell.py"): arrays in the bash evaluator
+
+Why: next step 3. Arrays and `< <(...)` were the most common reasons a bash permission script
+fell back to the text guess (5 of 16), with `(( ))` and `mapfile` next to them.
+
+Acceptance criteria:
+- `name=(...)`/`name+=(...)` parsed into one `_ArrayWord` (several lines too); arrays as tuples;
+  `${a[@]}` (tuple), `${a[*]}`, `${a[N]}`, `${#a[@]}`, `$a` (first element); a plain variable is
+  an array of one; `for` takes array elements as they are (spaces included); associative
+  arrays (`[k]=v`) are unknown.
+- `declare -a`, `local -a`, `x+=text` (soundness: it used to leave `x` stale), `mapfile`/
+  `readarray` (option values skipped; the array or `MAPFILE` unknown).
+- `<(cmd)`/`>(cmd)` -> a file with unknown contents; `(( ))` -> unknown status, its names
+  unknown when it assigns.
+
+Done:
+- `shell.py`: `_ArrayWord`, `array_literal`, `arithmetic`, `_ARRAY_REF`, `_array_ref`,
+  `_assignment` (shared by plain assignments, `local`, `declare`), `_PROCESS_FILE` in
+  `_prepare`, `mapfile`/`readarray` in `_sets`, arrays in `_for`.
+- Tests: 25 more in `test_shell.py` (`(( 1 ))` moved out of "doesn't follow"); 1218 in total.
+- README (How it works, limitations), CHANGELOG v0.36.0, version 0.36.0, v0.35.0 heading dated.
+
+What the corpora showed: bash permission scripts decided 29 of 40 (24 before). 11 still fall
+back: calls about someone other than the commenter (5), a function wrapping `gh` (`gh_retry`),
+a shell function called inside `$(...)`, a heredoc, and the rest. Findings 20, 17 and the fork
+corpus unchanged.
+
+Verified locally:
+- `pytest -q -W error`: 1218 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.36.0, 0 errors (warning: v0.36.0 not tagged yet).
+- All three corpora: same finding counts as main, no errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 19 mutants, all killed (3 after adding or reshaping tests: a test used
+  `-n 5 < f`, where the tokenizer can't tell `5 <` from `5<`, so `5` read as a descriptor).
+
 ## 2026-11-21 (interactive, user picked "Šipky v JS"): functions and callbacks in jscript
 
 Why: next step 2. Of the github-script permission checks in the corpora, 12 fell back to the
@@ -1410,11 +1445,11 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.35.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `jscript.py`: `require()`d helper scripts of the checked repository (read the file and run
-   its exported function), and array patterns (`const [a, b] = ...`, `([k, v]) =>`).
-3. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
-   input (5 of the 16 bash fallbacks).
+1. Tag `v0.36.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `shell.py`: a shell function called inside `$(...)` (capture what it echoes) and wrappers
+   around `gh` (`gh_retry api ...` that runs `gh "$@"`), the next fallbacks.
+3. `jscript.py`: `require()`d helper scripts of the checked repository, and array patterns
+   (`const [a, b] = ...`, `([k, v]) =>`).
 4. WG005: a label gate with a step that removes the label (`labeled` + `actions-ecosystem/
    action-remove-labels` before the checkout) as a recognised pattern, with a note on the
    remaining race.

@@ -4,7 +4,36 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.35.0 — WG010: functions and callbacks in github-script
+## v0.36.0 — WG010: arrays in bash checks
+
+### Arrays, `< <(...)` and `(( ))` are followed
+
+Bash permission checks often keep the allowed roles in an array:
+
+```bash
+allowed=(admin maintain write)
+perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission)
+for role in "${allowed[@]}"; do [ "$perm" = "$role" ] && exit 0; done
+exit 1
+```
+
+The bash evaluator gave up on them. Now it follows:
+
+- `a=(x y z)`, also over several lines and after `declare -a`/`local -a`, and `a+=(w)`;
+- `"${a[@]}"` (each element, also one with spaces, in a `for`), `${a[*]}` (joined by spaces),
+  `${a[N]}`, `${#a[@]}`, and `$a` (the first element);
+- `mapfile`/`readarray` (an array whose elements are unknown);
+- `<(cmd)` and `>(cmd)`, so `while read ...; done < <(gh api ...)` reads unknown lines;
+- `(( expr ))`: its status is unknown, and an assignment in it (`n++`, `n += 2`) makes its
+  variables unknown;
+- `x+=text`, which used to leave `x` unchanged.
+
+Associative arrays (`declare -A`, `([key]=value)`) still make the script unknown.
+
+On the public workflows, 29 of the 40 bash permission scripts are now decided (24 before).
+No finding changed.
+
+## v0.35.0 — WG010: functions and callbacks in github-script (2026-11-21)
 
 ### Arrow functions, functions, `for...of`, Map and Set are followed
 

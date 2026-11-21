@@ -25,7 +25,9 @@ Loops: ``for x in a b c`` runs its body once per word; over words it can't work 
 the last round left, until no new state turns up (at most 8 rounds; otherwise the script is
 unknown). ``break`` and ``continue`` end a round. Commands that set variables are followed:
 ``read`` (unknown values), ``export``/``declare``/``readonly`` with ``NAME=value``, ``unset``,
-``printf -v``; ``eval``, ``source``, ``shift``, ``let`` and ``getopts`` make the script unknown,
+``printf -v``, ``mapfile``/``readarray`` (an unknown array), ``x+=text``. Arrays: ``a=(x y)``,
+``a+=(z)``, ``"${a[@]}"`` and ``${a[*]}``, ``${a[0]}``, ``${#a[@]}``; ``<(cmd)`` and ``>(cmd)`` are a
+file with unknown contents. ``eval``, ``source``, ``shift``, ``let`` and ``getopts`` make the script unknown,
 as do ``((...))``, subshells, background jobs and heredocs: such a script doesn't count as a
 check. Commands it doesn't know succeed or fail, it doesn't matter which: only an ``exit`` or a
 failing test decides.
@@ -66,7 +68,8 @@ _BREAK = "\0break"  # set on a path that ran `break` (cleared when its loop ends
 _CONTINUE = "\0continue"  # set on a path that ran `continue` (cleared at the end of the round)
 _LOOPS = "\0loops"  # how many loops deep
 _MAX_ROUNDS = 8
-_UNFOLLOWED = {"eval", "source", ".", "shift", "let", "getopts", "mapfile", "readarray", "select", "coproc"}
+_UNFOLLOWED = {"eval", "source", ".", "shift", "let", "getopts", "select", "coproc"}
+_PROCESS_FILE = "/dev/fd/__WG_PROC"  # <(cmd): a file whose contents are unknown
 _RETURNED = "\0return"  # set on a path that ran `return`: the status it returned
 _DEPTH = "\0depth"  # how many function calls deep
 _LOCALS = "\0locals"  # names declared `local` in the current call
@@ -76,7 +79,16 @@ _POSITIONAL = tuple(str(i) for i in range(1, 10))
 _SEPARATORS = (";", "\n")
 _NAME = re.compile(r"\$(?:(\w+)|\{(\w+)\})")
 _EXPANSION = re.compile(r"\$[\w{(@*#?!-]")
-_ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)=(.*)", re.DOTALL)
+_ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)(\+?)=(.*)", re.DOTALL)
+_ARRAY_REF = re.compile(r"\$\{(#?)(\w+)\[([@*]|\d+)\]\}")
+
+
+class _ArrayWord(str):
+    """``name=(a b c)`` (or ``+=``) as one word: the element words are kept apart."""
+
+    items: tuple[str, ...]
+
+
 _GH_API = re.compile(r"\bgh\s+api\b")
 _API_USER = re.compile(r"collaborators/([^/\s\"']+)/permission")
 _JQ_FIELD = re.compile(
@@ -205,6 +217,11 @@ def _prepare(script: str) -> tuple[str, dict[str, _Sub]]:
         if quote != "'" and text.startswith("$(", i):
             end = _close(text, i + 1)
             substitute(text[i + 2 : end])
+            i = end + 1
+            continue
+        if quote is None and (text.startswith("<(", i) or text.startswith(">(", i)):
+            end = _close(text, i + 1)
+            out.append(_PROCESS_FILE)
             i = end + 1
             continue
         if quote != "'" and c == "`":
@@ -392,6 +409,8 @@ class _Parser:
 
     def command(self) -> object:
         token = self.peek()
+        if token == "(" and self.tokens[self.i + 1 : self.i + 2] == ["("]:
+            return self.arithmetic()
         if token in _UNSUPPORTED:
             raise Unsupported(f"{token!r}")
         compound = {
@@ -499,6 +518,8 @@ class _Parser:
             self.i += 1
             if token.isdigit() and self.peek() in ("<", ">", ">>"):
                 pass  # a file descriptor: 2>&1
+            elif re.fullmatch(r"[A-Za-z_]\w*\+?=", token) and self.peek() == "(":
+                words.append(self.array_literal(token))
             else:
                 words.append(token)
             if self.peek() in ("<", ">", ">>"):  # a redirection: its target is no argument
@@ -513,6 +534,39 @@ class _Parser:
         if not words:
             raise Unsupported(f"unexpected {self.peek()!r}")
         return _Simple(words, output)
+
+    def arithmetic(self) -> _Simple:
+        """``(( expr ))``: its words, after ``((``."""
+        self.take("(")
+        self.take("(")
+        words, depth = ["(("], 0
+        while True:
+            token = self.peek()
+            if token is None or token == "\n":
+                raise Unsupported("unclosed ((")
+            if token == ")" and depth == 0 and self.tokens[self.i + 1 : self.i + 2] == [")"]:
+                self.i += 2
+                return _Simple(words)
+            depth += {"(": 1, ")": -1}.get(token, 0)
+            words.append(self.take())
+
+    def array_literal(self, head: str) -> _ArrayWord:
+        """``name=( a b c )``, possibly over several lines."""
+        self.take("(")
+        items: list[str] = []
+        while (token := self.peek()) != ")":
+            if token is None:
+                raise Unsupported("unclosed array")
+            if token == "\n":
+                self.i += 1
+                continue
+            if token in _OPS:
+                raise Unsupported(f"{token!r} in an array")
+            items.append(self.take())
+        self.take(")")
+        word = _ArrayWord(head + "(" + " ".join(items) + ")")
+        word.items = tuple(items)
+        return word
 
     def double_test(self) -> _Simple:
         """``[[ ... ]]``: operators inside it are part of the test."""
@@ -571,15 +625,47 @@ Env = dict[str, object]
 Result = tuple[bool, bool, Env]
 
 
+def _array_ref(m: re.Match[str], env: Env) -> object:
+    """``${a[@]}`` (the elements, as a tuple), ``${a[*]}`` (joined by spaces), ``${a[2]}``,
+    ``${#a[@]}``."""
+    length, name, index = m.groups()
+    value = env.get(name, UNKNOWN)
+    if isinstance(value, str):
+        value = (value,)  # a plain variable is an array of one
+    if not isinstance(value, tuple):
+        return UNKNOWN
+    if length:
+        return str(len(value)) if index in "@*" else UNKNOWN
+    if index == "@":
+        return value
+    if index == "*":
+        return " ".join(value) if all(isinstance(v, str) for v in value) else UNKNOWN  # type: ignore[arg-type]
+    return value[int(index)] if int(index) < len(value) else ""
+
+
 def _value(word: str, env: Env) -> object:
-    """A word's value: a string, STRANGER or UNKNOWN."""
+    """A word's value: a string, STRANGER or UNKNOWN; ``"${a[@]}"`` alone gives the array's
+    elements as a tuple."""
     whole = _NAME.fullmatch(word)
     if whole:
         value = env.get(whole.group(1) or whole.group(2), UNKNOWN)
+        if isinstance(value, tuple):
+            return value[0] if value else ""  # $a is the first element
         return UNKNOWN if isinstance(value, _Sub) else value
+    if array := _ARRAY_REF.fullmatch(word):
+        return _array_ref(array, env)
     parts, pos = [], 0
-    for m in _NAME.finditer(word):
-        value = env.get(m.group(1) or m.group(2), UNKNOWN)
+    for m in sorted([*_NAME.finditer(word), *_ARRAY_REF.finditer(word)], key=lambda m: m.start()):
+        if m.start() < pos:
+            continue
+        if m.re is _ARRAY_REF:
+            value = _array_ref(m, env)
+            if isinstance(value, tuple):
+                value = " ".join(value) if all(isinstance(v, str) for v in value) else UNKNOWN  # type: ignore[arg-type]
+        else:
+            value = env.get(m.group(1) or m.group(2), UNKNOWN)
+            if isinstance(value, tuple):
+                value = value[0] if value else ""
         if not isinstance(value, str):
             return UNKNOWN
         parts += [word[pos : m.start()], value]
@@ -704,6 +790,36 @@ def _status(value: bool | None, env: Env) -> list[Result]:
     return _both(env, True) if value is None else [(value, True, env)]
 
 
+def _assignment(word: str, env: Env) -> tuple[str, object]:
+    """``name=value``, ``name+=value``, ``name=(a b)``, ``name+=(c)``: the name and its new
+    value."""
+    assign = _ASSIGNMENT.fullmatch(word)
+    assert assign is not None
+    name, append, text = assign.groups()
+    old = env.get(name, UNKNOWN)
+    if isinstance(word, _ArrayWord):
+        items: list[object] = []
+        for item in word.items:
+            value = _value(item, env)
+            if isinstance(value, tuple):
+                items += value
+            elif re.fullmatch(r"\[.*\]=.*", item):
+                return name, UNKNOWN  # [key]=value: an associative array
+            else:
+                items.append(value)
+        if append:
+            if isinstance(old, str):
+                old = (old,)
+            return name, (*old, *items) if isinstance(old, tuple) else UNKNOWN
+        return name, tuple(items)
+    value = _value(text, env)
+    if append:
+        if isinstance(old, tuple):  # a+=x appends to the first element
+            old = old[0] if old else ""
+        value = old + value if isinstance(old, str) and isinstance(value, str) else UNKNOWN
+    return name, value
+
+
 def _api_answers(text: str, env: Env) -> list[tuple[bool, object]] | None:
     """What a permission API call (``gh api .../collaborators/<user>/permission``, maybe with
     ``--jq``, ``| jq``, ``|| echo X``) gives a stranger: (whether it succeeds, its output) for
@@ -783,8 +899,8 @@ def _api_pipe(commands: list, env: Env) -> list[Result] | None:
 
 def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
     words = command.words
-    if len(words) == 1 and (assign := _ASSIGNMENT.fullmatch(words[0])):
-        name, value = assign.groups()
+    if len(words) == 1 and (assign := _ASSIGNMENT.fullmatch(words[0])) and not assign.group(2):
+        name, _, value = assign.groups()
         whole = _NAME.fullmatch(value)
         sub = env.get(whole.group(1) or whole.group(2)) if whole else None
         answers = _api_answers(sub.inner, env) if isinstance(sub, _Sub) else None
@@ -793,8 +909,8 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
     if all(_ASSIGNMENT.fullmatch(word) for word in words):
         env = dict(env)
         for word in words:
-            name, value = _ASSIGNMENT.fullmatch(word).groups()  # type: ignore[union-attr]
-            env[name] = _value(value, env)
+            name, value = _assignment(word, env)
+            env[name] = value
         return set(), [(True, True, env)]
     while len(words) > 1 and _ASSIGNMENT.fullmatch(words[0]):
         words = words[1:]  # `IFS=, read -r a b`: the assignment only lasts for the command
@@ -820,12 +936,14 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
             raise Unsupported("local outside a function")
         env = dict(env)
         for word in args:
+            if word.startswith("-"):
+                continue  # local -a, -r...
             assign = _ASSIGNMENT.fullmatch(word)
             local = assign.group(1) if assign else word
             if not re.fullmatch(r"[A-Za-z_]\w*", local):
                 raise Unsupported(f"local {word!r}")
             env[_LOCALS] = (*env.get(_LOCALS, ()), local)
-            env[local] = _value(assign.group(2), env) if assign else ""
+            env[local] = _assignment(word, env)[1] if assign else ""
         return set(), [(True, True, env)]
     if name == "exit":
         code = _value(args[0], env) if args else UNKNOWN
@@ -840,6 +958,12 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
         return ends, []
     if name in ("echo", "printf") and (command.output or env.get(_TO_OUTPUT)):
         return set(), [(True, True, _write(name, args, env))]
+    if name == "((":
+        # Arithmetic: its status is unknown; if it assigns, its variables become unknown.
+        text = " ".join(args)
+        if re.search(r"\+\+|--|(?<![=!<>])=(?!=)|[-+*/%]=", text):
+            env = {**env, **dict.fromkeys(re.findall(r"[A-Za-z_]\w*", text), UNKNOWN)}
+        return set(), _both(env, True)
     if name in ("true", ":", "echo", "printf"):
         return set(), [(True, True, env)]
     if name == "false":
@@ -921,12 +1045,12 @@ def _sets(name: str, args: list[str], env: Env) -> Env | None:
         env, plain = dict(env), True
         for word in args:
             if word.startswith("-"):
-                if set(word[1:]) - set("xrgp"):
-                    plain = False  # -i, -l, -u... change the value; -a, -A, -n make arrays and refs
+                if set(word[1:]) - set("xrgpa"):
+                    plain = False  # -i, -l, -u... change the value; -A, -n make maps and refs
                 continue
-            assign = _ASSIGNMENT.fullmatch(word)
-            if assign:
-                env[assign.group(1)] = _value(assign.group(2), env) if plain else UNKNOWN
+            if _ASSIGNMENT.fullmatch(word):
+                name_, value = _assignment(word, env)
+                env[name_] = value if plain else UNKNOWN
         return env
     if name == "unset":
         env = dict(env)
@@ -935,6 +1059,15 @@ def _sets(name: str, args: list[str], env: Env) -> Env | None:
             if not word.startswith("-"):
                 env.pop(_FUNCTION + word, None) if functions else env.update({word: ""})
         return env
+    if name in ("mapfile", "readarray"):
+        names, i = [], 0
+        while i < len(args):
+            if args[i].startswith("-") and len(args[i]) > 1:
+                i += 2 if args[i][-1] in "dnOsuCc" else 1
+                continue
+            names.append(args[i])
+            i += 1
+        return {**env, (names[-1] if names else "MAPFILE"): UNKNOWN}
     if name == "printf" and len(args) > 1 and args[0] == "-v":
         return {**env, args[1]: UNKNOWN}
     return None
@@ -1031,8 +1164,18 @@ def _round(body: list, frontier: list[Env]) -> tuple[set[str], list[Env], list[E
 def _for(node: _For, env: Env) -> tuple[set[str], list[Env]]:
     """``for``: once per word when the words are known (no `$`, no glob, nothing that splits);
     otherwise rounds with the variable unknown until no new state turns up."""
-    values = None if node.words is None else [_value(word, env) for word in node.words]
-    if values is not None and all(isinstance(v, str) and not any(c in v for c in " \t\n*?[") for v in values):
+    values: list[object] | None = None
+    if node.words is not None:
+        values = []
+        for word in node.words:
+            value = _value(word, env)
+            if isinstance(value, tuple):
+                values += value  # "${a[@]}": the elements, as they are
+            elif isinstance(value, str) and any(c in value for c in " \t\n*?["):
+                values.append(UNKNOWN)  # it splits or globs into words of its own
+            else:
+                values.append(value)
+    if values is not None and all(isinstance(v, str) for v in values):
         ends: set[str] = set()
         frontier, done = [env], []
         for value in values:
