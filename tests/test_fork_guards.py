@@ -224,3 +224,111 @@ def test_running_anyway_is_judged_for_a_fork():
         "always() && (needs.guard.result == 'success' || github.event.pull_request.head.repo.fork == false)"
     )
     assert found(prt(job_if, extra_jobs=GUARD_JOB, needs="guard"), "WG005") == []
+
+
+# --- messages: why a guard doesn't keep forks out -----------------------------------------------
+
+
+def messages(text: str, rule: str) -> list[str]:
+    return [f.message for f in check(Workflow.parse(text, "wf.yml")) if f.rule_id == rule]
+
+
+@pytest.mark.parametrize(
+    ("job_if", "note"),
+    [
+        (
+            "github.event.pull_request.author_association != 'NONE'",
+            "(the job's 'if:' looks at who opened the pull request but still lets CONTRIBUTOR,"
+            " FIRST_TIME_CONTRIBUTOR, FIRST_TIMER and MANNEQUIN in: author_association values",
+        ),
+        (
+            "contains(github.event.pull_request.labels.*.name, 'safe to test')",
+            "(the job's 'if:' checks a label, which stays on the pull request when the fork pushes new"
+            " commits)",
+        ),
+        (
+            "github.event.pull_request.head.repo.full_name != github.repository",
+            "(the job's 'if:' looks at where the pull request comes from but is still true for a pull request"
+            " from a fork)",
+        ),
+    ],
+)
+def test_wg005_names_a_weak_guard(job_if, note):
+    (message,) = messages(prt(job_if), "WG005")
+    assert note in message
+    assert message.startswith(
+        "checks out the pull request's code under 'pull_request_target', which runs with"
+    )
+
+
+def test_wg005_names_a_weak_step_guard():
+    (message,) = messages(prt(step_if="github.event.label.name == 'ok'"), "WG005")
+    assert "(its 'if:' checks a label" in message
+
+
+def test_wg005_names_always_past_a_guard_job():
+    (message,) = messages(prt("always()", extra_jobs=GUARD_JOB, needs="guard"), "WG005")
+    assert (
+        "(job 'guard', which it needs, keeps forks out, but this job's 'if:' uses always(), so it runs"
+        " anyway)" in message
+    )
+
+
+def test_wg005_names_a_needed_jobs_weak_guard():
+    weak = GUARD_JOB.replace(SAME_REPO, "contains(github.event.pull_request.labels.*.name, 'ok')")
+    (message,) = messages(prt(extra_jobs=weak, needs="guard"), "WG005")
+    assert "(the 'if:' of job 'guard', which it needs, checks a label" in message
+
+
+def test_wg005_without_a_guard_has_no_note():
+    (message,) = messages(prt("github.event.pull_request.draft == false"), "WG005")
+    assert "if:" not in message
+
+
+@pytest.mark.parametrize(
+    ("job_if", "note"),
+    [
+        (
+            "github.event.workflow_run.conclusion == 'success'",
+            "(the job's 'if:' only checks how the triggering run ended, not whose code it ran)",
+        ),
+        (
+            "github.event.workflow_run.event == 'pull_request'",
+            "(the job's 'if:' looks at where the triggering run comes from but is still true for a run"
+            " from a fork)",
+        ),
+    ],
+)
+def test_wg009_names_a_weak_guard(job_if, note):
+    (message,) = messages(run_wf(job_if), "WG009")
+    assert note in message
+
+
+def test_wg009_notes_on_artifact_downloads():
+    text = (
+        "on:\n  workflow_run:\n    workflows: [CI]\n    types: [completed]\npermissions: {}\njobs:\n"
+        "  a:\n    if: github.event.workflow_run.conclusion == 'success'\n    runs-on: x\n    steps:\n"
+        f"      - uses: actions/download-artifact@{SHA}\n"
+        "        with:\n          run-id: ${{ github.event.workflow_run.id }}\n"
+    )
+    (message,) = messages(text, "WG009")
+    assert "fork, (the job's" not in message
+    assert "a pull request from a fork (the job's 'if:' only checks how the triggering run ended" in message
+    unpack = text + "      - run: ./build.sh\n"
+    (message,) = messages(unpack, "WG009")
+    assert (
+        "from a fork (the job's 'if:' only checks how the triggering run ended, not whose code it ran)."
+        in message
+    )
+
+
+def test_wg005_names_a_needed_job_that_runs_past_its_guard():
+    middle = (
+        "  middle:\n    needs: guard\n    if: always()\n    runs-on: x\n    steps:\n      - run: echo ok\n"
+    )
+    (message,) = messages(prt(extra_jobs=GUARD_JOB + middle, needs="middle"), "WG005")
+    assert (
+        "(job 'middle', which it needs, runs past job 'guard', which keeps forks out: its 'if:' uses"
+        " always())" in message
+    )
+    assert "is still true" not in message

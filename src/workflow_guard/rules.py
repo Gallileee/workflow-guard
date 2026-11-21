@@ -23,6 +23,7 @@ from .conditions import (
     FORK_PR,
     FORK_RUN,
     NO_ANSWERS,
+    PR_ASSOCIATION,
     UNKNOWN,
     UNTRUSTED_ASSOCIATIONS,
     lets_in,
@@ -380,6 +381,83 @@ def _job_keeps_forks_out(wf: Workflow, job_id: str, profile: str, seen: frozense
     return bool(results) and not _runs_anyway(job, results, wf, profile)
 
 
+# What an 'if:' may look at to tell a fork's pull request or run from the repository's own.
+_FORK_PATHS = {
+    FORK_PR: (
+        ("github", "event", "pull_request", "head"),
+        ("github", "event", "pull_request", "user"),
+        ("github", "event", "sender"),
+        ("github", "actor"),
+        ("github", "triggering_actor"),
+    ),
+    FORK_RUN: (
+        ("github", "event", "workflow_run", "head_repository"),
+        ("github", "event", "workflow_run", "event"),
+        ("github", "event", "workflow_run", "actor"),
+        ("github", "event", "workflow_run", "triggering_actor"),
+        ("github", "actor"),
+        ("github", "triggering_actor"),
+    ),
+}
+_LABELS = (("github", "event", "pull_request", "labels"), ("github", "event", "label"))
+_CONCLUSION = (("github", "event", "workflow_run", "conclusion"),)
+_WHERE = {FORK_PR: "where the pull request comes from", FORK_RUN: "where the triggering run comes from"}
+_WHAT = {FORK_PR: "a pull request", FORK_RUN: "a run"}
+
+
+def _fork_if_note(node: Node | None, subject: str, profile: str) -> str:
+    """Why the ``if:`` of ``node`` (named ``subject``) doesn't keep forks out, if it looks like
+    it means to: an ``author_association`` deny-list, a label, the triggering run's conclusion,
+    or a check of the head repository or author that is still true for a fork."""
+    text = _if_text(node)
+    if not text:
+        return ""
+    try:
+        passing = lets_in(text, profile)
+    except ExpressionError:
+        return ""
+    if not passing:
+        return ""
+    paths = _if_paths(node)
+    if profile == FORK_PR and _mentions(paths, (PR_ASSOCIATION,)):
+        return f" ({subject} looks at who opened the pull request but still lets {_who(passing)})"
+    if profile == FORK_PR and _mentions(paths, _LABELS):
+        return (
+            f" ({subject} checks a label, which stays on the pull request when the fork pushes new commits)"
+        )
+    if _mentions(paths, _FORK_PATHS[profile]):
+        return f" ({subject} looks at {_WHERE[profile]} but is still true for {_WHAT[profile]} from a fork)"
+    if profile == FORK_RUN and _mentions(paths, _CONCLUSION):
+        return f" ({subject} only checks how the triggering run ended, not whose code it ran)"
+    return ""
+
+
+def _fork_note(wf: Workflow, step: Step, profile: str) -> str:
+    """Why the guards around ``step`` don't keep forks out: a weak ``if:`` (the step's, the
+    job's, a needed job's), or a needed job that does but this job runs anyway (``always()``)."""
+    jobs = dict(wf.jobs())
+    job = jobs.get(step.job_id)
+    for node, subject in ((step.node, "its 'if:'"), (job, "the job's 'if:'")):
+        if note := _fork_if_note(node, subject, profile):
+            return note
+    results = {name: "skipped" for name in _needs(job) if _job_keeps_forks_out(wf, name, profile)}
+    if results and (functions := _runs_anyway(job, results, wf, profile)):
+        return (
+            f" (job '{next(iter(results))}', which it needs, keeps forks out, but this job's 'if:' uses"
+            f" {_function_words(functions)}, so it runs anyway)"
+        )
+    for name in _needed_jobs(wf, step.job_id):
+        if note := _fork_if_note(jobs[name], f"the 'if:' of job '{name}', which it needs,", profile):
+            return note
+        guards = [n for n in _needs(jobs[name]) if _job_keeps_forks_out(wf, n, profile)]
+        if guards and (functions := _runs_anyway(jobs[name], dict.fromkeys(guards, "skipped"), wf, profile)):
+            return (
+                f" (job '{name}', which it needs, runs past job '{guards[0]}', which keeps forks out:"
+                f" its 'if:' uses {_function_words(functions)})"
+            )
+    return ""
+
+
 def _fork_guarded(wf: Workflow, step: Step, profile: str) -> bool:
     """The step never runs for a fork (its ``if:``, its job's, or a needed job's)."""
     return _keeps_forks_out(step.node, profile) or _job_keeps_forks_out(wf, step.job_id, profile)
@@ -402,7 +480,8 @@ def pull_request_target(wf: Workflow) -> Iterator[Finding]:
                     "WG005",
                     Severity.HIGH,
                     "checks out the pull request's code under 'pull_request_target', which runs"
-                    " with secrets and a write token; a fork's PR can then run its own code",
+                    f" with secrets and a write token{_fork_note(wf, step, FORK_PR)}; a fork's PR can"
+                    " then run its own code",
                 )
     if not risky:
         node = key_node(wf.root, "on") or wf.root
@@ -594,8 +673,8 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
                     "WG009",
                     Severity.HIGH,
                     "checks out the triggering run's code with git or gh in a script, under"
-                    f" 'workflow_run', which runs with secrets and a write token; {why}, and its"
-                    " code then runs here",
+                    " 'workflow_run', which runs with secrets and a write token"
+                    f"{_fork_note(wf, step, FORK_RUN)}; {why}, and its code then runs here",
                 )
                 continue
             if (step.uses or "").startswith("actions/checkout@"):
@@ -608,7 +687,8 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
                         "WG009",
                         Severity.HIGH,
                         "checks out the triggering run's code under 'workflow_run', which runs with"
-                        f" secrets and a write token; {why}, and its code then runs here",
+                        f" secrets and a write token{_fork_note(wf, step, FORK_RUN)}; {why}, and its"
+                        " code then runs here",
                     )
                 continue
             if (into_workspace := _artifact_download(step)) is None:
@@ -622,7 +702,8 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
                     Severity.HIGH,
                     "unpacks the triggering run's artifacts into the workspace, where they can"
                     " replace the repository's scripts and config, and the step at line"
-                    f" {later.node.start_mark.line + 1} runs commands there with secrets; {why}."
+                    f" {later.node.start_mark.line + 1} runs commands there with secrets; {why}"
+                    f"{_fork_note(wf, step, FORK_RUN)}."
                     " Download to ${{ runner.temp }} instead and treat the files as data",
                 )
             else:
@@ -631,7 +712,8 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
                     step.node,
                     "WG009",
                     Severity.MEDIUM,
-                    f"downloads the triggering run's artifacts under 'workflow_run'; {why}."
+                    f"downloads the triggering run's artifacts under 'workflow_run'; {why}"
+                    f"{_fork_note(wf, step, FORK_RUN)}."
                     " Treat their contents as untrusted data: don't run or source them, and don't"
                     " paste them into scripts or $GITHUB_ENV",
                 )

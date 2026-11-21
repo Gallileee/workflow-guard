@@ -4,7 +4,33 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.33.0 — WG005 and WG009: guards against forks
+## v0.34.0 — WG005 and WG009: why a guard doesn't hold
+
+### The message names the weak guard
+
+v0.33.0 made WG005 and WG009 skip steps that a fork can't reach. When there is a guard that
+doesn't hold, the message now says why, as WG010 does:
+
+```
+wf.yml:21:9: WG005 [high] checks out the pull request's code under 'pull_request_target', which
+runs with secrets and a write token (the job's 'if:' checks a label, which stays on the pull
+request when the fork pushes new commits); a fork's PR can then run its own code
+```
+
+- `author_association != 'NONE'` and other deny-lists: who they still let in.
+- A label (`github.event.pull_request.labels`, `github.event.label`): it stays on the pull
+  request when the fork pushes new commits.
+- `github.event.workflow_run.conclusion == 'success'` alone: it says how the triggering run
+  ended, not whose code it ran.
+- A check of the head repository or author that is still true for a fork
+  (`head.repo.full_name != github.repository`, `workflow_run.event == 'pull_request'`).
+- `always()` (or `!cancelled()`...) that runs the job, or a job it needs, past a guard job.
+
+The step's, the job's and the needed jobs' `if:` are looked at, nearest first. On the public
+`pull_request_target`/`workflow_run` workflows, 76 of the 145 findings get a note; the number
+of findings doesn't change.
+
+## v0.33.0 — WG005 and WG009: guards against forks (2026-11-21)
 
 ### An `if:` that keeps forks out guards the checkout
 
