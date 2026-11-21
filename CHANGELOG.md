@@ -4,7 +4,49 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.32.0 — WG010: github-script checks run on paper
+## v0.33.0 — WG005 and WG009: guards against forks
+
+### An `if:` that keeps forks out guards the checkout
+
+WG005 (`pull_request_target`) and WG009 (`workflow_run`) didn't read `if:`. A checkout of the
+pull request's code was high even in a job that only runs for the repository's own branches:
+
+```yaml
+jobs:
+  preview:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+```
+
+Now the step's, the job's and the needed jobs' `if:` are evaluated for a fork (the same
+evaluator as WG010's, with the fork as the stranger). A guard is anything that is false for a
+fork's pull request or run:
+
+- the head repository: `head.repo.full_name == github.repository`, `!head.repo.fork`,
+  `head.repo.owner.login == github.repository_owner`, and for `workflow_run`
+  `head_repository.full_name == github.repository`;
+- the author: `contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+  github.event.pull_request.author_association)`, `github.actor == 'renovate[bot]'`;
+- the trigger: `github.event_name == 'push'` in a workflow with more triggers, and
+  `github.event.workflow_run.event == 'push'` (a fork's run is a `pull_request` run).
+
+A deny-list (`author_association != 'NONE'`), a label check (the label stays when the fork
+pushes again) or `workflow_run.conclusion == 'success'` is no guard. A job that needs a guard job
+is guarded unless its own `if:` runs it anyway (`always()`, `!cancelled()`). The low reminder
+for `pull_request_target` goes when every job keeps forks out.
+
+On 141 public `pull_request_target` and `workflow_run` workflows: 182 findings -> 145, with
+nothing new but one reminder (in a workflow whose only checkout is now guarded).
+
+### `github.repository_owner` for comments
+
+For WG010 too, `github.repository_owner` and `github.repository` are the repository's own
+names: `github.actor == github.repository_owner` keeps a commenter who isn't the owner out.
+
+## v0.32.0 — WG010: github-script checks run on paper (2026-11-21)
 
 ### `actions/github-script` is followed, not guessed
 

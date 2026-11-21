@@ -19,6 +19,9 @@ from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 from . import jscript
 from .conditions import (
     ASSOCIATION,
+    COMMENT,
+    FORK_PR,
+    FORK_RUN,
     NO_ANSWERS,
     UNKNOWN,
     UNTRUSTED_ASSOCIATIONS,
@@ -351,12 +354,46 @@ def _checks_out_pr_code(ref: str) -> bool:
     )
 
 
+def _keeps_forks_out(node: Node | None, profile: str) -> bool:
+    """The ``if:`` of ``node`` is false for a fork's pull request (``conditions.FORK_PR``) or
+    its run (``FORK_RUN``): it checks the head repository, its author or the trigger."""
+    text = _if_text(node)
+    if not text:
+        return False
+    try:
+        return not lets_in(text, profile)
+    except ExpressionError:
+        return False
+
+
+def _job_keeps_forks_out(wf: Workflow, job_id: str, profile: str, seen: frozenset[str] = frozenset()) -> bool:
+    """The job never runs for a fork: its ``if:`` keeps forks out, or a job it needs does (and
+    this job's ``if:`` doesn't run it anyway with ``always()`` and the like)."""
+    job = dict(wf.jobs()).get(job_id)
+    if job is None or job_id in seen:
+        return False
+    if _keeps_forks_out(job, profile):
+        return True
+    results = {
+        name: "skipped" for name in _needs(job) if _job_keeps_forks_out(wf, name, profile, seen | {job_id})
+    }
+    return bool(results) and not _runs_anyway(job, results, wf, profile)
+
+
+def _fork_guarded(wf: Workflow, step: Step, profile: str) -> bool:
+    """The step never runs for a fork (its ``if:``, its job's, or a needed job's)."""
+    return _keeps_forks_out(step.node, profile) or _job_keeps_forks_out(wf, step.job_id, profile)
+
+
 def pull_request_target(wf: Workflow) -> Iterator[Finding]:
     if "pull_request_target" not in wf.triggers():
         return
+    jobs = [job_id for job_id, _ in wf.jobs()]
+    if jobs and all(_job_keeps_forks_out(wf, job_id, FORK_PR) for job_id in jobs):
+        return  # nothing runs for a fork's pull request
     risky = False
     for step in wf.steps():
-        if (step.uses or "").startswith("actions/checkout@"):
+        if (step.uses or "").startswith("actions/checkout@") and not _fork_guarded(wf, step, FORK_PR):
             if _checks_out_pr_code(step.with_value("ref") or ""):
                 risky = True
                 yield _at(
@@ -544,6 +581,8 @@ def workflow_run(wf: Workflow) -> Iterator[Finding]:
     for job_id, job_steps in groupby(wf.steps(), key=lambda step: step.job_id):
         steps = list(job_steps)
         for i, step in enumerate(steps):
+            if _fork_guarded(wf, step, FORK_RUN):
+                continue
             scopes = (wf.root, jobs.get(job_id), step.node)
             run = scalar(get(step.node, "run"))
             if run is not None and _script_checks_out_run(
@@ -1267,7 +1306,10 @@ def _needed_answer_gate(wf: Workflow, job: Node | None, name: str) -> tuple[bool
 
 
 def _runs_anyway(
-    node: Node | None, results: dict[str, str] | None = None, wf: Workflow | None = None
+    node: Node | None,
+    results: dict[str, str] | None = None,
+    wf: Workflow | None = None,
+    profile: str = COMMENT,
 ) -> tuple[str, ...]:
     """The status functions (``always``, ``failure``...) through which the ``if:`` of ``node``
     may still be true for a commenter who can't write: for a step, after an earlier step failed
@@ -1293,7 +1335,7 @@ def _runs_anyway(
             status[("needs", name.lower(), "result")] = result
             if result == "skipped":  # a skipped job sets no outputs
                 status.update({path: "" for path in _output_paths(node, name)})
-    return functions if may_pass(text, lambda path: status.get(path, UNKNOWN)) else ()
+    return functions if may_pass(text, lambda path: status.get(path, UNKNOWN), profile) else ()
 
 
 def _failure_after(wf: Workflow, job: Node | None, results: dict[str, str]) -> object:

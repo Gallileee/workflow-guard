@@ -1,5 +1,47 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "Stavové funkce WG005/9"): fork guards in WG005/WG009
+
+Why: next step 3 (picked over step 2). WG005 and WG009 didn't read `if:` at all: a checkout of
+a pull request's code guarded by `head.repo.full_name == github.repository` was still high.
+
+Acceptance criteria:
+- `conditions.py`: profiles for the stranger (`COMMENT`, `FORK_PR`, `FORK_RUN`) in
+  `_stranger_lookup`; `lets_in`, `may_pass` and `_for_strangers` take the profile. A fork's
+  head repository/owner/author are a stranger, `fork` is true, `github.repository`,
+  `repository_owner`, the base repository are the owners' (`OWNERS_LIST`), PR
+  `author_association` per association, `workflow_run.event` is `pull_request`,
+  `github.event_name` the trigger. Labels stay unknown.
+- `rules.py`: `_keeps_forks_out`, `_job_keeps_forks_out` (own `if:`, or needed jobs that keep
+  forks out unless `_runs_anyway(..., profile)`), `_fork_guarded`; WG005 skips guarded
+  checkouts and drops the reminder when every job is guarded; WG009 skips guarded steps.
+- No change for WG010 except `github.repository_owner`/`github.repository` being the owners'
+  for comments too (found by a mutant: `github.actor == github.repository_owner` is a check).
+
+Done:
+- `conditions.py`, `rules.py` as above; `_runs_anyway` has a `profile`.
+- Tests: `test_fork_guards.py` (45); 1137 in total.
+- README (WG005/WG009 rows, How it works), CHANGELOG v0.33.0, version 0.33.0, v0.32.0 heading
+  dated.
+
+What the corpora showed: a new corpus of 141 public `pull_request_target`/`workflow_run`
+workflows (code search: `head.repo.full_name`, `pull_request.head.sha`, `head_repository`,
+`workflow_run.head_sha`, `author_association` with a checkout; in the session scratchpad, not
+committed). WG005/WG009 findings 182 -> 145 (WG005 high 73 -> 68, low 32 -> 31, WG009 high 57 ->
+37, medium 20 -> 9); one reminder added where the only checkout is now guarded. Sampled
+removals: `workflow_run.event == 'push'`, `head_repository.full_name == github.repository`,
+`author_association` allow-lists, a step guard on `head.repo.full_name`. Comment corpora: 20
+and 17, as before.
+
+Verified locally:
+- `pytest -q -W error`: 1137 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.33.0, 0 errors (warning: v0.33.0 not tagged yet).
+- All three corpora run with all rules without errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 17 mutants (profile entries, event name, common values, guards in WG005
+  and WG009, needed jobs, running anyway with the fork's profile), all killed (two after adding
+  tests; one of them made `_COMMON` apply to comments too).
+
 ## 2026-11-21 (interactive, user picked "github-script kontroly"): github-script on paper
 
 Why: next step 2. `actions/github-script` permission checks were judged from their text
@@ -1296,12 +1338,12 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.32.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+1. Tag `v0.33.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
 2. `jscript.py`: arrow functions in `.some()`/`.every()`/`.find()` callbacks and `for...of`
    (the common reasons the 12 github-scripts fall back), and `require()`d helper scripts of the
    repository (read the file when it's in the checked repository).
-3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
-   look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
+3. WG005/WG009 messages: name a weak guard (a deny-list of `author_association`, a label check)
+   the way WG010 does, and the `always()` that runs a job past its guard job.
 4. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
    input (5 of the 16 bash fallbacks).
 5. The Marketplace listing (needs the owner: it's a public listing under their account).
