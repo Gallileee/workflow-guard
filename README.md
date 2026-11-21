@@ -328,7 +328,11 @@ be read or parsed, or bad arguments.
   `github.event.workflow_run.event` is `pull_request` and `github.event_name` the trigger.
   A label check (`contains(github.event.pull_request.labels.*.name, 'safe to test')`) isn't a
   guard: the label stays when the fork pushes new commits. A job that needs a guard job is
-  guarded too, unless its `if:` runs it anyway (`always()`, as for WG010).
+  guarded too, unless its `if:` runs it anyway (`always()`, as for WG010). When a guard is there
+  but doesn't hold, the message says why (`_fork_note`): an `author_association` deny-list (and
+  who it still lets in), a label, only the triggering run's `conclusion`, a check of the head
+  repository or author that is still true for a fork, or an `always()` that runs the job (or a
+  job it needs) past its guard job.
 - WG010 knows that a check with its own `if:` may be **skipped** (`_Stop.sure` in `rules.py`):
   unless that `if:` is true for every stranger, it covers only later steps whose `if:` contains
   every part of it (`a && b` covers `a && b && c`, not `a` or `a || b`). The same goes for a

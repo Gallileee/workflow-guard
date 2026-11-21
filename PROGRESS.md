@@ -1,5 +1,39 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "Zprávy WG005/9"): why a fork guard doesn't hold
+
+Why: next step 3. v0.33.0 skips steps a fork can't reach, but a guard that doesn't hold was
+reported without a word about it; WG010 names its weak checks.
+
+Acceptance criteria:
+- `_fork_if_note`: for an `if:` that may still be true for a fork: an `author_association`
+  deny-list (who it lets in, `_who`), a label, only `workflow_run.conclusion`, or a head
+  repository/author/event check still true for a fork; nothing for an `if:` that doesn't look.
+- `_fork_note`: the step's, then the job's `if:`, an `always()` past a needed guard job, then the
+  needed jobs' `if:` (nearest first), and a needed job that runs past its own guard job.
+- Notes go into every WG005 high and WG009 message; the findings themselves don't change.
+
+Done:
+- `rules.py`: `_FORK_PATHS`, `_LABELS`, `_CONCLUSION`, `_fork_if_note`, `_fork_note`; WG005
+  and WG009 messages.
+- Tests: 11 more in `test_fork_guards.py`; 1148 in total.
+- README (How it works), CHANGELOG v0.34.0, version 0.34.0, v0.33.0 heading dated.
+
+What the corpora showed: 76 of the 145 WG005/WG009 findings in the fork corpus get a note:
+37 only the triggering run's conclusion, 18 a label, 19 a head/event check still true for a
+fork, 2 an `author_association` deny-list (8 of the 76 from a needed job's `if:`). Finding
+counts (475, 170, and the fork corpus) unchanged from main.
+
+Verified locally:
+- `pytest -q -W error`: 1148 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.34.0, 0 errors (warning: v0.34.0 not tagged yet).
+- All three corpora: same finding counts as main, no errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 12 mutants; 11 killed (one after adding a test that also led to the
+  "runs past job" note for a needed job), one equivalent in context (the `if not passing`
+  check in `_fork_if_note`: a needed job that keeps forks out is reached only after an
+  `always()` note or when the step is guarded anyway; kept so the function stands alone).
+
 ## 2026-11-21 (interactive, user picked "Stavové funkce WG005/9"): fork guards in WG005/WG009
 
 Why: next step 3 (picked over step 2). WG005 and WG009 didn't read `if:` at all: a checkout of
@@ -1338,12 +1372,13 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.33.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+1. Tag `v0.34.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
 2. `jscript.py`: arrow functions in `.some()`/`.every()`/`.find()` callbacks and `for...of`
    (the common reasons the 12 github-scripts fall back), and `require()`d helper scripts of the
    repository (read the file when it's in the checked repository).
-3. WG005/WG009 messages: name a weak guard (a deny-list of `author_association`, a label check)
-   the way WG010 does, and the `always()` that runs a job past its guard job.
-4. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
+3. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
    input (5 of the 16 bash fallbacks).
+4. WG005: a label gate with a step that removes the label (`labeled` + `actions-ecosystem/
+   action-remove-labels` before the checkout) as a recognised pattern, with a note on the
+   remaining race.
 5. The Marketplace listing (needs the owner: it's a public listing under their account).
