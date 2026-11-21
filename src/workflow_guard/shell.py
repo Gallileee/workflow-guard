@@ -31,6 +31,11 @@ The permission API is known too, when it asks about the commenter (a stranger's 
 (maybe after gh's error text); without ``--jq``/``jq`` the answer is JSON, equal to no word.
 ``gh api ... | grep -q PATTERN`` is followed the same way. ``api_fails`` tells whether such a
 script exits for a stranger, and None when no such call was followed.
+
+``script_outputs`` gives what a script that succeeds writes to ``$GITHUB_OUTPUT`` on each path
+(``echo "name=value" >> "$GITHUB_OUTPUT"``, ``printf 'name=%s\n' "$x" >> ...``, or ``echo`` in a
+``{ ...; } >> "$GITHUB_OUTPUT"`` group): the step's outputs. Any other mention of
+``$GITHUB_OUTPUT`` (``tee``, a copy in a variable, a multiline value) makes them unknown.
 """
 
 from __future__ import annotations
@@ -69,6 +74,11 @@ _JQ_FIELD = re.compile(
 _ANY_JQ = re.compile(r"(?:--jq|-q)(?:\s|=)|\|\s*jq\b")
 _FALLBACK = re.compile(r"\|\|\s*(?:echo\s+['\"]?([\w-]*)['\"]?|(true|:))\s*$")
 _API_SEEN: ContextVar[bool] = ContextVar("api_seen", default=False)
+_PASSED: ContextVar[list | None] = ContextVar("passed", default=None)  # envs where the script succeeds
+_OUTPUT_FILE = re.compile(r"\$\{?GITHUB_OUTPUT\}?")
+_OUT = "\0out:"  # an output the script wrote: _OUT + name
+_OUT_UNKNOWN = "\0out?"  # a write the evaluator couldn't read
+_TO_OUTPUT = "\0to_output"  # inside a { ...; } >> "$GITHUB_OUTPUT" group
 
 
 @dataclass(frozen=True)
@@ -97,20 +107,51 @@ def api_fails(script: str, variables: Mapping[str, object]) -> bool | None:
     return result[0] if result is not None and result[1] else None
 
 
-def _analyse(script: str, variables: Mapping[str, object]) -> tuple[bool, bool] | None:
-    """(fails on every path, a permission API call was followed), or None if unsupported."""
-    token = _API_SEEN.set(False)
+def script_outputs(script: str, variables: Mapping[str, object]) -> list[dict[str, object]] | None:
+    """The outputs the script writes on each path where it succeeds (name -> a string,
+    ``STRANGER`` or ``UNKNOWN``; an output it doesn't write is empty), or None if the evaluator
+    doesn't follow the script or a write to ``$GITHUB_OUTPUT``. An empty list: it never
+    succeeds."""
+    passed: list[Env] = []
+    if _analyse(script, variables, passed) is None:
+        return None
+    maps: list[dict[str, object]] = []
+    for env in passed:
+        if env.get(_OUT_UNKNOWN):
+            return None
+        written = {key[len(_OUT) :]: value for key, value in env.items() if key.startswith(_OUT)}
+        if written not in maps:
+            maps.append(written)
+    return maps
+
+
+def _analyse(
+    script: str, variables: Mapping[str, object], passed: list | None = None
+) -> tuple[bool, bool] | None:
+    """(fails on every path, a permission API call was followed), or None if unsupported.
+    ``passed`` collects the variables on every path where the script succeeds."""
+    token, passed_token = _API_SEEN.set(False), _PASSED.set(passed)
     try:
         text, subs = _prepare(script)
-        tree = _Parser(_tokens(text)).program()
+        tokens = _tokens(text)
+        parser = _Parser(tokens)
+        tree = parser.program()
         # GitHub runs the script file without arguments: $1... are empty.
         env: dict[str, object] = {**dict.fromkeys(_POSITIONAL, ""), **variables, **subs, _ERREXIT: True}
+        mentions = sum("GITHUB_OUTPUT" in t for t in tokens) + sum(
+            "GITHUB_OUTPUT" in s.inner for s in subs.values()
+        )
+        if mentions != parser.output_targets:
+            env[_OUT_UNKNOWN] = True  # written some other way: tee, a copy in a variable...
         ends, paths = _run_seq(tree, [env])
+        if passed is not None:
+            passed += paths
         return not paths and ends == {FAIL}, _API_SEEN.get()
     except Unsupported:
         return None
     finally:
         _API_SEEN.reset(token)
+        _PASSED.reset(passed_token)
 
 
 # --- reading the script ------------------------------------------------------------------------
@@ -214,6 +255,7 @@ def _tokens(text: str) -> list[str]:
 @dataclass
 class _Simple:
     words: list[str]
+    output: bool = False  # redirected to $GITHUB_OUTPUT
 
 
 @dataclass
@@ -231,6 +273,7 @@ class _Case:
 @dataclass
 class _Group:
     body: list
+    output: bool = False  # `{ ...; } >> "$GITHUB_OUTPUT"`
 
 
 @dataclass
@@ -265,6 +308,7 @@ class _Parser:
     def __init__(self, tokens: list[str]) -> None:
         self.tokens = tokens
         self.i = 0
+        self.output_targets = 0  # redirections to $GITHUB_OUTPUT it understood
 
     def peek(self) -> str | None:
         return self.tokens[self.i] if self.i < len(self.tokens) else None
@@ -326,7 +370,11 @@ class _Parser:
         compound = {"if": self.if_, "case": self.case, "[[": self.double_test, "{": self.group}
         if token in compound:
             node = compound[token]()
-            self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`
+            output = self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`
+            if output and isinstance(node, _Group):
+                node.output = True
+            elif output:
+                self.output_targets -= 1  # `fi >> "$GITHUB_OUTPUT"`: not followed
             return node
         if token == "function":
             self.i += 1
@@ -342,17 +390,28 @@ class _Parser:
             return self.define(name)
         return self.simple()
 
-    def redirections(self) -> None:
-        """Skips redirections after a compound command (their target is only written)."""
+    def redirections(self) -> bool:
+        """Skips redirections after a compound command; True if one goes to $GITHUB_OUTPUT."""
+        output = False
         while self.peek() in (">", ">>") or (
             self.peek() not in (None, *_OPS) and self.tokens[self.i + 1 : self.i + 2] in ([">"], [">>"])
         ):
             if self.peek() not in (">", ">>"):
                 self.i += 1  # a file descriptor: 2>
+            output |= self.target()
+        return output
+
+    def target(self) -> bool:
+        """Takes a redirection (the operator and its target); True if the target is
+        $GITHUB_OUTPUT."""
+        self.i += 1
+        if self.peek() == "&":
             self.i += 1
-            if self.peek() == "&":
-                self.i += 1
-            self.take()
+        target = self.take()
+        if _OUTPUT_FILE.fullmatch(target):
+            self.output_targets += 1
+            return True
+        return False
 
     def group(self) -> _Group:
         self.take("{")
@@ -370,23 +429,25 @@ class _Parser:
 
     def simple(self) -> _Simple:
         words: list[str] = []
+        output = False
         while (token := self.peek()) is not None and token not in _OPS:
-            words.append(token)
             self.i += 1
-            if self.peek() in ("<", ">", ">>"):  # a redirection: skip it and its target
-                self.i += 1
-                if self.peek() == "&":
-                    self.i += 1
-                self.take()
+            if token.isdigit() and self.peek() in ("<", ">", ">>"):
+                pass  # a file descriptor: 2>&1
+            else:
+                words.append(token)
+            if self.peek() in ("<", ">", ">>"):  # a redirection: its target is no argument
+                output |= self.target()
         if self.peek() in ("<", ">", ">>") and not words:
-            self.i += 1
-            self.take()
-            return self.simple()
+            output |= self.target()
+            node = self.simple()
+            node.output |= output
+            return node
         if self.peek() == "(":
             raise Unsupported("( after a word")
         if not words:
             raise Unsupported(f"unexpected {self.peek()!r}")
-        return _Simple(words)
+        return _Simple(words, output)
 
     def double_test(self) -> _Simple:
         """``[[ ... ]]``: operators inside it are part of the test."""
@@ -694,9 +755,17 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
         return set(), [(True, True, env)]
     if name == "exit":
         code = _value(args[0], env) if args else UNKNOWN
-        if isinstance(code, str) and code.lstrip("-").isdigit():
-            return {FAIL if int(code) % 256 else PASS}, []
-        return {FAIL, PASS}, []
+        ends = (
+            {FAIL if int(code) % 256 else PASS}
+            if isinstance(code, str) and code.lstrip("-").isdigit()
+            else {FAIL, PASS}
+        )
+        passed = _PASSED.get()
+        if PASS in ends and passed is not None:
+            passed.append(env)
+        return ends, []
+    if name in ("echo", "printf") and (command.output or env.get(_TO_OUTPUT)):
+        return set(), [(True, True, _write(name, args, env))]
     if name in ("true", ":", "echo", "printf"):
         return set(), [(True, True, env)]
     if name == "false":
@@ -718,6 +787,36 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
     if name == "[[":
         return set(), _status(_Test(args[:-1], env, glob=True).run(), env)
     return set(), _both(env, True)
+
+
+def _write(name: str, args: list[str], env: Env) -> Env:
+    """``echo``/``printf`` to $GITHUB_OUTPUT: one ``name=value`` line becomes an output; anything
+    else (several lines, ``name<<EOF``, a format it doesn't follow) makes the outputs unknown."""
+    env = dict(env)
+    if name == "echo":
+        words = list(args)
+        while words and re.fullmatch(r"-[neE]+", words[0]):
+            words.pop(0)
+        line = " ".join(words)
+    else:
+        fmt, rest = (args[0], args[1:]) if args else ("", [])
+        named = re.fullmatch(r"([A-Za-z_][\w-]*)=%s(?:\\n)?", fmt)
+        if named and len(rest) == 1:
+            line = f"{named.group(1)}={rest[0]}"
+        elif fmt in ("%s", "%s\\n") and len(rest) == 1:
+            line = rest[0]
+        elif "%" not in fmt and not rest:
+            line = fmt.removesuffix("\\n")
+        else:
+            env[_OUT_UNKNOWN] = True
+            return env
+    assign = re.fullmatch(r"([A-Za-z_][\w-]*)=(.*)", line, re.DOTALL)
+    if assign is None or "\n" in line or "\\n" in line:
+        if line.strip():
+            env[_OUT_UNKNOWN] = True
+        return env
+    env[_OUT + assign.group(1)] = _value(assign.group(2), env)
+    return env
 
 
 def _call(function: _Function, args: list[str], env: Env) -> tuple[set[str], list[Result]]:
@@ -770,7 +869,12 @@ def _command(command: object, env: Env) -> tuple[set[str], list[Result]]:
     if isinstance(command, _Case):
         return _case(command, env)
     if isinstance(command, _Group):
-        ends, results = _seq_status(command.body, env)
+        inner = {**env, _TO_OUTPUT: True} if command.output else env
+        ends, results = _seq_status(command.body, inner)
+        if command.output:
+            results = [
+                (status, last, {**after, _TO_OUTPUT: env.get(_TO_OUTPUT)}) for status, last, after in results
+            ]
         return ends, [(status, last and _RETURNED not in after, after) for status, last, after in results]
     if isinstance(command, _Define):
         return set(), [(True, True, {**env, _FUNCTION + command.name: _Function(command.body)})]

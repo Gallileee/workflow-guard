@@ -354,8 +354,13 @@ def _normalize(value: object) -> object:
     return UNKNOWN
 
 
-def evaluate(node: Node, lookup: Callable[[tuple[str, ...]], object]) -> object:
-    """The value of ``node``; context values come from ``lookup``."""
+def evaluate(node: Node, lookup: Callable[[tuple[str, ...]], object], as_value: bool = False) -> object:
+    """The value of ``node``; context values come from ``lookup``.
+
+    ``a || b`` is ``a`` if it's truthy, else ``b`` (and ``&&`` the other way round). With ``a``
+    unknown and ``b`` truthy, ``a || b`` is certainly truthy but its value is unknown (``a`` or
+    ``b``): as a condition (``as_value`` False) the result is True, as a value (compared, passed
+    to a function, put into text) it is UNKNOWN."""
     if node.kind == "literal":
         return node.value
     if node.kind == "path":
@@ -364,21 +369,22 @@ def evaluate(node: Node, lookup: Callable[[tuple[str, ...]], object]) -> object:
         value = truthy(evaluate(node.children[0], lookup))
         return value if value is UNKNOWN else not value
     if node.kind in ("and", "or"):
-        left = evaluate(node.children[0], lookup)
+        left = evaluate(node.children[0], lookup, as_value)
         decided = truthy(left)
         stop = False if node.kind == "and" else True
         if decided is stop:
             return left
-        right = evaluate(node.children[1], lookup)
+        right = evaluate(node.children[1], lookup, as_value)
         if decided is not UNKNOWN:
             return right
-        # The left side is unknown: the result is known only if the right side decides it.
-        return stop if truthy(right) is stop else UNKNOWN
+        # The left side is unknown: the result is known only if the right side decides it, and
+        # then only as a condition.
+        return stop if truthy(right) is stop and not as_value else UNKNOWN
     if node.kind == "compare":
-        a, b = (evaluate(child, lookup) for child in node.children)
+        a, b = (evaluate(child, lookup, as_value=True) for child in node.children)
         return _compare(node.value, a, b)
     if node.kind == "call":
-        args = [evaluate(child, lookup) for child in node.children]
+        args = [evaluate(child, lookup, as_value=True) for child in node.children]
         name = node.value
         if name == "contains" and len(args) == 2:
             return _contains(*args)
@@ -465,7 +471,7 @@ def must_pass(condition: str, lookup: Callable[[tuple[str, ...]], object]) -> bo
 
 def text_value(expression: str, lookup: Callable[[tuple[str, ...]], object]) -> object:
     """The text ``${{ expression }}`` puts in its place, or UNKNOWN. Raises ``ExpressionError``."""
-    value = evaluate(parse(expression), lookup)
+    value = evaluate(parse(expression), lookup, as_value=True)
     if value is UNKNOWN or value is STRANGER or value is OWNERS_LIST:
         return UNKNOWN
     return _text(value)
@@ -480,7 +486,7 @@ def stranger_text(text: str, association: str) -> object:
     parts, pos = [], 0
     for expr in expressions:
         try:
-            value = evaluate(parse(expr.inner), lookup)
+            value = evaluate(parse(expr.inner), lookup, as_value=True)
         except ExpressionError:
             return UNKNOWN
         if (

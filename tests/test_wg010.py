@@ -1163,3 +1163,106 @@ def test_a_job_with_the_needed_checks_condition_is_covered(job_if):
 )
 def test_a_job_without_the_needed_checks_condition_is_open(job_if, output):
     assert len(wg010(needing_maybe(job_if, output))) == 1
+
+
+# --- a script that reports who commented through $GITHUB_OUTPUT ----------------------------------
+
+TRUST = (
+    "- id: trust",
+    "  run: |",
+    '    case "${{ github.event.comment.author_association }}" in',
+    '      OWNER|MEMBER|COLLABORATOR) echo "trusted=true" >> "$GITHUB_OUTPUT" ;;',
+    '      *) echo "trusted=false" >> "$GITHUB_OUTPUT" ;;',
+    "    esac",
+)
+
+
+@pytest.mark.parametrize(
+    "cond",
+    [
+        "steps.trust.outputs.trusted == 'true'",
+        "steps.trust.outputs.trusted != 'false'",
+        "${{ !contains(steps.trust.outputs.trusted, 'f') }}",
+    ],
+)
+def test_a_step_if_on_a_scripts_output_covers_that_step(cond):
+    assert wg010(on_comment(*TRUST, *CHECKOUT_PR, f"  if: {cond}")) == []
+
+
+def test_a_step_if_that_lets_the_scripts_no_through_is_named():
+    ((_, _, message),) = wg010(on_comment(*TRUST, *CHECKOUT_PR, "  if: steps.trust.outputs.trusted != 'yes'"))
+    assert (
+        "(the step at line 9 looks at who commented but doesn't fail on a no, and this step's 'if:'"
+        " is still true when it answers 'trusted=false')" in message
+    )
+
+
+def test_a_step_that_doesnt_read_the_scripts_output_is_named():
+    ((_, _, message),) = wg010(on_comment(*TRUST, *CHECKOUT_PR))
+    assert (
+        "(the step at line 9 looks at who commented but doesn't fail on a no,"
+        " and this step's 'if:' doesn't check" in message
+    )
+
+
+def test_an_exit_on_the_scripts_no_stops_the_job():
+    deny = ("- if: steps.trust.outputs.trusted != 'true'", "  run: exit 1")
+    assert wg010(on_comment(*TRUST, *deny, *CHECKOUT_PR)) == []
+
+
+def test_a_job_if_on_a_needed_scripts_output():
+    gate = "\n".join(f"      {line}" for line in TRUST)
+    text = on_comment(*CHECKOUT_PR, job_if="needs.gate.outputs.trusted == 'true'").replace(
+        "jobs:\n  test:\n",
+        "jobs:\n  gate:\n    runs-on: x\n    outputs:\n      trusted: ${{ steps.trust.outputs.trusted }}\n"
+        f"    steps:\n{gate}\n  test:\n    needs: gate\n",
+    )
+    assert wg010(text) == []
+    assert len(wg010(text.replace("== 'true'", "!= 'yes'"))) == 1
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # An output it can't work out.
+        '    echo "trusted=$(./check.sh)" >> "$GITHUB_OUTPUT"',
+        # Written some way it doesn't follow.
+        '    echo "trusted=false" | tee -a "$GITHUB_OUTPUT"',
+    ],
+)
+def test_a_script_output_it_cant_work_out_is_no_check(script):
+    step = ("- id: trust", "  run: |", '    A="${{ github.event.comment.author_association }}"', script)
+    assert len(wg010(on_comment(*step, *CHECKOUT_PR, "  if: steps.trust.outputs.trusted == 'true'"))) == 1
+
+
+def test_a_script_that_writes_the_api_answer():
+    step = (
+        "- id: perm",
+        "  run: |",
+        '    P=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$GITHUB_ACTOR/permission" --jq .permission)',
+        '    if [ "$P" = admin ]; then ok=yes; else ok=no; fi',
+        '    echo "ok=$ok" >> "$GITHUB_OUTPUT"',
+    )
+    assert wg010(on_comment(*step, *CHECKOUT_PR, "  if: steps.perm.outputs.ok == 'yes'")) == []
+    ((_, _, message),) = wg010(on_comment(*step, *CHECKOUT_PR, "  if: steps.perm.outputs.ok != 'false'"))
+    assert "asks for the commenter's permission but doesn't fail on a no" in message
+    assert "is still true when it answers 'ok=no')" in message
+
+
+def test_a_script_that_doesnt_look_at_the_commenter_is_no_answer():
+    step = ("- id: trust", "  run: echo trusted=false >> $GITHUB_OUTPUT")
+    ((_, _, message),) = wg010(on_comment(*step, *CHECKOUT_PR, "  if: steps.trust.outputs.trusted == 'true'"))
+    assert "looks at who commented" not in message
+
+
+def test_a_script_with_continue_on_error_is_no_answer():
+    text = on_comment(
+        *TRUST, "  continue-on-error: true", *CHECKOUT_PR, "  if: steps.trust.outputs.trusted == 'true'"
+    )
+    assert len(wg010(text)) == 1
+
+
+def test_a_script_that_writes_nothing_is_no_answer():
+    step = ("- id: hello", '  run: echo "hello ${{ github.actor }}"')
+    ((_, _, message),) = wg010(on_comment(*step, *CHECKOUT_PR))
+    assert "looks at who commented" not in message

@@ -2,8 +2,8 @@
 
 import pytest
 
-from workflow_guard.conditions import STRANGER, UNTRUSTED_ASSOCIATIONS
-from workflow_guard.shell import always_fails, api_fails
+from workflow_guard.conditions import STRANGER, UNKNOWN, UNTRUSTED_ASSOCIATIONS
+from workflow_guard.shell import always_fails, api_fails, script_outputs
 
 
 def fails(script: str, **variables: object) -> bool:
@@ -327,3 +327,73 @@ def test_more_functions(script, expected):
 
 def test_return_outside_a_function_is_not_followed():
     assert api(f"P=$({API} --jq .permission)\nreturn 1") is None
+
+
+# --- what a script writes to $GITHUB_OUTPUT ----------------------------------------------------
+
+
+def outputs(script: str, **variables: object):
+    return script_outputs(script, {"A": "NONE", "L": STRANGER, **variables})
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        (
+            'case "$A" in\n  OWNER|MEMBER) echo "trusted=true" >> $GITHUB_OUTPUT ;;\n'
+            '  *) echo "trusted=false" >> "$GITHUB_OUTPUT" ;;\nesac',
+            [{"trusted": "false"}],
+        ),
+        (
+            'if [ "$A" = OWNER ]; then ok=yes; else ok=no; fi\necho "ok=$ok" >> "${GITHUB_OUTPUT}"',
+            [{"ok": "no"}],
+        ),
+        (
+            '{\n  echo "a=1"\n  echo "b=$A"\n} >> "$GITHUB_OUTPUT"\necho c=3 >> $GITHUB_OUTPUT',
+            [{"a": "1", "b": "NONE", "c": "3"}],
+        ),
+        ("printf 'x=%s\\n' \"$A\" >> $GITHUB_OUTPUT", [{"x": "NONE"}]),
+        ("printf '%s\\n' \"x=$A\" >> $GITHUB_OUTPUT", [{"x": "NONE"}]),
+        ("printf 'x=1\\n' >> $GITHUB_OUTPUT", [{"x": "1"}]),
+        ('echo -n "x=1" >> $GITHUB_OUTPUT', [{"x": "1"}]),
+        ('echo "x=1" >> $GITHUB_OUTPUT 2>&1', [{"x": "1"}]),
+        ('echo "login=$L" >> $GITHUB_OUTPUT', [{"login": STRANGER}]),
+        ('echo "x=$(date)" >> $GITHUB_OUTPUT', [{"x": UNKNOWN}]),
+        # Each path where the script succeeds; `exit 0` ends one early.
+        (
+            '[ "$X" = y ] && { echo "go=1" >> "$GITHUB_OUTPUT"; exit 0; }\necho "go=0" >> "$GITHUB_OUTPUT"',
+            [{"go": "1"}, {"go": "0"}],
+        ),
+        ('[ "$A" = OWNER ] || exit 0\necho go=1 >> $GITHUB_OUTPUT', [{}]),
+        # A failing path writes nothing that counts.
+        ('[ "$A" = OWNER ] || exit 1\necho go=1 >> $GITHUB_OUTPUT', []),
+        # An empty line is fine; other output files don't count.
+        ('echo "" >> $GITHUB_OUTPUT\necho "x=1" >> "$GITHUB_STEP_SUMMARY"', [{}]),
+        # A function writing to the file.
+        ('report() { echo "ok=$1" >> "$GITHUB_OUTPUT"; }\nreport no', [{"ok": "no"}]),
+    ],
+)
+def test_script_outputs(script, expected):
+    assert outputs(script) == expected
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        'echo "x=1" | tee -a "$GITHUB_OUTPUT"',
+        'OUT=$GITHUB_OUTPUT\necho "x=1" >> "$OUT"',
+        'echo "x<<EOF" >> $GITHUB_OUTPUT',
+        'echo -e "a=1\\nb=2" >> $GITHUB_OUTPUT',
+        'echo "not an output" >> $GITHUB_OUTPUT',
+        "printf '%s=%s\\n' x 1 >> $GITHUB_OUTPUT",
+        'if true; then echo x=1; fi >> "$GITHUB_OUTPUT"',
+        'echo "x=$(cat $GITHUB_OUTPUT)"',
+        "for i in 1; do echo x=1 >> $GITHUB_OUTPUT; done",
+    ],
+)
+def test_script_outputs_it_cant_read(script):
+    assert outputs(script) is None
+
+
+def test_writes_in_a_group_stop_at_its_end():
+    assert outputs('{ echo "a=1"; } >> "$GITHUB_OUTPUT"\necho "b=2"') == [{"a": "1"}]
