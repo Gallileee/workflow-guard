@@ -40,6 +40,15 @@ The permission API is known too, when it asks about the commenter (a stranger's 
 ``gh api ... | grep -q PATTERN`` is followed the same way. ``api_fails`` tells whether such a
 script exits for a stranger, and None when no such call was followed.
 
+``P=$(f ...)``, where ``f`` is a function, runs ``f`` in a subshell (``set -e`` not inherited, its
+variables its own, ``exit`` not followed) and keeps what it prints: ``echo``, ``printf '%s'``, and
+a permission call about the commenter, which prints its answer on a line, or on a failure an
+error body (a 404's) or nothing. ``gh "$@"`` in a function is the call its caller wrote, so a
+wrapper (``gh_retry api .../permission``) is followed; a retried failure's body counts once.
+Output sent elsewhere (``>&2``, ``> file``) isn't printed; anything else a command may print
+(``2>&1`` included) makes the output unknown. An assignment's status is its command
+substitution's (``$((...))`` succeeds).
+
 ``script_outputs`` gives what a script that succeeds writes to ``$GITHUB_OUTPUT`` on each path
 (``echo "name=value" >> "$GITHUB_OUTPUT"``, ``printf 'name=%s\n' "$x" >> ...``, or ``echo`` in a
 ``{ ...; } >> "$GITHUB_OUTPUT"`` group): the step's outputs. Any other mention of
@@ -75,6 +84,14 @@ _DEPTH = "\0depth"  # how many function calls deep
 _LOCALS = "\0locals"  # names declared `local` in the current call
 _FUNCTION = "\0function:"
 _MAX_DEPTH = 8
+_STDOUT = "\0stdout"  # inside $(...): what the commands printed so far
+_SUBSHELL = "\0subshell"  # inside $(...)
+_ARGV = "\0argv"  # in a function: its arguments as written, and the values they read
+_ARGV_NAME = "__WG_ARGV"
+# What a failed `gh api` call prints: the error's JSON body (or nothing, when the request
+# never got an answer). A 404 is what a non-collaborator can get.
+_NOT_FOUND = '{"message":"Not Found","status":"404"}'
+_SILENT = {"true", ":", "false", "sleep", "cd", "mkdir", "rm", "touch", "chmod", "cp", "mv"}
 _POSITIONAL = tuple(str(i) for i in range(1, 10))
 _SEPARATORS = (";", "\n")
 _NAME = re.compile(r"\$(?:(\w+)|\{(\w+)\})")
@@ -199,15 +216,16 @@ def _close(text: str, start: int) -> int:
     raise Unsupported("unclosed $(")
 
 
-def _prepare(script: str) -> tuple[str, dict[str, _Sub]]:
+def _prepare(script: str, prefix: str = _COMMAND) -> tuple[str, dict[str, _Sub]]:
     """Joins ``\\`` continuations, drops comments, and replaces each command substitution
-    (``$(...)``, backticks, ``$((...))``) with a variable ``$__WG_CMD<n>`` holding its text."""
+    (``$(...)``, backticks, ``$((...))``) with a variable ``$__WG_CMD<n>`` (``prefix`` + n)
+    holding its text."""
     text = script.replace("\\\n", " ")
     out: list[str] = []
     subs: dict[str, _Sub] = {}
 
     def substitute(inner: str) -> None:
-        name = f"{_COMMAND}{len(subs)}"
+        name = f"{prefix}{len(subs)}"
         subs[name] = _Sub(inner.strip())
         out.append("${" + name + "}")
 
@@ -284,6 +302,17 @@ def _tokens(text: str) -> list[str]:
 class _Simple:
     words: list[str]
     output: bool = False  # redirected to $GITHUB_OUTPUT
+    quiet: bool = False  # its output goes elsewhere (`>&2`, `> file`)
+    merged: bool = False  # `2>&1`: what it writes to stderr is in its output
+
+
+@dataclass
+class _Redirected:
+    """A compound command whose output goes elsewhere, or with ``2>&1``."""
+
+    node: object
+    quiet: bool
+    merged: bool
 
 
 @dataclass
@@ -353,6 +382,7 @@ class _Parser:
         self.tokens = tokens
         self.i = 0
         self.output_targets = 0  # redirections to $GITHUB_OUTPUT it understood
+        self.last_redirect: tuple[str, bool, str] = ("", False, "")  # (operator, `&`, target)
 
     def peek(self) -> str | None:
         return self.tokens[self.i] if self.i < len(self.tokens) else None
@@ -424,12 +454,12 @@ class _Parser:
         }
         if token in compound:
             node = compound[token]()
-            output = self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`, `done < file`
+            output, quiet, merged = self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`
             if output and isinstance(node, (_Group, _For, _While)):
                 node.output = True
             elif output:
                 self.output_targets -= 1  # `fi >> "$GITHUB_OUTPUT"`: not followed
-            return node
+            return _Redirected(node, quiet, merged) if quiet or merged else node
         if token == "function":
             self.i += 1
             name = self.take()
@@ -444,25 +474,41 @@ class _Parser:
             return self.define(name)
         return self.simple()
 
-    def redirections(self) -> bool:
-        """Skips redirections after a compound command; True if one goes to $GITHUB_OUTPUT."""
-        output = False
+    def redirections(self) -> tuple[bool, bool, bool]:
+        """Skips redirections after a compound command: whether one goes to $GITHUB_OUTPUT,
+        whether its output goes elsewhere, and whether stderr joins its output."""
+        output = quiet = merged = False
         while self.peek() in ("<", ">", ">>") or (
             self.peek() not in (None, *_OPS)
             and self.tokens[self.i + 1 : self.i + 2] in (["<"], [">"], [">>"])
         ):
+            fd = None
             if self.peek() not in ("<", ">", ">>"):
-                self.i += 1  # a file descriptor: 2>
-            output |= self.target()
-        return output
+                fd = self.take()  # a file descriptor: 2>
+            to_output = self.target()
+            output |= to_output
+            quiet, merged = self.stdout(fd, to_output, quiet, merged)
+        return output, quiet, merged
+
+    def stdout(self, fd: str | None, to_output: bool, quiet: bool, merged: bool) -> tuple[bool, bool]:
+        """After the redirection just taken: whether stdout now goes elsewhere, and whether
+        stderr goes where stdout went (``2>&1`` before stdout is sent elsewhere)."""
+        op, dup, target = self.last_redirect
+        if op in (">", ">>") and fd in (None, "1") and not to_output and not (dup and target == "1"):
+            quiet = True
+        if op == ">" and dup and fd == "2" and target == "1" and not quiet:
+            merged = True
+        return quiet, merged
 
     def target(self) -> bool:
         """Takes a redirection (the operator and its target); True if the target is
         $GITHUB_OUTPUT."""
-        self.i += 1
-        if self.peek() == "&":
+        op = self.take()
+        dup = self.peek() == "&"
+        if dup:
             self.i += 1
         target = self.take()
+        self.last_redirect = (op, dup, target)
         if _OUTPUT_FILE.fullmatch(target):
             self.output_targets += 1
             return True
@@ -513,27 +559,33 @@ class _Parser:
 
     def simple(self) -> _Simple:
         words: list[str] = []
-        output = False
+        output = quiet = merged = False
         while (token := self.peek()) is not None and token not in _OPS:
             self.i += 1
+            fd = None
             if token.isdigit() and self.peek() in ("<", ">", ">>"):
-                pass  # a file descriptor: 2>&1
+                fd = token  # a file descriptor: 2>&1
             elif re.fullmatch(r"[A-Za-z_]\w*\+?=", token) and self.peek() == "(":
                 words.append(self.array_literal(token))
             else:
                 words.append(token)
             if self.peek() in ("<", ">", ">>"):  # a redirection: its target is no argument
-                output |= self.target()
+                to_output = self.target()
+                output |= to_output
+                quiet, merged = self.stdout(fd, to_output, quiet, merged)
         if self.peek() in ("<", ">", ">>") and not words:
-            output |= self.target()
+            to_output = self.target()
+            quiet, merged = self.stdout(None, to_output, quiet, merged)
             node = self.simple()
-            node.output |= output
+            node.output |= output | to_output
+            node.quiet |= quiet
+            node.merged |= merged
             return node
         if self.peek() == "(":
             raise Unsupported("( after a word")
         if not words:
             raise Unsupported(f"unexpected {self.peek()!r}")
-        return _Simple(words, output)
+        return _Simple(words, output, quiet, merged)
 
     def arithmetic(self) -> _Simple:
         """``(( expr ))``: its words, after ``((``."""
@@ -906,12 +958,23 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
         answers = _api_answers(sub.inner, env) if isinstance(sub, _Sub) else None
         if answers is not None:  # the assignment's status is the command's
             return set(), [(ok, True, {**env, name: output}) for ok, output in answers]
+        if isinstance(sub, _Sub) and whole is not None:
+            captured = _captured(name, whole.group(1) or whole.group(2), sub, env)
+            if captured is not None:
+                return set(), captured
     if all(_ASSIGNMENT.fullmatch(word) for word in words):
         env = dict(env)
         for word in words:
             name, value = _assignment(word, env)
             env[name] = value
-        return set(), [(True, True, env)]
+        # With a command substitution, the status is the command's: unknown ($((...)) succeeds).
+        commands = [
+            ref
+            for word in words
+            for ref in re.findall(r"\$\{(" + _COMMAND + r"\w*)\}", word)
+            if isinstance(env.get(ref), _Sub) and not env[ref].inner.startswith("(")  # type: ignore[union-attr]
+        ]
+        return set(), _both(env, True) if commands else [(True, True, env)]
     while len(words) > 1 and _ASSIGNMENT.fullmatch(words[0]):
         words = words[1:]  # `IFS=, read -r a b`: the assignment only lasts for the command
     name, args = words[0], words[1:]
@@ -946,6 +1009,8 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
             env[local] = _assignment(word, env)[1] if assign else ""
         return set(), [(True, True, env)]
     if name == "exit":
+        if env.get(_SUBSHELL):
+            raise Unsupported("exit in $(...)")
         code = _value(args[0], env) if args else UNKNOWN
         ends = (
             {FAIL if int(code) % 256 else PASS}
@@ -964,6 +1029,16 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
         if re.search(r"\+\+|--|(?<![=!<>])=(?!=)|[-+*/%]=", text):
             env = {**env, **dict.fromkeys(re.findall(r"[A-Za-z_]\w*", text), UNKNOWN)}
         return set(), _both(env, True)
+    if _STDOUT in env and name in ("echo", "printf"):
+        return set(), [(True, True, _emit(env, _printed(name, args, env)))]
+    if _STDOUT in env and name == "gh":
+        answers = _api_answers(*_with_argv(words, env))
+        if answers is not None:
+            return set(), [
+                (ok, True, _emit(env, piece))
+                for ok, output in answers
+                for piece in (_printed_answer(output) if ok else ["", _NOT_FOUND])
+            ]
     if name in ("true", ":", "echo", "printf"):
         return set(), [(True, True, env)]
     if name == "false":
@@ -984,7 +1059,113 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
         return set(), _status(_Test(args, env, glob=False).run(), env)
     if name == "[[":
         return set(), _status(_Test(args[:-1], env, glob=True).run(), env)
+    if _STDOUT in env and not _silent(words):
+        env = {**env, _STDOUT: UNKNOWN}  # it may print anything
     return set(), _both(env, True)
+
+
+def _silent(words: list[str]) -> bool:
+    """Whether the command prints nothing (``sleep``, ``grep -q``...)."""
+    name = words[0]
+    return name in _SILENT or (name == "grep" and any(re.fullmatch(r"-\w*q\w*", w) for w in words[1:]))
+
+
+def _emit(env: Env, piece: object) -> Env:
+    """Adds ``piece`` to what was printed inside ``$(...)``."""
+    out = env[_STDOUT]
+    if piece == "":
+        return env
+    if out == "":
+        return {**env, _STDOUT: piece}
+    if piece == _NOT_FOUND and isinstance(out, str) and out.endswith(_NOT_FOUND):
+        return env  # a retried call: one error body stands for any number (the loop settles)
+    if isinstance(out, str) and isinstance(piece, str):
+        return {**env, _STDOUT: out + piece}
+    return {**env, _STDOUT: UNKNOWN}
+
+
+def _printed(name: str, args: list[str], env: Env) -> object:
+    """What ``echo``/``printf`` prints: a string, STRANGER (a login alone) or UNKNOWN."""
+    if name == "echo":
+        words, newline, escapes = list(args), "\n", False
+        while words and re.fullmatch(r"-[neE]+", words[0]):
+            flags = words.pop(0)
+            newline = "" if "n" in flags else newline
+            escapes = escapes or "e" in flags
+        values: list[object] = []
+        for word in words:
+            value = _value(word, env)
+            values += value if isinstance(value, tuple) else [value]
+        if values == [STRANGER]:
+            return STRANGER
+        if not all(isinstance(v, str) for v in values):
+            return UNKNOWN
+        text = " ".join(values) + newline  # type: ignore[arg-type]
+        return UNKNOWN if escapes and "\\" in text else text
+    fmt = _value(args[0], env) if args else ""
+    rest = [_value(word, env) for word in args[1:]]
+    if fmt in ("%s", "%s\\n") and len(rest) == 1:
+        if rest == [STRANGER]:
+            return STRANGER
+        return rest[0] + ("\n" if fmt == "%s\\n" else "") if isinstance(rest[0], str) else UNKNOWN
+    if isinstance(fmt, str) and not rest and "%" not in fmt and "\\" not in fmt.removesuffix("\\n"):
+        return fmt.removesuffix("\\n") + ("\n" if fmt.endswith("\\n") else "")
+    return UNKNOWN
+
+
+def _printed_answer(output: object) -> list[object]:
+    """What a permission call that succeeded prints: its answer on a line."""
+    return [output + "\n" if isinstance(output, str) else output]
+
+
+def _with_argv(words: list[str], env: Env) -> tuple[str, Env]:
+    """A command's text with ``"$@"`` written out as the function's arguments were (a wrapper
+    like ``gh_retry api ...`` that runs ``gh "$@"``), and the values those arguments read."""
+    argv = env.get(_ARGV)
+    if not isinstance(argv, tuple):
+        return " ".join(words), env
+    written, values = argv
+    out: list[str] = []
+    for word in words:
+        out += list(written) if word in ("$@", "$*") else [word]
+    return " ".join(out), {**env, **dict(values)}
+
+
+def _captured(name: str, sub_name: str, sub: _Sub, env: Env) -> list[Result] | None:
+    """``name=$(f ...)`` when ``f`` is a function: runs it in a subshell and keeps what it
+    prints. None if the substitution starts with something else, or isn't followed."""
+    try:
+        text, subs = _prepare(sub.inner, sub_name + "_")
+        tree = _Parser(_tokens(text)).program()
+    except Unsupported:
+        return None
+    first = tree[0].first.commands[0] if tree else None
+    if isinstance(first, _Redirected):
+        first = first.node
+    if not isinstance(first, _Simple):
+        return None
+    head = next((w for w in first.words if not _ASSIGNMENT.fullmatch(w)), None)
+    if head is None or not isinstance(env.get(_FUNCTION + head), _Function):
+        return None
+    seen = _API_SEEN.get()
+    # A subshell: `set -e` isn't inherited; only what it prints and writes to files comes back.
+    inner = {**env, **subs, _STDOUT: "", _SUBSHELL: True, _ERREXIT: False, _TO_OUTPUT: None, _LOOPS: 0}
+    try:
+        ends, results = _seq_status(tree, inner)
+    except Unsupported:
+        _API_SEEN.set(seen)
+        return None
+    if ends:
+        _API_SEEN.set(seen)
+        return None
+    out: list[Result] = []
+    for status, _, after in results:
+        value = after.get(_STDOUT, UNKNOWN)
+        if isinstance(value, str):
+            value = value.rstrip("\n")
+        written = {k: v for k, v in after.items() if k.startswith(_OUT) or k == _OUT_UNKNOWN}
+        out.append((status, True, {**env, **written, name: value}))
+    return out
 
 
 def _write(name: str, args: list[str], env: Env) -> Env:
@@ -1080,7 +1261,7 @@ def _call(function: _Function, args: list[str], env: Env) -> tuple[set[str], lis
     depth = int(env.get(_DEPTH) or 0)  # type: ignore[call-overload]
     if depth >= _MAX_DEPTH:
         raise Unsupported("functions too deep")
-    inner = {**env, _DEPTH: depth + 1, _LOCALS: ()}
+    inner = {**env, _DEPTH: depth + 1, _LOCALS: (), _ARGV: _argv(args, env, depth)}
     for i, name in enumerate(_POSITIONAL):
         inner[name] = _value(args[i], env) if i < len(args) else ""
     ends, results = _seq_status(function.body, inner)
@@ -1093,13 +1274,42 @@ def _call(function: _Function, args: list[str], env: Env) -> tuple[set[str], lis
                 after[name] = env[name]
             else:
                 after.pop(name, None)
-        for key in (_DEPTH, _LOCALS):
+        for key in (_DEPTH, _LOCALS, _ARGV):
             if key in env:
                 after[key] = env[key]
             else:
                 after.pop(key, None)
         out.append((bool(status), True, after))
     return ends, out
+
+
+def _argv(args: list[str], env: Env, depth: int) -> tuple[tuple[str, ...], tuple[tuple[str, object], ...]]:
+    """A call's arguments as written, for ``"$@"`` in the function: each variable they read is
+    renamed (``$X`` -> ``$__WG_ARGV<depth>_X``) and its value kept, so the function's own
+    variables can't change them."""
+    outer = env.get(_ARGV)
+    written: list[str] = []
+    values: dict[str, object] = {}
+    prefix = f"{_ARGV_NAME}{depth}_"
+
+    def rename(m: re.Match[str]) -> str:
+        name = m.group(1) or m.group(2)
+        values[prefix + name] = env.get(name, UNKNOWN)
+        return "${" + prefix + name + "}"
+
+    def rename_array(m: re.Match[str]) -> str:
+        length, name, index = m.groups()
+        values[prefix + name] = env.get(name, UNKNOWN)
+        return "${" + length + prefix + name + "[" + index + "]}"
+
+    for arg in args:
+        if arg in ("$@", "$*"):
+            if isinstance(outer, tuple):
+                written += outer[0]
+                values.update(outer[1])
+            continue
+        written.append(_NAME.sub(rename, _ARRAY_REF.sub(rename_array, arg)))
+    return tuple(written), tuple(sorted(values.items(), key=lambda kv: kv[0]))
 
 
 def _match(value: object, pattern: str) -> bool | None:
@@ -1115,8 +1325,23 @@ def _match(value: object, pattern: str) -> bool | None:
     return None
 
 
+def _redirected(node: object, quiet: bool, merged: bool, env: Env) -> tuple[set[str], list[Result]]:
+    """Inside ``$(...)``: a command whose output goes elsewhere prints nothing; with ``2>&1``
+    its errors are printed too (unknown)."""
+    out = UNKNOWN if merged else env[_STDOUT]
+    ends, results = _command(node, env)
+    return ends, [(status, flag, {**after, _STDOUT: out}) for status, flag, after in results]
+
+
 def _command(command: object, env: Env) -> tuple[set[str], list[Result]]:
+    if isinstance(command, _Redirected):
+        if _STDOUT not in env:
+            return _command(command.node, env)
+        return _redirected(command.node, command.quiet, command.merged, env)
     if isinstance(command, _Simple):
+        if (command.quiet or command.merged) and _STDOUT in env:
+            plain = _Simple(command.words, command.output)
+            return _redirected(plain, command.quiet, command.merged, env)
         return _simple(command, env)
     if isinstance(command, _If):
         return _if(command.branches, command.otherwise, env)
@@ -1286,6 +1511,9 @@ def _pipe(pipe: _Pipe, env: Env, last: bool = True) -> tuple[set[str], list[Resu
         return ends, [(status, flag, {**after, _ERREXIT: True}) for status, flag, after in results]
     if len(pipe.commands) > 1:  # each part runs in a subshell: an exit there ends only that part
         ends, results = set(), _api_pipe(pipe.commands, env) or _both(env, True)
+        last = pipe.commands[-1]
+        if _STDOUT in env and not (isinstance(last, _Simple) and (last.quiet or _silent(last.words))):
+            results = [(status, flag, {**after, _STDOUT: UNKNOWN}) for status, flag, after in results]
     else:
         ends, results = _command(pipe.commands[0], env)
     if pipe.negated:

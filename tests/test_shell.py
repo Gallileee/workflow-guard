@@ -589,3 +589,138 @@ def test_process_substitution_is_an_unknown_file():
     assert script_outputs("diff <(echo a) <(echo b) >/dev/null || true\necho x=1 >> $GITHUB_OUTPUT", {}) == [
         {"x": "1"}
     ]
+
+
+# --- what a function prints: $(f ...) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        'f() { echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo "$1"; }\nP=$(f OWNER)\n[ "$P" = OWNER ] && exit 1\necho go',
+        "f() { printf %s a; printf '%s\\n' b; }\nP=$(f)\n[ \"$P\" = ab ] && exit 1\necho go",
+        'f() { echo -n a; echo b; }\nP=$(f)\n[ "$P" = ab ] && exit 1\necho go',
+        'f() { for r in a b; do printf %s "$r"; done; }\nP=$(f)\n[ "$P" = ab ] && exit 1\necho go',
+        # What goes elsewhere isn't printed.
+        'f() { echo no >&2; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo no > /tmp/x; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { { echo no; } >&2; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        "f() { if true; then echo no; fi >/dev/null; echo OWNER; }\nP=$(f)\n"
+        '[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { sleep 1 >/dev/null 2>&1; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo x | grep -q x; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo "a=1" >> "$GITHUB_OUTPUT"; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        # Functions calling functions, and $(...) inside.
+        'inner() { echo OWNER; }\nouter() { inner; }\nP=$(outer)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'inner() { echo OWNER; }\nouter() { local x; x=$(inner); echo "$x"; }\nP=$(outer)\n'
+        '[ "$P" = OWNER ] && exit 1\necho go',
+        # A login stays a login: none of the names written down.
+        'f() { echo "$1"; }\nP=$(f "$L")\n[ "$P" = octocat ] && exit 0\nexit 1',
+        # Its status is the function's; `set -e` isn't inherited inside $(...).
+        "f() { false; }\nP=$(f) || exit 1\necho go",
+        "f() { return 3; }\nP=$(f)\necho go",
+        'f() { false; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        # $(...) is a subshell: the function's variables stay there.
+        'f() { X=OWNER; echo hi; }\nX=no\nP=$(f)\n[ "$X" = no ] && exit 1\necho go',
+    ],
+)
+def test_function_output(script):
+    assert fails(script) is True
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # It may print anything.
+        'f() { date; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo x | tr x y; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { sleep 1 2>&1; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { sleep 1 2>&1 >/dev/null; echo OWNER; }\nP=$(f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo -e "a\\tb"; }\nP=$(f)\n[ "$P" = a ] || exit 1',
+        # Not followed: exit inside $(...), or a substitution that starts with something else.
+        "f() { exit 1; }\nP=$(f)\necho go",
+        'P=$(echo OWNER)\n[ "$P" = OWNER ] && exit 1\necho go',
+        'f() { echo OWNER; }\nP=$(X=1 g; f)\n[ "$P" = OWNER ] && exit 1\necho go',
+        # `set -e` inside the function: a failed test ends the subshell, and the assignment fails.
+        'f() { set -e; [ "$X" = y ]; echo hi; }\nif P=$(f); then exit 1; fi\necho go',
+        # An assignment's status is its command substitution's.
+        "if P=$(some command); then exit 1; fi\necho go",
+    ],
+)
+def test_function_output_unknown(script):
+    assert fails(script) is False
+
+
+def test_arithmetic_in_an_assignment_succeeds():
+    assert fails("if n=$((1 + 1)); then exit 1; fi\necho go") is True
+
+
+def test_exit_inside_a_substitution_isnt_the_scripts():
+    script = 'f() { echo "a=1" >> "$GITHUB_OUTPUT"; exit 0; }\nP=$(f)\nexit 1'
+    assert script_outputs(script, {}) == []
+
+
+def test_function_output_keeps_what_it_writes_to_github_output():
+    script = 'f() { echo "a=1" >> "$GITHUB_OUTPUT"; echo hi; }\nP=$(f)\necho "p=$P" >> "$GITHUB_OUTPUT"'
+    assert script_outputs(script, {}) == [{"a": "1", "p": "hi"}]
+
+
+RETRY = """gh_retry() {
+  local n=0 max=3
+  while true; do
+    if gh "$@"; then return 0; fi
+    n=$((n+1))
+    if [ "$n" -ge "$max" ]; then return 1; fi
+    sleep $((n * 2))
+  done
+}
+"""
+PERM = "api repos/o/r/collaborators/$U/permission --jq .permission"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        'perm() { gh api "repos/o/r/collaborators/$1/permission" --jq .permission; }\n'
+        'P=$(perm "$U")\ncase "$P" in admin|write) ;; *) exit 1;; esac',
+        f'w() {{ gh "$@"; }}\nP=$(w {PERM})\n[ "$P" = admin ] || exit 1',
+        f'{RETRY}P=$(gh_retry {PERM} 2>/dev/null)\ncase "$P" in admin|write|maintain) ;; *) exit 1;; esac',
+        f'{RETRY}if P=$(gh_retry {PERM}); then\n  [ "$P" = admin ] || exit 1\nelse\n  exit 1\nfi',
+        # "$@" is what the caller wrote: the function's own variables don't change it.
+        f'w() {{ local U=octocat; gh "$@"; }}\nP=$(w {PERM})\n[ "$P" = admin ] || exit 1',
+        f'w1() {{ gh "$@"; }}\nw2() {{ w1 "$@"; }}\nP=$(w2 {PERM})\n[ "$P" = admin ] || exit 1',
+        # Something else printed first: the answer is still not admin.
+        f'w() {{ echo calling; gh "$@"; }}\nP=$(w {PERM})\n[ "$P" = admin ] || exit 1',
+        # The answer is printed on a line of its own.
+        f'w() {{ gh "$@"; printf %s x; }}\nP=$(w {PERM})\ncase "$P" in nonex|readx) exit 0;; esac\nexit 1',
+        # After another function returns, "$@" is this one's again.
+        f'other() {{ :; }}\nw() {{ other x; gh "$@"; }}\nP=$(w {PERM})\n[ "$P" = admin ] || exit 1',
+    ],
+)
+def test_api_through_functions(script):
+    assert api(script) is True
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        # Only reports the answer.
+        (f'w() {{ gh "$@"; }}\nP=$(w {PERM})\necho "p=$P" >> "$GITHUB_OUTPUT"', False),
+        # A failed call prints its error body, then none.
+        (f'w() {{ gh "$@"; }}\nP=$(w {PERM} || echo none)\ncase "$P" in none|read) exit 1;; esac', False),
+        (f'{RETRY}set +e\nP=$(gh_retry {PERM})\ncase "$P" in none|read|"") exit 1;; esac', False),
+        # Or nothing, when no answer came back.
+        (f'w() {{ gh "$@"; }}\nset +e\nP=$(w {PERM})\n[ -z "$P" ] && exit 0\nexit 1', False),
+        # Something that may print anything.
+        (f'w() {{ date; gh "$@"; }}\nP=$(w {PERM})\n[ "$P" = admin ] || exit 1', False),
+        # About someone else: not followed.
+        (
+            'w() { gh "$@"; }\nP=$(w api repos/o/r/collaborators/octocat/permission --jq .permission)\n'
+            '[ "$P" = admin ] || exit 1',
+            None,
+        ),
+    ],
+)
+def test_api_through_functions_details(script, expected):
+    assert api(script) is expected

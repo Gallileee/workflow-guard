@@ -391,9 +391,13 @@ be read or parsed, or bad arguments.
   answer is JSON, equal to no word; `gh api ... | grep -q[EiwxFs] PATTERN` is followed as well.
   The user has to be the commenter (`${{ github.actor }}`, `$GITHUB_ACTOR`, a step `env:` set
   from the comment). Then the step fails on a no only if every path exits; a script that exits
-  only when the call fails just reports. Scripts it can't follow (`eval`, a heredoc, another
-  user, another jq filter) are still judged from their text (`core.setFailed`, `throw`,
-  `exit 1`, `grep -q`).
+  only when the call fails just reports. The call may sit in a function: `P=$(perm "$USER")`
+  runs `perm` in a subshell and keeps what it prints (`echo`, `printf '%s'`, the answer on a
+  line; a failed call prints its error body or nothing; `>&2` and `> file` print nothing,
+  other commands something unknown), and `gh "$@"` in a wrapper (`gh_retry api
+  .../permission`, with retries) is the call its caller wrote. Scripts it can't follow
+  (`eval`, a heredoc, `exit` inside `$(...)`, another user, another jq filter) are still
+  judged from their text (`core.setFailed`, `throw`, `exit 1`, `grep -q`).
 - An `actions/github-script` step is run on paper too (`jscript.py`), for a stranger:
   `context.actor` and the commenter's login are a stranger, `author_association` each
   association that can't write, `context.eventName` is `issue_comment`, the rest of `context`
@@ -603,7 +607,7 @@ CHANGELOG.md.
   `!= 'false'` is reported even where the output is never empty. A check in a script of the
   repository (`require('./.github/scripts/check.js')`) isn't recognised, and a bash check of the
   association only in the forms `shell.py` follows (no `eval` or heredocs). A script that asks the
-  permission API and that the evaluator can't follow (a heredoc, `eval`, a wrapper function around `gh`, a check of another
+  permission API and that the evaluator can't follow (a heredoc, `eval`, `$(...)` that doesn't start with a function, a check of another
   user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
   anywhere (a guess from its text), and so does a github-script with a `while`/`for (;;)` loop, `switch`, a class or an array pattern (`core.setFailed`, `throw` or `process.exit(1)` in its text). A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)

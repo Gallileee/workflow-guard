@@ -1,5 +1,42 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "Obálky gh v shell.py"): gh wrappers and `$(function)`
+
+Why: next step 2. A retry wrapper around `gh` (`gh_retry api .../permission`, running `gh "$@"`
+in a loop) and permission helpers called in `$(...)` were the next bash fallbacks.
+
+Acceptance criteria:
+- `P=$(f ...)` with `f` a function: run in a subshell (errexit off, variables not kept,
+  `$GITHUB_OUTPUT` writes kept, `exit` -> not followed), its status is the assignment's, what it
+  prints is the value (trailing newlines stripped).
+- Printing: `echo`/`printf '%s'` known; a permission call about the commenter prints its answer
+  on a line, a failure its error body or nothing; `>&2`/`> file`/compound redirections print
+  nothing; `2>&1` and unknown commands make the output unknown; `grep -q`, `sleep` are silent.
+- `gh "$@"`: the caller's words, its variables renamed and their values kept (a wrapper's
+  `local` can't change them), through nested wrappers; a retry loop settles.
+- Soundness: `X=$(cmd)` no longer always succeeds; its status is the command's.
+
+Done:
+- `shell.py`: `_captured`, `_emit`, `_printed`, `_printed_answer`, `_silent`, `_with_argv`,
+  `_argv`, `_redirected`/`_Redirected`, `_Simple.quiet`/`merged` (the parser reads the file
+  descriptor of each redirection), `_prepare(prefix)`, `_SUBSHELL` for `exit`, the assignment
+  status.
+- Tests: 47 more in `test_shell.py`; 1265 in total.
+- README (permission API, limitations), CHANGELOG v0.37.0, version 0.37.0, v0.36.0 heading
+  dated, `shell.py` docstring.
+
+What the corpora showed: bash permission scripts decided 30 of 40 (29 before): the retry
+wrapper. The other helper in the corpora asks about a thread author, not the commenter. Findings
+20, 17 and the fork corpus unchanged; the status fix changed none.
+
+Verified locally:
+- `pytest -q -W error`: 1265 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.37.0, 0 errors (warning: v0.37.0 not tagged yet).
+- All three corpora and workflow-guard, LendLoop, fitness-workout-log, transit-raptor: same
+  output as main.
+- Mutation checks: 33 mutants, all killed (5 after adding tests; one simplification: a quiet
+  command no longer hides the output while it runs, it's put back afterwards anyway).
+
 ## 2026-11-21 (interactive, user picked "Pole v shell.py"): arrays in the bash evaluator
 
 Why: next step 3. Arrays and `< <(...)` were the most common reasons a bash permission script
@@ -1445,12 +1482,12 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.36.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `shell.py`: a shell function called inside `$(...)` (capture what it echoes) and wrappers
-   around `gh` (`gh_retry api ...` that runs `gh "$@"`), the next fallbacks.
-3. `jscript.py`: `require()`d helper scripts of the checked repository, and array patterns
+1. Tag `v0.37.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `jscript.py`: `require()`d helper scripts of the checked repository, and array patterns
    (`const [a, b] = ...`, `([k, v]) =>`).
-4. WG005: a label gate with a step that removes the label (`labeled` + `actions-ecosystem/
+3. WG005: a label gate with a step that removes the label (`labeled` + `actions-ecosystem/
    action-remove-labels` before the checkout) as a recognised pattern, with a note on the
    remaining race.
+4. `shell.py`: heredocs (`cat <<EOF`), and `$(...)` compared directly
+   (`[ "$(perm "$U")" = admin ]`), the remaining bash fallbacks.
 5. The Marketplace listing (needs the owner: it's a public listing under their account).
