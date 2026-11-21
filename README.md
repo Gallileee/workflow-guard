@@ -358,8 +358,14 @@ be read or parsed, or bad arguments.
   call (empty at the top: GitHub passes no arguments), `local` variables put back afterwards and
   `return`; `{ ...; }` groups run in place; redirections after them are skipped. Inside a
   function or group called in a condition, negated or before the last command of a `&&`/`||`
-  list, `-e` doesn't act (bash's rule). Loops, subshells, arrays, process substitution
-  (`< <(...)`), background jobs and heredocs make it unknown (not a check). Only steps whose shell
+  list, `-e` doesn't act (bash's rule). Loops: `for x in a b c` runs the body once per word;
+  over words it can't count (`$LIST`, `$(...)`, a glob, a value with spaces) and for
+  `while`/`until` the body runs round after round from every state the last round left, until
+  no new state turns up (at most 8 rounds, else unknown); `break` and `continue` end a round,
+  `done < file` is fine. Commands that set variables are followed: `read` (unknown values),
+  `export`/`declare`/`readonly NAME=value`, `unset`, `printf -v`, and `NAME=value command`
+  prefixes. `eval`, `source`, `shift`, `let`, `getopts`, `((...))`, subshells, arrays, process
+  substitution (`< <(...)`), background jobs and heredocs make it unknown (not a check). Only steps whose shell
   is bash or sh (the default, except on a Windows runner) and whose `if:` is true for everyone
   are looked at.
 - A bash script that asks the **permission API** about the commenter is run on paper too:
@@ -369,7 +375,7 @@ be read or parsed, or bad arguments.
   answer is JSON, equal to no word; `gh api ... | grep -q[EiwxFs] PATTERN` is followed as well.
   The user has to be the commenter (`${{ github.actor }}`, `$GITHUB_ACTOR`, a step `env:` set
   from the comment). Then the step fails on a no only if every path exits; a script that exits
-  only when the call fails just reports. Scripts it can't follow (loops, arrays, another
+  only when the call fails just reports. Scripts it can't follow (arrays, `eval`, another
   user, another jq filter) and github-scripts are still judged from their text (`core.setFailed`,
   `throw`, `exit 1`, `grep -q`).
 - WG010 reads what a bash script **writes to `$GITHUB_OUTPUT`** (`shell.script_outputs`):
@@ -385,6 +391,8 @@ be read or parsed, or bad arguments.
 - `a || b` with `a` unknown and `b` truthy is truthy as a condition, but its value is unknown
   (it may be `a`): compared, passed to a function or put into text (`env:`, job outputs) it is
   unknown, not `true`.
+- A step that asks for the commenter's permission isn't reported for the secrets it uses
+  itself: it needs a token to ask the API. The steps after it are what it guards.
 - WG010 knows what some actions answer (`_ACTION_ANSWERS` in `rules.py`, from the action's
   source): `actions-cool/check-user-permission` always sets `user-permission` (`none` or `read`
   for a stranger), and `require-result` (`false`) when `require:` is given. For those outputs
@@ -553,8 +561,8 @@ CHANGELOG.md.
   `if:` on the answer has to be false for an empty answer, `false`, `none` and `read`, so
   `!= 'false'` is reported even where the output is never empty. A check in a script of the
   repository (`require('./.github/scripts/check.js')`) isn't recognised, and a bash check of the
-  association only in the forms `shell.py` follows (no loops or arrays). A script that asks the
-  permission API and that the evaluator can't follow (a loop, an array, a check of another
+  association only in the forms `shell.py` follows (no arrays or `eval`). A script that asks the
+  permission API and that the evaluator can't follow (an array, `eval`, a check of another
   user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
   anywhere (a guess from its text). A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)

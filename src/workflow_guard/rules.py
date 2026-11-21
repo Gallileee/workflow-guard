@@ -1453,8 +1453,8 @@ def comment_commands(wf: Workflow) -> Iterator[Finding]:
             if prior:
                 before[id(step.node)] = prior[0]
                 anyway[id(step.node)] = _runs_anyway(step.node)
-            if id(step.node) in stop_ids:
-                continue
+            if id(step.node) in stop_ids or _permission_check(step) is not None:
+                continue  # the check itself (it may need a token to ask the API)
             if not anyway.get(id(step.node)) and any(_covers(stop, step) for stop in prior):
                 continue
             if not (_commenter_gate(step.node)[0] or _answer_gate(step.node, answers)[0]):

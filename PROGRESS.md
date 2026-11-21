@@ -1,5 +1,47 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "Cykly v shell.py"): loops in the bash evaluator
+
+Why: next step 2. Loops were the largest group of permission scripts that fell back to the
+text guess (5 of 19).
+
+Acceptance criteria:
+- `for x in WORDS` with known words (no `$`, glob or spaces): once per word, in order.
+  Otherwise (and `for x;`, `while`, `until`): rounds from every state the last one left until no
+  new state (`_key`) turns up, at most 8, else unknown. A `for` over unknown words may end
+  before any round; `while`/`until` end where the condition says so (`-e` off in it).
+- `break`/`continue` (no count above 1, only inside a loop); `return` leaves loops too; redirect
+  `done < file`, and `done >> "$GITHUB_OUTPUT"` writes like a group.
+- Found on the way (soundness): `read`, `export`/`declare`/`readonly`, `unset`, `printf -v`
+  and `NAME=value cmd` prefixes now change variables; `eval`, `source`, `.`, `shift`, `let`,
+  `getopts`, `mapfile`, `readarray`, `select`, `coproc` are unsupported.
+- A permission step's own secrets aren't counted (corpus: a check holding `CI_BOT_PAT` became a
+  new "uses secrets" finding once the evaluator saw it only reports).
+
+Done:
+- `shell.py`: `_For`, `_While`, parser `for_`/`while_`/`do_done`, `_round`, `_for`, `_while`,
+  `_rounds` (fixed point), `_BREAK`/`_CONTINUE`/`_LOOPS`, `_jumped`, `_key`, `_sets`,
+  `_UNFOLLOWED`, `<` in `redirections`.
+- `rules.py`: `comment_commands` skips permission steps like stops.
+- Tests: 44 more (`test_shell.py`, one in `test_wg010.py`; 4 old ones that used loops as the
+  unsupported example now use `eval`, `source`, `((...))`); 997 in total.
+- README (How it works, limitations), CHANGELOG v0.31.0, version 0.31.0, v0.30.0 heading dated.
+
+What the corpora showed: permission scripts decided 24 of 40 (was 21): 15 fail on a no as the
+guess said, 9 only report (4 of them the guess counted as checks: they `exit 1` only on an API
+error or for another reason). Findings 22 -> 20 and 17 -> 17: the permission step's own token
+(ceph, uf-mil) and one found and then fixed during this change (QwenLM's authorize job). 16
+still fall back: arrays and `< <(...)` (5), a `(` in a function body, a heredoc, a `gh_retry`
+wrapper around the API call, and calls about someone other than the commenter.
+
+Verified locally:
+- `pytest -q -W error`: 997 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.31.0, 0 errors (warning: v0.31.0 not tagged yet).
+- Both corpora: all rules without errors. workflow-guard, LendLoop, fitness-workout-log,
+  transit-raptor: same output as main.
+- Mutation checks: 24 mutants; 23 killed (7 after rewriting or adding tests), one equivalent
+  (the status a `_seq_status` gives a path after `break`/`continue` is never read; commented).
+
 ## 2026-11-21 (interactive, user picked "$GITHUB_OUTPUT v shell.py"): scripts that report
 
 Why: next step 2. A script that checks the commenter and writes `trusted=false` to
@@ -1209,11 +1251,12 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.30.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `shell.py`: `for`/`while` loops (5 of the 19 permission-script fallbacks), e.g. by running the
-   body zero and one times when the loop's words are unknown.
+1. Tag `v0.31.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. github-script checks: `core.setOutput('allowed', ...)`, `return` and `core.setFailed` in
+   `actions/github-script` are still guessed from the text; a small evaluator for the common
+   shapes (`if (!['admin','write'].includes(p)) core.setFailed(...)`).
 3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
-4. github-script checks: `core.setOutput('allowed', ...)` and `return` in
-   `actions/github-script` are still guessed from the text.
+4. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
+   input (5 of the 16 fallbacks).
 5. The Marketplace listing (needs the owner: it's a public listing under their account).

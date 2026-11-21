@@ -67,9 +67,9 @@ def test_scripts_that_exit_for_everyone_who_cant_write(script):
         # Never exits.
         'echo "$A"',
         # Not followed: loops, subshells, background jobs, heredocs, bad syntax.
-        "for x in a; do exit 1; done",
-        "while true; do exit 1; done",
-        "for x in a b; do echo $x; done\nexit 1",
+        "eval 'exit 1'",
+        "source ./check.sh\nexit 1",
+        "(( 1 )) && exit 1",
         "( exit 1 )",
         "exit 1 &",
         "cat <<EOF\nx\nEOF\nexit 1",
@@ -388,7 +388,7 @@ def test_script_outputs(script, expected):
         "printf '%s=%s\\n' x 1 >> $GITHUB_OUTPUT",
         'if true; then echo x=1; fi >> "$GITHUB_OUTPUT"',
         'echo "x=$(cat $GITHUB_OUTPUT)"',
-        "for i in 1; do echo x=1 >> $GITHUB_OUTPUT; done",
+        "for i in a; do echo x=1; done >> $GITHUB_OUTPUT\necho x >> $GITHUB_OUTPUT",
     ],
 )
 def test_script_outputs_it_cant_read(script):
@@ -397,3 +397,127 @@ def test_script_outputs_it_cant_read(script):
 
 def test_writes_in_a_group_stop_at_its_end():
     assert outputs('{ echo "a=1"; } >> "$GITHUB_OUTPUT"\necho "b=2"') == [{"a": "1"}]
+
+
+# --- loops --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "for x in a b c; do echo $x; done\nexit 1",
+        'for role in OWNER MEMBER COLLABORATOR; do\n  [ "$A" = "$role" ] && exit 0\ndone\nexit 1',
+        'ok=no\nfor role in OWNER MEMBER; do\n  if [ "$A" = "$role" ]; then ok=yes; break; fi\ndone\n'
+        '[ "$ok" = yes ] || exit 1',
+        # Unknown words: any number of rounds, but no round lets a stranger in.
+        'ok=no\nfor role in $ALLOWED; do\n  [ "$L" = "octocat" ] && ok=yes\ndone\n[ "$ok" = yes ] || exit 1',
+        'for f in *.txt; do echo "$f"; done\n[ "$A" = OWNER ] || exit 1',
+        # while: the condition decides each round.
+        'n=0\nwhile [ "$n" != 3 ]; do\n  n=x$n\n  [ "$n" = xxx0 ] && break\ndone\nexit 1',
+        'while true; do\n  [ "$A" = OWNER ] && break\n  exit 1\ndone',
+        'until [ "$A" = OWNER ]; do exit 1; done',
+        # continue skips the rest of the round.
+        "for x in a b; do\n  continue\n  exit 0\ndone\nexit 1",
+        # A loop that reads lines: each line is unknown.
+        'found=no\nwhile read -r line; do\n  [ "$line" = "$A" ] && found=yes\ndone < allowed.txt\n'
+        '[ "$found" = yes ] && [ "$A" = OWNER ] || exit 1',
+    ],
+)
+def test_loops_that_exit_for_strangers(script):
+    assert fails(script) is True
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # A word list may hold the commenter's association.
+        'ok=no\nfor role in $ALLOWED; do\n  [ "$A" = "$role" ] && ok=yes\ndone\n[ "$ok" = yes ] || exit 1',
+        'for x in a b; do\n  [ "$A" = OWNER ] || break\ndone\necho go',
+        'while read -r who; do\n  [ "$who" = "$L" ] && exit 0\ndone < owners.txt\nexit 1',
+        # Zero rounds: the body never runs.
+        "for x in $NOTHING; do exit 1; done",
+        'while [ -n "$MORE" ]; do exit 1; done',
+        # A counter: every round is a new state, so it never settles.
+        'n=0\nwhile [ "$MORE" = yes ]; do n="x$n"; done\nexit 1',
+        "break",
+        "for x in a; do break 2; done",
+        "for ((i = 0; i < 3; i++)); do exit 1; done",
+    ],
+)
+def test_loops_that_may_let_strangers_through(script):
+    assert fails(script) is False
+
+
+def test_known_words_run_once_each():
+    script = 'seen=\nfor x in a b; do seen="$seen$x"; done\n[ "$seen" = ab ] || exit 1\nexit 2'
+    assert always_fails(script, {}) is True
+    assert script_outputs('for x in a b; do echo "last=$x" >> $GITHUB_OUTPUT; done', {}) == [{"last": "b"}]
+
+
+def test_a_loop_writing_to_the_output_file():
+    script = 'for x in a b; do echo "x=$x"; done >> "$GITHUB_OUTPUT"'
+    assert script_outputs(script, {}) == [{"x": "b"}]
+
+
+# --- commands that set variables -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        # read makes a variable unknown: a stale value would decide the check.
+        ('A2=x\nread -r A2 < f || true\n[ "$A2" = x ] && exit 1\necho go', False),
+        ('A2=x\nIFS=, read -r A2 B2 < f || true\n[ "$A2" = x ] && exit 1\necho go', False),
+        ('REPLY=x\nread < f || true\n[ "$REPLY" = x ] && exit 1\necho go', False),
+        # -p takes a value: it is no variable.
+        ('A2=x\nread -p A2 -r B2 < f || true\n[ "$A2" = x ] || exit 0\nexit 1', True),
+        # export/declare assign; -i and friends change the value.
+        ('export X=OWNER\n[ "$X" = OWNER ] && exit 1', True),
+        ('declare -r X="$A"\n[ "$X" = OWNER ] || exit 1', True),
+        ('declare -l X=OWNER\n[ "$X" = OWNER ] && exit 1\necho go', False),
+        ('export X\n[ "$A" = OWNER ] || exit 1', True),
+        # unset empties it; printf -v makes it unknown.
+        ('X=OWNER\nunset X\n[ -z "$X" ] && exit 1', True),
+        ('X=OWNER\nprintf -v X "%s" "$A"\n[ "$X" = OWNER ] && exit 1\necho go', False),
+        ("f() { exit 1; }\nunset -f f\nf\necho go", False),
+    ],
+)
+def test_commands_that_set_variables(script, expected):
+    assert fails(script) is expected
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "eval 'exit 1'",
+        ". ./lib.sh\nexit 1",
+        "shift\nexit 1",
+        "let x=1\nexit 1",
+        "getopts ab o\nexit 1",
+        "read -a arr\nexit 1",
+    ],
+)
+def test_commands_it_doesnt_follow(script):
+    assert always_fails(script, {}) is False
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        # A glob or a word that splits is no known word.
+        ('for x in a*; do [ "$x" = "a*" ] || exit 0; done\nexit 1', False),
+        ('V="a b"\nfor x in $V; do [ "$x" = "a b" ] || exit 0; done\nexit 1', False),
+        # -e doesn't act in a while condition.
+        ('while false; [ "$A" = OWNER ]; do exit 1; done\necho go', False),
+    ],
+)
+def test_more_loops(script, expected):
+    assert fails(script) is expected
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["break\necho x=1 >> $GITHUB_OUTPUT", "for x in a; do break 2; done\necho x=1 >> $GITHUB_OUTPUT"],
+)
+def test_break_outside_a_loop_is_not_followed(script):
+    assert script_outputs(script, {}) is None

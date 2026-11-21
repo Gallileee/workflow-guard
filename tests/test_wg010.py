@@ -1266,3 +1266,11 @@ def test_a_script_that_writes_nothing_is_no_answer():
     step = ("- id: hello", '  run: echo "hello ${{ github.actor }}"')
     ((_, _, message),) = wg010(on_comment(*step, *CHECKOUT_PR))
     assert "looks at who commented" not in message
+
+
+def test_the_permission_step_may_use_a_secret_token():
+    # It needs a token to ask the API; the steps after it are what it guards.
+    ask = (*ASK_ONLY[:2], "  with:", "    require: write", "    token: ${{ secrets.BOT_TOKEN }}")
+    assert wg010(on_comment(*ask, "- run: echo hi")) == []
+    secret = ("- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}")
+    assert [s for _, s, _ in wg010(on_comment(*ask, *secret))] == [Severity.MEDIUM]
