@@ -69,7 +69,7 @@ def test_scripts_that_exit_for_everyone_who_cant_write(script):
         # Not followed: loops, subshells, background jobs, heredocs, bad syntax.
         "eval 'exit 1'",
         "source ./check.sh\nexit 1",
-        "(( 1 )) && exit 1",
+        "select x in a b; do exit 1; done",
         "( exit 1 )",
         "exit 1 &",
         "cat <<EOF\nx\nEOF\nexit 1",
@@ -521,3 +521,71 @@ def test_more_loops(script, expected):
 )
 def test_break_outside_a_loop_is_not_followed(script):
     assert script_outputs(script, {}) is None
+
+
+# --- arrays, process substitution, arithmetic ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        'roles=(OWNER MEMBER COLLABORATOR)\nok=no\nfor r in "${roles[@]}"; do\n'
+        '  [ "$A" = "$r" ] && ok=yes\ndone\n[ "$ok" = yes ] || exit 1',
+        'roles=(\n  OWNER\n  MEMBER\n)\n[[ " ${roles[*]} " == *" $A "* ]] || exit 1',
+        'roles=(OWNER)\nroles+=(MEMBER)\n[ "${#roles[@]}" = 2 ] && [ "${roles[1]}" = MEMBER ] && exit 1',
+        'roles=(OWNER)\n[ "$roles" = OWNER ] && exit 1',
+        'declare -a roles=(OWNER)\n[ "${roles[0]}" = OWNER ] && exit 1',
+        "f() {\n  local -a ok=(OWNER MEMBER)\n"
+        '  for r in "${ok[@]}"; do [ "$A" = "$r" ] && return 0; done\n  return 1\n}\n'
+        "f || exit 1",
+        'more=(MEMBER)\nall=(OWNER "${more[@]}")\n[ "${all[1]}" = MEMBER ] && exit 1',
+        # An element with a space is still one element.
+        'names=("a b" c)\nfor n in "${names[@]}"; do [ "$n" = "a b" ] && exit 1; done',
+        # x+=text appends.
+        'x=OW\nx+=NER\n[ "$x" = OWNER ] && exit 1',
+    ],
+)
+def test_arrays(script):
+    assert fails(script) is True
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Unknown arrays.
+        'mapfile -t lines < <(gh api x)\nfor l in "${lines[@]}"; do [ "$l" = "$A" ] && exit 0; done\nexit 1',
+        'lines=(a)\nmapfile -t lines < f\n[ "${lines[0]}" = a ] && exit 1\necho go',
+        # -n takes a value: no array name; MAPFILE is set.
+        'MAPFILE=(a)\nreadarray -n 5 -t < f\n[ "${MAPFILE[0]}" = a ] && exit 1\necho go',
+        'while read -r who; do [ "$who" = "$L" ] && exit 0; done < <(gh api collaborators)\nexit 1',
+        'roles=([admin]=1)\n[ "${roles[0]}" = "[admin]=1" ] && exit 1\necho go',
+        'i=1\nroles=(a b)\n[ "${roles[$i]}" = b ] && exit 1',
+        # (( )) decides nothing; when it assigns, its variables are unknown.
+        "(( 1 )) && exit 1",
+        'n=0\n(( n++ ))\n[ "$n" = 0 ] && exit 1\necho go',
+        'n=0\n(( n += 2 ))\n[ "$n" = 0 ] && exit 1\necho go',
+    ],
+)
+def test_arrays_that_may_let_someone_through(script):
+    assert fails(script) is False
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ('n=0\n(( n > 1 ))\n[ "$n" = 0 ] || exit 0\nexit 1', True),  # a comparison assigns nothing
+        ('x=a\n(( x == 1 )) || true\n[ "$x" = a ] || exit 0\nexit 1', True),
+        ('a=(x)\n[ "${#a[*]}" = 1 ] || exit 0\nexit 1', True),
+        ("a=(x)\n[ \"${a[5]}\" = '' ] || exit 0\nexit 1", True),
+        ('s=one\n[ "${s[0]}" = one ] || exit 0\nexit 1', True),  # a plain variable is an array of one
+        ("a=(x y)\n[ \"pre-${a[*]}\" = 'pre-x y' ] || exit 0\nexit 1", True),
+    ],
+)
+def test_array_values(script, expected):
+    assert always_fails(script, {}) is expected
+
+
+def test_process_substitution_is_an_unknown_file():
+    assert script_outputs("diff <(echo a) <(echo b) >/dev/null || true\necho x=1 >> $GITHUB_OUTPUT", {}) == [
+        {"x": "1"}
+    ]
