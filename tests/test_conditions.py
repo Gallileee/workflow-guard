@@ -293,3 +293,35 @@ def test_must_pass(text, expected):
 def test_stranger_text(text, expected):
     value = stranger_text(text, "NONE")
     assert value == expected if isinstance(expected, str) else value is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "condition", "as_value"),
+    [
+        # Truthy for sure, but which value is it?
+        ("x || 'push'", True, UNKNOWN),
+        ("x && false", False, UNKNOWN),
+        ("x || ''", UNKNOWN, UNKNOWN),
+        ("'a' || x", "a", "a"),
+        ("false && x", False, False),
+    ],
+)
+def test_and_or_as_a_condition_and_as_a_value(text, condition, as_value):
+    tree = parse(text)
+    assert (
+        evaluate(tree, lambda path: UNKNOWN) == condition or evaluate(tree, lambda path: UNKNOWN) is condition
+    )
+    value = evaluate(tree, lambda path: UNKNOWN, as_value=True)
+    assert value == as_value or value is as_value
+
+
+def test_a_compared_or_is_a_value():
+    # (x || 'push') may be x, so it may not be 'push'.
+    assert evaluate(parse("(x || 'push') == 'push'"), lambda path: UNKNOWN) is UNKNOWN
+    assert text_value("x || 'push'", lambda path: UNKNOWN) is UNKNOWN
+    assert stranger_text("${{ steps.r.outputs.e || github.event_name }}", "NONE") is UNKNOWN
+
+
+def test_an_or_passed_to_a_function_is_a_value():
+    # x || 'abc' is x or 'abc', not the text 'true'.
+    assert evaluate(parse("contains(x || 'abc', 'true')"), lambda path: UNKNOWN) is UNKNOWN

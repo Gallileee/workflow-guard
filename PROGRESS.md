@@ -1,5 +1,46 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "$GITHUB_OUTPUT v shell.py"): scripts that report
+
+Why: next step 2. A script that checks the commenter and writes `trusted=false` to
+`$GITHUB_OUTPUT` wasn't understood: the job was reported (a false positive seen in the corpus).
+
+Acceptance criteria:
+- `shell.script_outputs`: the outputs on every path where the script succeeds (end of script,
+  `exit 0`, an unknown exit code), from `echo name=value`, `printf 'name=%s\n' x`,
+  `printf '%s\n' name=x`, `printf 'name=v\n'`, and `echo` in a `{ ...; } >> $GITHUB_OUTPUT`
+  group; any other mention of `GITHUB_OUTPUT` (tokens or substitutions) -> unknown.
+- A bash script that looks at the commenter and writes something is an answer step
+  (`_is_answer`, `_askers`); `_no_answers` gives every combination of the scripts' outputs (at
+  most 64), labelled `_SCRIPT` when only scripts answer; messages name `'name=value'`.
+- API scripts with an output the evaluator can't work out keep `NO_ANSWERS`.
+- Found on the way: `a || b` with `a` unknown evaluated to `True` as a value. `evaluate` got
+  `as_value` (comparisons, function arguments, `text_value`, `stranger_text`).
+
+Done:
+- `shell.py`: `_Simple.output`, `_Group.output`, `_Parser.target`/`output_targets`,
+  `_write`, `_PASSED`, `script_outputs`, file descriptors (`2>&1`) no longer become arguments.
+- `conditions.py`: `evaluate(..., as_value=)`.
+- `rules.py`: `_script_answers`/`_script_maps` (cached), `_is_answer`, `_answers`/`_askers`
+  include them, `_no_answers` combinations, `_passing` returns lookups, `_answer_words`,
+  "looks at who commented" in messages.
+- Tests: 45 more (`test_shell.py`, `test_wg010.py`, `test_conditions.py`); 953 in total.
+- README (WG010 row, How it works, modules), CHANGELOG v0.30.0, version 0.30.0, v0.29.0
+  heading dated (2026-11-21, its release day).
+
+What the corpora showed: 18 steps report through `$GITHUB_OUTPUT`. Findings 22 and 18 -> 22
+and 17 (the `trusted=false` script). Two scripts gave `allowed=true` for a stranger: one was the
+`||` bug (`EVENT_NAME: ${{ steps.replay.outputs.event_name || github.event_name }}`, now
+unknown), the other is a rate limiter that lets comments through on purpose.
+
+Verified locally:
+- `pytest -q -W error`: 953 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.30.0, 0 errors (warning: v0.30.0 not tagged yet).
+- Both corpora run with all rules without errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 29 mutants (shell writes, value mode, answer steps), all killed (2 after
+  adding tests).
+
 ## 2026-11-20 (interactive, user picked "if: kroku kontroly"): a check that may be skipped
 
 Why: next step 2. A permission step that fails on a no covered every later step even when its
@@ -1168,12 +1209,11 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.29.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `shell.py`: what a script writes to `$GITHUB_OUTPUT` (`echo "trusted=$x" >> "$GITHUB_OUTPUT"`)
-   as the step's outputs, so a script that only reports its check (a `case` on the association,
-   or the permission API) is evaluated like a reporting action (`_no_answers`).
-3. `shell.py`: `for`/`while` loops (5 of the 19 fallbacks), e.g. by running the body zero and
-   one times when the loop's words are unknown.
-4. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
+1. Tag `v0.30.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `shell.py`: `for`/`while` loops (5 of the 19 permission-script fallbacks), e.g. by running the
+   body zero and one times when the loop's words are unknown.
+3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
+4. github-script checks: `core.setOutput('allowed', ...)` and `return` in
+   `actions/github-script` are still guessed from the text.
 5. The Marketplace listing (needs the owner: it's a public listing under their account).

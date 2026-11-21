@@ -6,11 +6,12 @@ for the reasoning and links behind each one.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from itertools import groupby
+from itertools import groupby, product
 from pathlib import Path
 
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
@@ -40,7 +41,7 @@ from .expressions import (
 from .model import Finding, Severity
 from .project import repo_root
 from .scripts import scripts
-from .shell import always_fails, api_fails
+from .shell import always_fails, api_fails, script_outputs
 from .taint import INPUT, OUTSIDER, TOJSON, Taint, Tracker
 from .workflow import Step, Workflow, get, items, key_node, scalar
 
@@ -781,7 +782,7 @@ def _stops(wf: Workflow, job_id: str) -> list[_Stop]:
     steps = _job_steps(wf, job_id)
     stops = []
     for i, step in enumerate(steps):
-        if _denies(step, [s for s in steps[:i] if _permission_check(s) == _REPORTS]):
+        if _denies(step, [s for s in steps[:i] if _is_answer(s)]):
             stops.append(_Stop(i, step, True))
         elif _permission_check(step) == _FAILS or (_shell_check(wf, step) == () and not _continues(step)):
             stops.append(_Stop(i, step, _always_runs(step)))
@@ -943,14 +944,59 @@ def _denies(step: Step, answers: list[Step]) -> bool:
 
 
 def _answers(wf: Workflow, job_id: str) -> list[Step]:
-    """The job's steps that ask for the commenter's permission but don't fail on a no."""
-    return [step for step in _job_steps(wf, job_id) if _permission_check(step) == _REPORTS]
+    """The job's steps that ask for the commenter's permission but don't fail on a no, and the
+    scripts that look at who commented and write the answer to ``$GITHUB_OUTPUT``."""
+    return [step for step in _job_steps(wf, job_id) if _is_answer(step)]
+
+
+def _is_answer(step: Step) -> bool:
+    check = _permission_check(step)
+    return check == _REPORTS or (check is None and _script_answers(step) is not None)
 
 
 def _askers(wf: Workflow, job_id: str) -> list[Step]:
     """The job's steps that ask for the commenter's permission, whether they fail on a no or
-    not: a step that fails may still write the answer to an output first."""
-    return [step for step in _job_steps(wf, job_id) if _permission_check(step) is not None]
+    not (a step that fails may still write the answer to an output first), and the scripts
+    that report who commented."""
+    return [
+        step
+        for step in _job_steps(wf, job_id)
+        if _permission_check(step) is not None or _script_answers(step) is not None
+    ]
+
+
+def _script_answers(step: Step) -> list[dict[str, object]] | None:
+    """For a bash ``run:`` script that looks at who commented (``${{ }}``, its ``env:``,
+    ``$GITHUB_ACTOR`` or the permission API): what it writes to ``$GITHUB_OUTPUT`` for a
+    stranger on each path where it succeeds (``shell.script_outputs``, every association that
+    can't write). None if it doesn't look, writes nothing, never succeeds, has
+    ``continue-on-error`` or isn't followed."""
+    run = scalar(get(step.node, "run"))
+    shell = (scalar(get(step.node, "shell")) or "bash").split()[0].lower()
+    if not run or shell not in ("bash", "sh") or _continues(step):
+        return None
+    env = {k: v.value for k, v in items(get(step.node, "env")) if isinstance(v, ScalarNode)}
+    texts = [run, *env.values()]
+    looks = (
+        any(_mentions(_paths(expr), _COMMENTER) for text in texts for expr in find_expressions(text))
+        or re.search(r"\$\{?GITHUB_(?:TRIGGERING_)?ACTOR\b", run) is not None
+        or _PERMISSION_API.search(run) is not None
+    )
+    if not looks:
+        return None
+    return _script_maps(run, tuple(sorted(env.items())))
+
+
+@lru_cache(maxsize=1024)
+def _script_maps(script: str, env: tuple[tuple[str, str], ...]) -> list[dict[str, object]] | None:
+    body, variables = _shell_run(script, env)
+    maps: list[dict[str, object]] = []
+    for values in variables.values():
+        found = script_outputs(body, values)
+        if found is None:
+            return None
+        maps += [m for m in found if m not in maps]
+    return maps if maps and any(maps) else None
 
 
 def _step_ids(steps: list[Step]) -> set[str]:
@@ -975,25 +1021,50 @@ def _possible_answers(step: Step, output: str) -> tuple[str, ...]:
     return NO_ANSWERS
 
 
+_SCRIPT = "\0script"  # the label of a lookup when only scripts' outputs answer
+_MAX_COMBINATIONS = 64
+
+
 def _no_answers(steps: list[Step]) -> list[tuple[str, Lookup]]:
     """For each answer in ``NO_ANSWERS``: the ``steps.<id>`` values of these permission steps
     (which don't stop the job) for a commenter who can't write. A step that would fail but has
     ``continue-on-error`` has the outcome ``failure``; the others succeed. An output that can't
     give that answer (see ``_possible_answers``) gives its first possible one instead, so every
     lookup is one a commenter can really meet. Each lookup notes in its ``seen`` dict whether it
-    gave its own answer ("said") or a stand-in ("swapped"), for ``_passing``."""
+    gave its own answer ("said") or a stand-in ("swapped"), for ``_passing``.
+
+    A script whose outputs are known (``_script_answers``) gives each of them in turn instead
+    (every combination with the other scripts); the lookup notes the ``name=value`` it gave in
+    ``seen["outputs"]``. With only such scripts there is one label, ``_SCRIPT``. A script that
+    asks the permission API but writes an output the evaluator can't work out keeps the answers
+    in ``NO_ANSWERS`` (what such an output says to a no)."""
     by_id = {(scalar(get(step.node, "id")) or "").lower(): step for step in steps}
     by_id.pop("", None)
     outcomes = {key: "failure" if _asks(step) else "success" for key, step in by_id.items()}
+    scripted = {
+        key: maps
+        for key, step in by_id.items()
+        if (maps := _script_answers(step)) is not None
+        and not (_permission_check(step) and any(v is UNKNOWN for m in maps for v in m.values()))
+    }
+    if math.prod(len(maps) for maps in scripted.values()) > _MAX_COMBINATIONS:
+        scripted = {}
+    labels = NO_ANSWERS if set(by_id) - set(scripted) or not scripted else (_SCRIPT,)
+    combinations = [dict(zip(scripted, combo, strict=True)) for combo in product(*scripted.values())]
 
-    def lookup_for(answer: str) -> Lookup:
-        seen: dict[str, bool] = {}
+    def lookup_for(answer: str, written: dict[str, dict[str, object]]) -> Lookup:
+        seen: dict[str, object] = {}
 
         def lookup(path: tuple[str, ...]) -> object:
             if len(path) > 2 and path[0] == "steps" and path[1] in outcomes:
                 if path[2] == "outputs":
                     if len(path) < 4:
                         return UNKNOWN
+                    if path[1] in written:
+                        value = written[path[1]].get(path[3], "")
+                        if isinstance(value, str):
+                            seen.setdefault("outputs", set()).add(f"{path[3]}={value}")  # type: ignore[union-attr]
+                        return value
                     possible = _possible_answers(by_id[path[1]], path[3])
                     seen["said" if answer in possible else "swapped"] = True
                     return answer if answer in possible else possible[0]
@@ -1006,19 +1077,19 @@ def _no_answers(steps: list[Step]) -> list[tuple[str, Lookup]]:
         lookup.seen = seen  # type: ignore[attr-defined]
         return lookup
 
-    return [(answer, lookup_for(answer)) for answer in NO_ANSWERS]
+    return [(label, lookup_for(label, written)) for label in labels for written in combinations]
 
 
-def _passing(node: Node | None, lookups: list[tuple[str, Lookup]]) -> list[str]:
-    """The answers for which the ``if:`` of ``node`` may be true (all, if it isn't an expression).
-    An answer that no output it reads can give (every one it read was a stand-in) isn't named:
-    its stand-in is named for itself."""
+def _passing(node: Node | None, lookups: list[tuple[str, Lookup]]) -> list[tuple[str, Lookup]]:
+    """The lookups (with their answers) for which the ``if:`` of ``node`` may be true (all, if
+    it isn't an expression). An answer that no output it reads can give (every one it read was
+    a stand-in) isn't named: its stand-in is named for itself."""
     text = _if_text(node)
     try:
         passing = [(answer, lookup) for answer, lookup in lookups if may_pass(text, lookup)]
     except ExpressionError:
-        return [answer for answer, _ in lookups]
-    return [answer for answer, lookup in passing if _said(lookup)]
+        return lookups
+    return [(answer, lookup) for answer, lookup in passing if _said(lookup)]
 
 
 def _said(lookup: Lookup) -> bool:
@@ -1026,11 +1097,21 @@ def _said(lookup: Lookup) -> bool:
     return bool(seen.get("said")) or not seen.get("swapped")
 
 
-def _answer_words(passing: list[str]) -> str:
-    """``passing`` answers to follow "when it answers"."""
-    if len(passing) == len(NO_ANSWERS):
+def _answer_words(passing: list[tuple[str, Lookup]]) -> str:
+    """``passing`` answers to follow "when it answers": the answers, or for scripts the
+    ``name=value`` outputs they write."""
+    answers = list(dict.fromkeys(answer for answer, _ in passing))
+    if answers == [_SCRIPT]:
+        written: set[str] = set()
+        for _, lookup in passing:
+            written |= getattr(lookup, "seen", {}).get("outputs", set())
+        words = [f"'{output}'" for output in sorted(written)]
+        if not words:
+            return "anything"
+    elif len(answers) == len(NO_ANSWERS):
         return "anything"
-    words = ["nothing" if answer == "" else f"'{answer}'" for answer in passing]
+    else:
+        words = ["nothing" if answer == "" else f"'{answer}'" for answer in answers]
     return ", ".join(words[:-1]) + (" or " if len(words) > 1 else "") + words[-1] if words else ""
 
 
@@ -1322,12 +1403,14 @@ def _why_open(
         if not steps:
             continue
         line = steps[0].node.start_mark.line + 1
+        asks = (
+            "asks for the commenter's permission" if _permission_check(steps[0]) else "looks at who commented"
+        )
         if name == job_id:
             who = next((w for w in (_answer_gate(node, steps)[1] for node in nodes) if w), "")
             check = f"is still true when it answers {who}" if who else "doesn't check its answer"
             return (
-                f" (the step at line {line} asks for the commenter's permission but doesn't"
-                f" fail on a no, and this {what}'s 'if:' {check})"
+                f" (the step at line {line} {asks} but doesn't fail on a no, and this {what}'s 'if:' {check})"
             )
         who = _needed_answer_gate(wf, jobs[job_id], name)[1]
         check = (
@@ -1336,8 +1419,8 @@ def _why_open(
             else f"doesn't check the answer in needs.{name}.outputs"
         )
         return (
-            f" (the step at line {line} in job '{name}', which it needs, asks for the"
-            f" commenter's permission but doesn't fail on a no, and this job's 'if:' {check})"
+            f" (the step at line {line} in job '{name}', which it needs, {asks} but doesn't fail"
+            f" on a no, and this job's 'if:' {check})"
         )
     if any(_mentions(_if_paths(node), _COMMENT_BODY) for node in nodes):
         return " (its 'if:' only looks at the comment's text, which anyone can write)"

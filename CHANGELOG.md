@@ -4,7 +4,56 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.29.0 — WG010: a check that may be skipped
+## v0.30.0 — WG010: scripts that report to $GITHUB_OUTPUT
+
+### A script that writes its check to `$GITHUB_OUTPUT` is read like an action that reports
+
+Some workflows check the commenter in a script and pass the result on:
+
+```yaml
+- id: trust
+  run: |
+    case "${{ github.event.comment.author_association }}" in
+      OWNER|MEMBER|COLLABORATOR) echo "trusted=true" >> "$GITHUB_OUTPUT" ;;
+      *) echo "trusted=false" >> "$GITHUB_OUTPUT" ;;
+    esac
+- if: steps.trust.outputs.trusted != 'true'
+  run: exit 1
+- if: steps.trust.outputs.trusted == 'true'
+  env:
+    GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+  run: gh workflow run ...
+```
+
+WG010 didn't know what such a script writes, so the job was reported. Now the bash evaluator
+follows `echo "name=value" >> "$GITHUB_OUTPUT"` (also `printf`, and `echo` in a
+`{ ...; } >> "$GITHUB_OUTPUT"` group) on every path where the script succeeds. A script that
+looks at who commented and writes something is a step that only reports, and an `if:` on its
+outputs is evaluated with what it writes for a stranger (`trusted=false` here). The message names
+those outputs:
+
+```
+wf.yml:14:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 9 looks at who commented but doesn't fail on a no, and this step's
+'if:' is still true when it answers 'trusted=false'); ...
+```
+
+- Any other way of writing to `$GITHUB_OUTPUT` (`tee`, a copy in a variable, a multiline value)
+  makes the outputs unknown, so the step is no check.
+- A script that asks the permission API but writes an output the evaluator can't work out
+  (`ok=$(...)`) keeps the earlier answers (empty, `false`, `none`, `read`).
+
+### `a || b` as a value
+
+With `a` unknown and `b` truthy, `a || b` is truthy, but its value may be `a`. It was taken as
+`true` everywhere, so `EVENT: ${{ steps.replay.outputs.event || github.event_name }}` became the
+text `true`. Now that is unknown wherever the value matters (a comparison, a function argument,
+`env:`, a job output); only as a condition it stays true.
+
+On the public workflows, one more finding went away (a script like the one above); no other
+finding changed.
+
+## v0.29.0 — WG010: a check that may be skipped (2026-11-21)
 
 ### A permission check with its own `if:` covers only steps with the same condition
 
