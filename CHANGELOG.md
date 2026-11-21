@@ -4,7 +4,44 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.30.0 — WG010: scripts that report to $GITHUB_OUTPUT
+## v0.31.0 — WG010: loops in bash checks
+
+### `for`, `while` and `until` are followed
+
+A permission script with a loop was judged from its text:
+
+```bash
+ok=no
+for role in admin maintain write; do
+  [ "$PERM" = "$role" ] && { ok=yes; break; }
+done
+[ "$ok" = yes ] || exit 1
+```
+
+Now the bash evaluator follows loops. `for x in a b c` runs its body once per word. Over words
+it can't count (`$LIST`, `$(...)`, a glob, a value with spaces), and for `while`/`until`, the
+body runs round after round from every state the last round left, until no new state turns up
+(at most 8 rounds; a counter that never settles makes the script unknown). `break`,
+`continue`, and `done < file` are followed too.
+
+### Commands that set variables
+
+Before, `read X` or `export X=...` left `X` as it was, so a later test of `X` could be decided
+wrongly. Now `read` makes its variables unknown, `export`/`declare`/`readonly NAME=value`
+assign, `unset` empties, `printf -v` makes unknown, and `IFS=, read -r a b` runs `read` (the
+prefix only lasts for the command). `eval`, `source`, `shift`, `let` and `getopts` make the
+script unknown.
+
+### The permission step's own token
+
+A step that asks for the commenter's permission needs a token for the API
+(`GH_TOKEN: ${{ secrets.BOT_PAT }}`); it was reported as a job that uses secrets once it only
+reported its answer. The check itself is no longer counted, only the steps it guards.
+
+On the public workflows, 24 of 40 permission scripts are now decided (21 before); 2 findings
+went away (a permission step that holds its own token), none was added.
+
+## v0.30.0 — WG010: scripts that report to $GITHUB_OUTPUT (2026-11-21)
 
 ### A script that writes its check to `$GITHUB_OUTPUT` is read like an action that reports
 

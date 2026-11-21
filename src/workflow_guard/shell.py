@@ -20,9 +20,15 @@ Functions (``name() { ...; }``, ``function name { ...; }``) run where they're ca
 groups run in place. In a condition, a negated command or before the last command of a
 ``&&``/``||`` list, ``set -e`` doesn't act inside them either (bash's rule).
 
-Anything else that changes the flow (loops, subshells, background jobs, heredocs) makes the
-script unknown: it doesn't count as a check. Commands it doesn't know succeed or
-fail, it doesn't matter which: only an ``exit`` or a failing test decides.
+Loops: ``for x in a b c`` runs its body once per word; over words it can't work out (``$LIST``,
+``$(...)``, a glob) and for ``while``/``until`` the body runs again and again, from every state
+the last round left, until no new state turns up (at most 8 rounds; otherwise the script is
+unknown). ``break`` and ``continue`` end a round. Commands that set variables are followed:
+``read`` (unknown values), ``export``/``declare``/``readonly`` with ``NAME=value``, ``unset``,
+``printf -v``; ``eval``, ``source``, ``shift``, ``let`` and ``getopts`` make the script unknown,
+as do ``((...))``, subshells, background jobs and heredocs: such a script doesn't count as a
+check. Commands it doesn't know succeed or fail, it doesn't matter which: only an ``exit`` or a
+failing test decides.
 
 The permission API is known too, when it asks about the commenter (a stranger's login):
 ``P=$(gh api repos/.../collaborators/$USER/permission --jq .permission)`` gives ``none`` or
@@ -43,7 +49,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -55,7 +61,12 @@ _COMMAND = "__WG_CMD"
 _MAX_PATHS = 64
 _OPS = ("&&", "||", ";;", "<<", ">>", ";", "|", "&", "(", ")", "<", ">", "\n")
 _OP_CHARS = ";&|()<>\n"
-_UNSUPPORTED = {"for", "while", "until", "select", "(", "((", "do", "done"}
+_UNSUPPORTED = {"select", "(", "((", "do", "done"}
+_BREAK = "\0break"  # set on a path that ran `break` (cleared when its loop ends)
+_CONTINUE = "\0continue"  # set on a path that ran `continue` (cleared at the end of the round)
+_LOOPS = "\0loops"  # how many loops deep
+_MAX_ROUNDS = 8
+_UNFOLLOWED = {"eval", "source", ".", "shift", "let", "getopts", "mapfile", "readarray", "select", "coproc"}
 _RETURNED = "\0return"  # set on a path that ran `return`: the status it returned
 _DEPTH = "\0depth"  # how many function calls deep
 _LOCALS = "\0locals"  # names declared `local` in the current call
@@ -277,6 +288,22 @@ class _Group:
 
 
 @dataclass
+class _For:
+    name: str
+    words: list[str] | None  # None: `for x; do` (the positional parameters)
+    body: list
+    output: bool = False
+
+
+@dataclass
+class _While:
+    condition: list
+    body: list
+    until: bool = False
+    output: bool = False
+
+
+@dataclass
 class _Define:
     name: str
     body: list
@@ -367,11 +394,19 @@ class _Parser:
         token = self.peek()
         if token in _UNSUPPORTED:
             raise Unsupported(f"{token!r}")
-        compound = {"if": self.if_, "case": self.case, "[[": self.double_test, "{": self.group}
+        compound = {
+            "if": self.if_,
+            "case": self.case,
+            "[[": self.double_test,
+            "{": self.group,
+            "for": self.for_,
+            "while": self.while_,
+            "until": self.while_,
+        }
         if token in compound:
             node = compound[token]()
-            output = self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`
-            if output and isinstance(node, _Group):
+            output = self.redirections()  # `} >> "$GITHUB_OUTPUT"`, `fi 2>&1`, `done < file`
+            if output and isinstance(node, (_Group, _For, _While)):
                 node.output = True
             elif output:
                 self.output_targets -= 1  # `fi >> "$GITHUB_OUTPUT"`: not followed
@@ -393,10 +428,11 @@ class _Parser:
     def redirections(self) -> bool:
         """Skips redirections after a compound command; True if one goes to $GITHUB_OUTPUT."""
         output = False
-        while self.peek() in (">", ">>") or (
-            self.peek() not in (None, *_OPS) and self.tokens[self.i + 1 : self.i + 2] in ([">"], [">>"])
+        while self.peek() in ("<", ">", ">>") or (
+            self.peek() not in (None, *_OPS)
+            and self.tokens[self.i + 1 : self.i + 2] in (["<"], [">"], [">>"])
         ):
-            if self.peek() not in (">", ">>"):
+            if self.peek() not in ("<", ">", ">>"):
                 self.i += 1  # a file descriptor: 2>
             output |= self.target()
         return output
@@ -412,6 +448,35 @@ class _Parser:
             self.output_targets += 1
             return True
         return False
+
+    def for_(self) -> _For:
+        self.take("for")
+        name = self.take()
+        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+            raise Unsupported(f"for {name!r}")  # for (( ... ))
+        self.newlines()
+        words: list[str] | None = None
+        if self.peek() == "in":
+            self.i += 1
+            words = []
+            while self.peek() not in (";", "\n", None):
+                if self.peek() in _OPS:
+                    raise Unsupported(f"for ... in {self.peek()!r}")
+                words.append(self.take())
+        while self.peek() in _SEPARATORS:
+            self.i += 1
+        return _For(name, words, self.do_done())
+
+    def while_(self) -> _While:
+        until = self.take() == "until"
+        condition = self.seq({"do"})
+        return _While(condition, self.do_done(), until)
+
+    def do_done(self) -> list:
+        self.take("do")
+        body = self.seq({"done"})
+        self.take("done")
+        return body
 
     def group(self) -> _Group:
         self.take("{")
@@ -731,7 +796,16 @@ def _simple(command: _Simple, env: Env) -> tuple[set[str], list[Result]]:
             name, value = _ASSIGNMENT.fullmatch(word).groups()  # type: ignore[union-attr]
             env[name] = _value(value, env)
         return set(), [(True, True, env)]
+    while len(words) > 1 and _ASSIGNMENT.fullmatch(words[0]):
+        words = words[1:]  # `IFS=, read -r a b`: the assignment only lasts for the command
     name, args = words[0], words[1:]
+    if name in ("break", "continue"):
+        if not env.get(_LOOPS) or args not in ([], ["1"]):
+            raise Unsupported(f"{name} outside a loop or out of more than one")
+        return set(), [(True, False, {**env, _BREAK if name == "break" else _CONTINUE: True})]
+    changed = _sets(name, args, env)
+    if changed is not None:
+        return set(), _status(None, changed) if name == "read" else [(True, True, changed)]
     function = env.get(_FUNCTION + name)
     if isinstance(function, _Function):
         return _call(function, args, env)
@@ -819,6 +893,53 @@ def _write(name: str, args: list[str], env: Env) -> Env:
     return env
 
 
+def _jumped(env: Env) -> bool:
+    """The path ran ``return``, ``break`` or ``continue``: the rest of its block is skipped."""
+    return _RETURNED in env or _BREAK in env or _CONTINUE in env
+
+
+def _sets(name: str, args: list[str], env: Env) -> Env | None:
+    """Commands that set variables: the new variables, or None for any other command."""
+    if name in _UNFOLLOWED:
+        raise Unsupported(name)
+    if name == "read":
+        env, names, i = dict(env), [], 0
+        while i < len(args):
+            word = args[i]
+            if word.startswith("-") and len(word) > 1:
+                if "a" in word:
+                    raise Unsupported("read -a")
+                if word[-1] in "pdtnNu":
+                    i += 1  # the option's value
+            else:
+                names.append(word)
+            i += 1
+        for var in names or ["REPLY"]:
+            env[var] = UNKNOWN
+        return env
+    if name in ("export", "declare", "typeset", "readonly"):
+        env, plain = dict(env), True
+        for word in args:
+            if word.startswith("-"):
+                if set(word[1:]) - set("xrgp"):
+                    plain = False  # -i, -l, -u... change the value; -a, -A, -n make arrays and refs
+                continue
+            assign = _ASSIGNMENT.fullmatch(word)
+            if assign:
+                env[assign.group(1)] = _value(assign.group(2), env) if plain else UNKNOWN
+        return env
+    if name == "unset":
+        env = dict(env)
+        functions = "-f" in args
+        for word in args:
+            if not word.startswith("-"):
+                env.pop(_FUNCTION + word, None) if functions else env.update({word: ""})
+        return env
+    if name == "printf" and len(args) > 1 and args[0] == "-v":
+        return {**env, args[1]: UNKNOWN}
+    return None
+
+
 def _call(function: _Function, args: list[str], env: Env) -> tuple[set[str], list[Result]]:
     """Runs a function's body where it's called: ``$1``... from ``args``; afterwards ``$1``...
     and its ``local`` variables are put back. Its status is ``return``'s, or its last
@@ -875,10 +996,100 @@ def _command(command: object, env: Env) -> tuple[set[str], list[Result]]:
             results = [
                 (status, last, {**after, _TO_OUTPUT: env.get(_TO_OUTPUT)}) for status, last, after in results
             ]
-        return ends, [(status, last and _RETURNED not in after, after) for status, last, after in results]
+        return ends, [(status, last and not _jumped(after), after) for status, last, after in results]
     if isinstance(command, _Define):
         return set(), [(True, True, {**env, _FUNCTION + command.name: _Function(command.body)})]
+    if isinstance(command, (_For, _While)):
+        inner = {**env, _LOOPS: int(env.get(_LOOPS) or 0) + 1}  # type: ignore[call-overload]
+        if command.output:
+            inner[_TO_OUTPUT] = True
+        ends, paths = _for(command, inner) if isinstance(command, _For) else _while(command, inner)
+        out = []
+        for after in paths:
+            after = {**after, _LOOPS: env.get(_LOOPS), _TO_OUTPUT: env.get(_TO_OUTPUT)}
+            after.pop(_BREAK, None)
+            out.append(after)
+        return _after_compound(ends, _dedupe(out))
     raise Unsupported(type(command).__name__)
+
+
+def _round(body: list, frontier: list[Env]) -> tuple[set[str], list[Env], list[Env]]:
+    """Runs a loop's body once from each path: the exits, the paths that go round again, and the
+    paths that leave the loop (``break``, or ``return`` from the function around it)."""
+    ends, out = _run_seq(body, frontier)
+    again, leave = [], []
+    for after in out:
+        if _BREAK in after or _RETURNED in after:
+            leave.append(after)
+        else:
+            after = dict(after)
+            after.pop(_CONTINUE, None)
+            again.append(after)
+    return ends, again, leave
+
+
+def _for(node: _For, env: Env) -> tuple[set[str], list[Env]]:
+    """``for``: once per word when the words are known (no `$`, no glob, nothing that splits);
+    otherwise rounds with the variable unknown until no new state turns up."""
+    values = None if node.words is None else [_value(word, env) for word in node.words]
+    if values is not None and all(isinstance(v, str) and not any(c in v for c in " \t\n*?[") for v in values):
+        ends: set[str] = set()
+        frontier, done = [env], []
+        for value in values:
+            more, frontier, leave = _round(node.body, [{**path, node.name: value} for path in frontier])
+            ends |= more
+            done += leave
+            if not frontier:
+                break
+        return ends, done + frontier
+    return _rounds(lambda path: ([{**path, node.name: UNKNOWN}], []), node.body, env, anytime=True)
+
+
+def _while(node: _While, env: Env) -> tuple[set[str], list[Env]]:
+    """``while``/``until``: the condition decides each round (``set -e`` doesn't act in it)."""
+    ends: set[str] = set()
+
+    def test(path: Env) -> tuple[list[Env], list[Env]]:
+        more, results = _seq_status(node.condition, {**path, _ERREXIT: False})
+        ends.update(more)
+        go, stop = [], []
+        for status, _, after in results:
+            after = {**after, _ERREXIT: path[_ERREXIT]}
+            (go if status != node.until else stop).append(after)
+        return go, stop
+
+    more, paths = _rounds(test, node.body, env)
+    return ends | more, paths
+
+
+def _rounds(
+    start: Callable[[Env], tuple[list[Env], list[Env]]], body: list, env: Env, anytime: bool = False
+) -> tuple[set[str], list[Env]]:
+    """Runs a loop until no new state turns up: ``start`` turns a path into the paths that run
+    the body and the paths that leave before it. ``anytime``: the loop may also end before any
+    round (a ``for`` over words it can't count)."""
+    ends: set[str] = set()
+    seen = {_key(env)}
+    frontier, done = [env], []
+    for _ in range(_MAX_ROUNDS):
+        go: list[Env] = []
+        for path in frontier:
+            if anytime:
+                done.append(path)
+            run, stop = start(path)
+            go += run
+            done += stop
+        if not go:
+            return ends, done
+        more, again, leave = _round(body, _dedupe(go))
+        ends |= more
+        done += leave
+        fresh = [path for path in _dedupe(again) if _key(path) not in seen]
+        seen |= {_key(path) for path in fresh}
+        frontier = fresh
+        if not frontier:
+            return ends, done
+    raise Unsupported("a loop that doesn't settle")
 
 
 def _after_compound(ends: set[str], paths: list[Env]) -> tuple[set[str], list[Result]]:
@@ -944,7 +1155,7 @@ def _and_or(command: _AndOr, env: Env) -> tuple[set[str], list[Result]]:
     for i, (op, pipe) in enumerate(command.rest):
         nxt: list[Result] = []
         for status, _, after in results:
-            if _RETURNED in after:
+            if _jumped(after):
                 nxt.append((status, False, after))
             elif status == (op == "&&"):
                 more, out = _pipe(pipe, after, last=i == len(command.rest) - 1)
@@ -956,10 +1167,14 @@ def _and_or(command: _AndOr, env: Env) -> tuple[set[str], list[Result]]:
     return ends, results
 
 
+def _key(env: Env) -> tuple:
+    return tuple(sorted((k, repr(v)) for k, v in env.items()))
+
+
 def _dedupe(paths: list[Env]) -> list[Env]:
     seen, out = set(), []
     for env in paths:
-        key = tuple(sorted((k, repr(v)) for k, v in env.items()))
+        key = _key(env)
         if key not in seen:
             seen.add(key)
             out.append(env)
@@ -974,7 +1189,7 @@ def _run_seq(seq: list, paths: list[Env]) -> tuple[set[str], list[Env]]:
     for command in seq:
         nxt: list[Env] = []
         for env in paths:
-            if _RETURNED in env:  # the function has returned: skip the rest of its body
+            if _jumped(env):  # return, break or continue: skip the rest of the block
                 nxt.append(env)
                 continue
             more, results = _and_or(command, env)
@@ -997,8 +1212,9 @@ def _seq_status(seq: list, env: Env) -> tuple[set[str], list[Result]]:
     ends, paths = _run_seq(seq[:-1], [env])
     results: list[Result] = []
     for after in paths:
-        if _RETURNED in after:
-            results.append((bool(after[_RETURNED]), False, after))
+        if _jumped(after):
+            # After break/continue the status is never read (the jumped path skips everything).
+            results.append((bool(after.get(_RETURNED, True)), False, after))
             continue
         more, out = _and_or(seq[-1], after)
         ends |= more
