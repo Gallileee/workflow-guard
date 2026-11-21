@@ -423,7 +423,8 @@ def test_step_ids_dont_depend_on_case():
         (ASK_ONLY[:2], "steps.perm.outputs.require-result != 'false'", "nothing, 'none' or 'read'"),
         # A misspelt output name is empty: != fails open, == fails closed.
         (ASK_ONLY, "steps.perm.outputs.require-reslut != 'false'", "nothing, 'none' or 'read'"),
-        (GITHUB_SCRIPT_ASK, "steps.perm.outputs.result != 'none'", "nothing, 'false' or 'read'"),
+        # The script is run on paper: it returns false for a stranger.
+        (GITHUB_SCRIPT_ASK, "steps.perm.outputs.result != 'none'", "'result=false'"),
         # A step that never fails always succeeds.
         (GITHUB_SCRIPT_ASK, "steps.perm.outcome == 'success'", "anything"),
         (GITHUB_SCRIPT_ASK, "steps.perm.conclusion == 'success'", "anything"),
@@ -433,7 +434,7 @@ def test_step_ids_dont_depend_on_case():
             "'false'",
         ),
         (ASK_ONLY, "${{ steps.perm.outputs.require-result == 'true' || always() }}", "'false'"),
-        (GITHUB_SCRIPT_ASK, "${{ steps.perm.outputs.result == 'true' || always() }}", "anything"),
+        (GITHUB_SCRIPT_ASK, "${{ steps.perm.outputs.result == 'true' || always() }}", "'result=false'"),
         # Not an expression GitHub accepts.
         (ASK_ONLY, "steps.perm.outputs.require-result ==", "anything"),
     ],
@@ -839,9 +840,7 @@ def test_a_failing_permission_step_that_also_writes_its_answer():
         "    steps:\n      - uses: actions/github",
     )
     assert wg010(text) == []
-    assert (
-        len(wg010(text.replace("needs.gate.outputs.ok == 'true'", "needs.gate.outputs.ok != 'false'"))) == 1
-    )
+    assert len(wg010(text.replace("needs.gate.outputs.ok == 'true'", "needs.gate.outputs.ok != 'true'"))) == 1
 
 
 @pytest.mark.parametrize(
@@ -1274,3 +1273,114 @@ def test_the_permission_step_may_use_a_secret_token():
     assert wg010(on_comment(*ask, "- run: echo hi")) == []
     secret = ("- run: ./deploy.sh", "  env:", "    T: ${{ secrets.X }}")
     assert [s for _, s, _ in wg010(on_comment(*ask, *secret))] == [Severity.MEDIUM]
+
+
+# --- github-script run on paper ------------------------------------------------------------------
+
+
+def github_script(*lines: str, step_id: str = "perm") -> tuple[str, ...]:
+    return (
+        f"- uses: actions/github-script@{SHA}",
+        f"  id: {step_id}",
+        "  with:",
+        "    script: |",
+        *(f"      {line}" for line in lines),
+    )
+
+
+ASK_JS = (
+    "const { data } = await github.rest.repos.getCollaboratorPermissionLevel({",
+    "  ...context.repo, username: context.actor })",
+)
+
+
+def test_a_github_script_that_fails_only_on_an_api_error_is_no_stop():
+    script = github_script(
+        "try {",
+        *ASK_JS,
+        "  core.setOutput('level', data.permission)",
+        "} catch (e) {",
+        "  core.setFailed(e.message)",
+        "}",
+    )
+    ((_, severity, message),) = wg010(on_comment(*script, *CHECKOUT_PR))
+    assert severity == Severity.HIGH
+    assert "asks for the commenter's permission but doesn't fail on a no" in message
+
+
+def test_a_github_script_that_fails_on_a_no_is_a_stop():
+    script = github_script(
+        *ASK_JS, "if (!['admin', 'write'].includes(data.permission)) throw new Error('no')"
+    )
+    assert wg010(on_comment(*script, *CHECKOUT_PR)) == []
+
+
+@pytest.mark.parametrize(
+    ("cond", "covered"),
+    [
+        ("steps.perm.outputs.level == 'write'", True),
+        ("steps.perm.outputs.level != 'none'", False),
+    ],
+)
+def test_a_github_script_output_is_its_real_answer(cond, covered):
+    script = github_script(*ASK_JS, "core.setOutput('level', data.permission)")
+    found = wg010(on_comment(*script, *CHECKOUT_PR, f"  if: {cond}"))
+    assert (found == []) is covered
+    if not covered:
+        assert "is still true when it answers 'level=read')" in found[0][2]
+
+
+def test_return_false_is_the_text_false():
+    # `${{ !steps.x.outputs.result }}` is never true: the result is the text 'false'.
+    script = github_script(*ASK_JS, "return ['admin', 'write'].includes(data.permission)")
+    deny = ("- if: ${{ !steps.perm.outputs.result }}", "  run: exit 1")
+    ((_, _, message),) = wg010(on_comment(*script, *deny, *CHECKOUT_PR))
+    assert "(the step at line" in message
+    assert wg010(on_comment(*script, *CHECKOUT_PR, "  if: steps.perm.outputs.result == 'true'")) == []
+
+
+def test_a_github_script_on_the_association_is_a_stop():
+    script = github_script(
+        "const a = context.payload.comment.author_association",
+        "if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(a)) core.setFailed('not allowed')",
+    )
+    assert wg010(on_comment(*script, *CHECKOUT_PR)) == []
+    weak = github_script("if (context.payload.comment.author_association === 'NONE') core.setFailed('x')")
+    assert len(wg010(on_comment(*weak, *CHECKOUT_PR))) == 1
+
+
+def test_a_github_script_with_pasted_expressions():
+    script = github_script(
+        "if ('${{ github.event.comment.author_association }}' !== 'OWNER') core.setFailed('x')"
+    )
+    assert wg010(on_comment(*script, *CHECKOUT_PR)) == []
+
+
+def test_a_github_script_it_cant_follow_is_guessed_from_its_text():
+    script = github_script(*ASK_JS, "if (!['admin'].some(p => p === data.permission)) core.setFailed('no')")
+    assert wg010(on_comment(*script, *CHECKOUT_PR)) == []  # setFailed in the text: counted as a check
+
+
+def test_result_encoding_string():
+    script = (*github_script(*ASK_JS, "return data.permission"), "    result-encoding: string")
+    assert wg010(on_comment(*script, *CHECKOUT_PR, "  if: steps.perm.outputs.result == 'write'")) == []
+    json_script = github_script(*ASK_JS, "return data.permission")
+    # As JSON the result is '"read"', never 'write' either; both are covered.
+    assert wg010(on_comment(*json_script, *CHECKOUT_PR, "  if: steps.perm.outputs.result == 'write'")) == []
+
+
+def test_a_needed_jobs_output_from_a_step_that_doesnt_run_is_empty():
+    gate_steps = (
+        *github_script(*ASK_JS, "core.setOutput('ok', String(data.permission === 'admin'))"),
+        "- id: ready",
+        "  if: steps.perm.outputs.ok == 'true'",
+        "  run: echo ready=yes >> $GITHUB_OUTPUT",
+    )
+    gate = "\n".join(f"      {line}" for line in gate_steps)
+    text = on_comment(*CHECKOUT_PR, job_if="needs.gate.outputs.ready == 'yes'").replace(
+        "jobs:\n  test:\n",
+        "jobs:\n  gate:\n    runs-on: x\n    outputs:\n      ready: ${{ steps.ready.outputs.ready }}\n"
+        f"    steps:\n{gate}\n  test:\n    needs: gate\n",
+    )
+    assert wg010(text) == []
+    assert len(wg010(text.replace("        if: steps.perm.outputs.ok == 'true'\n", ""))) == 1

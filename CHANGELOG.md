@@ -4,7 +4,59 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.31.0 — WG010: loops in bash checks
+## v0.32.0 — WG010: github-script checks run on paper
+
+### `actions/github-script` is followed, not guessed
+
+A github-script that asked the permission API counted as a check whenever `core.setFailed`,
+`throw` or `process.exit(1)` appeared anywhere in it. That holds for a script that fails only when
+the API call itself fails:
+
+```js
+try {
+  const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+    ...context.repo, username: context.actor })
+  core.setOutput('level', data.permission)
+} catch (e) {
+  core.setFailed(e.message)
+}
+```
+
+Now such a script runs on paper (a small JavaScript evaluator, `jscript.py`) for a commenter who
+can't write. The API about them answers `none` or `read`, or throws a 404 (into `catch` if there
+is one), and any other call may throw. The evaluator follows `const`/`let` with `{ data: {
+permission } }` patterns, `if`/`else`, `return`, `throw`, `try`/`catch`/`finally`,
+`core.setFailed`, `core.setOutput`, `process.exit`, `.includes()` and the usual operators. If
+every path fails, the step is a check. Otherwise it only reports, and its outputs are what it
+really writes, `level=none` or `level=read` here, so `if: steps.perm.outputs.level != 'none'`
+is reported:
+
+```
+wf.yml:14:9: WG010 [high] checks out the pull request's code (...) without checking who
+commented (the step at line 9 asks for the commenter's permission but doesn't fail on a no, and
+this step's 'if:' is still true when it answers 'level=read'); ...
+```
+
+- `return x` is the `result` output: JSON by default (`return false` is the text `false`, which
+  is true in an `if:`, so `if: ${{ !steps.x.outputs.result }}` is never true), or the plain text
+  with `result-encoding: string`.
+- A github-script that checks `author_association` or the login without the API, and fails for
+  everyone who can't write, is a check too.
+- Arrow functions, functions, loops and `switch` aren't followed: such a script is judged from
+  its text, as before.
+
+### Outputs of a step that doesn't run
+
+A step whose `if:` keeps strangers out writes no outputs for them. So a job output that carries
+one is empty (`ready: ${{ steps.ready.outputs.ready }}` after `if: steps.perm.outputs.ok ==
+'true'`), and a dependent job's `if: needs.gate.outputs.ready == 'yes'` is false for a stranger.
+
+On the public workflows, 19 of the 31 github-script permission checks are now run on paper:
+17 as the text said, two only report (one returns early when the comment isn't its command,
+one sets `authorized=false`, which the job after it checks through a step that doesn't run).
+No finding changed.
+
+## v0.31.0 — WG010: loops in bash checks (2026-11-21)
 
 ### `for`, `while` and `until` are followed
 
