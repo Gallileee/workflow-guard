@@ -38,7 +38,7 @@ A step that asks for the commenter's permission needs a token for the API
 (`GH_TOKEN: ${{ secrets.BOT_PAT }}`); it was reported as a job that uses secrets once it only
 reported its answer. The check itself is no longer counted, only the steps it guards.
 
-On the public workflows, 24 of 40 permission scripts are now decided (21 before); 3 findings
+On the public workflows, 24 of 40 permission scripts are now decided (21 before); 2 findings
 went away (a permission step that holds its own token), none was added.
 
 ## v0.30.0 — WG010: scripts that report to $GITHUB_OUTPUT (2026-11-21)
