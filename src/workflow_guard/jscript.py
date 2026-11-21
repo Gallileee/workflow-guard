@@ -22,7 +22,14 @@ patterns), assignments, ``if``/``else``, ``return``, ``throw``, ``try``/``catch`
 expressions around them: ``!``, ``&&``, ``||``, ``??``, ``? :``, ``===``/``!==``/``==``/``!=``,
 ``+``, template strings, ``.includes``/``.indexOf``/``.toLowerCase``/``.trim``/``.startsWith``/
 ``.endsWith``, ``String``/``Boolean``/``JSON.stringify``. A condition it can't decide goes both
-ways. Functions, arrow functions, loops, ``switch`` and classes make the script unknown.
+ways. Functions (``function f(a, b = 1) {}``, ``async function``, arrow functions with an
+expression or a block) run where they are called, with their own parameters and declarations
+(``async``/``await`` change nothing here); ``.some``, ``.every``, ``.find``, ``.findIndex``,
+``.filter``, ``.map`` and ``.forEach`` call their callback for each element of a known list (on
+an unknown one: zero or one call, and an unknown result). ``for (const x of list)`` runs once
+per element of a known list, and round after round on an unknown one until no new state turns
+up (at most 8); ``break`` and ``continue`` work in it. Other loops, ``switch``, classes,
+recursion past 8 calls and array patterns make the script unknown.
 
 ``${{ }}`` in the script is pasted in before it runs; its value (see
 ``conditions.stranger_text``) is put where it stands, inside a string or not.
@@ -74,6 +81,8 @@ def run(script: str, values: Mapping[int, object], association: str, encoding: s
         program = _Parser(_tokens(script, values)).program()
         env = _Env({"context": _context(association)}, {}, False, False)
         ends = _block(program, [env])
+        if any(end.kind in ("break", "continue") for end in ends):
+            raise Unsupported("break outside a loop")
     except (Unsupported, RecursionError):
         return None
     successes: list[dict[str, object]] = []
@@ -244,7 +253,12 @@ def _string(text: str, i: int, values: Mapping[int, object]) -> tuple[object, in
         if c == "\\":
             nxt = text[i + 1 : i + 2]
             if nxt in ("x", "u"):
-                raise Unsupported("escape")
+                m = re.match(r"x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|u\{([0-9a-fA-F]{1,6})\}", text[i + 1 :])
+                if m is None:
+                    raise Unsupported("escape")
+                parts.append(chr(int(m.group(1) or m.group(2) or m.group(3), 16)))
+                i += 1 + len(m.group(0))
+                continue
             parts.append(_ESCAPES.get(nxt, nxt))
             i += 2
             continue
@@ -425,22 +439,82 @@ class _Parser:
                     self.i += 1
                     final = self.block()
                 return _Node("try", name, (attempt, handler, final))
-            if word in (
-                "function",
-                "for",
-                "while",
-                "do",
-                "switch",
-                "class",
-                "async",
-                "with",
-                "yield",
-                "import",
-            ):
+            if word == "function" or (word == "async" and self.peek(1) == _Token("name", "function")):
+                node = self.function()
+                if node.value is None:
+                    raise Unsupported("a function statement without a name")
+                return _Node("fundecl", node.value, node.children)
+            if word == "for":
+                return self.for_of()
+            if word in ("break", "continue"):
+                self.i += 1
+                nxt = self.peek()
+                if nxt is not None and nxt.kind == "name" and not nxt.newline:
+                    raise Unsupported(f"{word} with a label")
+                self.end()
+                return _Node(word)
+            if word in ("while", "do", "switch", "class", "with", "yield", "import"):
                 raise Unsupported(word)
         node = self.expression()
         self.end()
         return _Node("expr", node)
+
+    def for_of(self) -> _Node:
+        self.take("for")
+        self.take("(")
+        if not self.is_name("const", "let", "var"):
+            raise Unsupported("for loop")
+        self.i += 1
+        tok = self.take()
+        if tok.kind != "name" or not self.is_name("of"):
+            raise Unsupported("for loop that isn't for...of")
+        self.i += 1
+        iterable = self.expression()
+        self.take(")")
+        return _Node("forof", tok.value, (iterable, self.body()))
+
+    def function(self) -> _Node:
+        """``[async] function [name](params) { body }``: a node with the name (or None) and
+        (params, body, is_block)."""
+        if self.is_name("async"):
+            self.i += 1
+        self.take("function")
+        name = None
+        if (tok := self.peek()) is not None and tok.kind == "name":
+            name = self.take().value
+        params = self.params()
+        return _Node("function", name, (params, self.block(), True))
+
+    def params(self) -> list[tuple[str, _Node | None]]:
+        """``(a, b = 1)``: names with their defaults; patterns and rest aren't followed."""
+        self.take("(")
+        params = []
+        while not self.is_op(")"):
+            tok = self.take()
+            if tok.kind != "name":
+                raise Unsupported("a parameter pattern")
+            default = None
+            if self.is_op("="):
+                self.i += 1
+                default = self.assignment()
+            params.append((str(tok.value), default))
+            if not self.is_op(")"):
+                self.take(",")
+        self.take(")")
+        return params
+
+    def arrow(self) -> _Node:
+        """``[async] x => body`` or ``[async] (a, b) => body``."""
+        if self.is_name("async"):
+            self.i += 1
+        if self.is_op("("):
+            params = self.params()
+        else:
+            params = [(str(self.take().value), None)]
+        self.take("=>")
+        if self.is_op("{"):
+            return _Node("function", None, (params, self.block(), True))
+        return _Node("function", None, (params, self.assignment(), False))
 
     def declarator(self) -> _Node:
         if self.is_op("{"):
@@ -485,9 +559,15 @@ class _Parser:
 
     def assignment(self) -> _Node:
         start = self.i
+        if self.is_name("async") and (nxt := self.peek(1)) is not None and not nxt.newline:
+            self.i += 1
+            arrow = self._arrow_ahead()
+            self.i = start
+            if arrow:
+                return self.arrow()
         if self.is_op("(") or (self.peek() is not None and self.peek().kind == "name"):  # type: ignore[union-attr]
             if self._arrow_ahead():
-                raise Unsupported("arrow function")
+                return self.arrow()
         self.i = start
         left = self.conditional()
         if self.is_op("=", "+=", "-=", "*=", "/=", "%=", "||=", "&&=", "??="):
@@ -617,7 +697,10 @@ class _Parser:
                 callee = self.postfix_member(self.primary())
                 args = self.arguments() if self.is_op("(") else []
                 return _Node("new", None, (callee, *args))
-            if tok.value in ("function", "class", "this", "super", "async", "yield"):
+            if tok.value == "function" or (tok.value == "async" and self.is_name("function")):
+                self.i -= 1
+                return self.function()
+            if tok.value in ("class", "this", "super", "yield"):
                 raise Unsupported(str(tok.value))
             return _Node("name", tok.value)
         if tok.value == "(":
@@ -689,6 +772,22 @@ class _Env:
                 self.asked,
             )
         )
+
+
+class _Fn:
+    """A function value (compared and shown by identity)."""
+
+    def __init__(self, params: list, body: object, block: bool) -> None:
+        self.params, self.body, self.block = params, body, block
+
+    def __repr__(self) -> str:
+        return f"<function {id(self)}>"
+
+
+_DEPTH: list[int] = [0]  # how many calls deep (one run at a time)
+_MAX_DEPTH = 8
+_MAX_ROUNDS = 8
+_CALLBACKS = {"some", "every", "find", "findIndex", "filter", "map", "forEach"}
 
 
 @dataclass
@@ -817,8 +916,57 @@ class _Throw(Exception):
 _STRING_METHODS = {"toLowerCase", "toUpperCase", "trim", "toString", "trimStart", "trimEnd"}
 
 
+class _Collection:
+    """A ``Map`` (``pairs``) or ``Set`` (keys with no value), kept as an immutable list of
+    entries in insertion order; ``set``/``add`` make a new one."""
+
+    def __init__(self, kind: str, pairs: tuple[tuple[object, object], ...] = ()) -> None:
+        self.kind, self.pairs = kind, pairs
+
+    def __repr__(self) -> str:
+        return f"{self.kind}({self.pairs!r})"
+
+    def find(self, key: object) -> tuple[bool | None, object]:
+        """Whether ``key`` is in it (None: may be) and its value (UNKNOWN if not sure)."""
+        maybe = False
+        for k, v in self.pairs:
+            same = _equal(k, key, True)
+            if same is True:
+                return (None, UNKNOWN) if maybe else (True, v)
+            if same is None:
+                maybe = True
+        return (None, UNKNOWN) if maybe else (False, UNDEFINED)
+
+    def put(self, key: object, value: object) -> object:
+        """A new one with ``key`` set; UNKNOWN when it may or may not be there already."""
+        found, _ = self.find(key)
+        if found is None:
+            return UNKNOWN
+        pairs = tuple((k, value if _equal(k, key, True) else v) for k, v in self.pairs)
+        return _Collection(self.kind, pairs if found else (*pairs, (key, value)))
+
+
+def _construct(callee: list[str] | None, args: list[object]) -> object:
+    """``new Map()``, ``new Map([[k, v]])``, ``new Set([...])``; anything else is unknown."""
+    items = args[0] if args else []
+    if callee == ["Set"] and isinstance(items, list):
+        return _Collection("Set", tuple((item, True) for item in items))
+    if (
+        callee == ["Map"]
+        and isinstance(items, list)
+        and all(isinstance(i, list) and len(i) == 2 for i in items)
+    ):
+        return _Collection("Map", tuple((i[0], i[1]) for i in items))  # type: ignore[index]
+    return UNKNOWN
+
+
 def _method(obj: object, name: str, args: list[object]) -> object:
     """A known method on a known value, or UNKNOWN."""
+    if isinstance(obj, _Collection) and args and name in ("has", "get"):
+        found, value = obj.find(args[0])
+        if name == "has":
+            return UNKNOWN if found is None else found
+        return value
     if name in _STRING_METHODS and not args:
         if obj is STRANGER:
             return STRANGER
@@ -933,10 +1081,13 @@ def _eval(node: _Node, env: _Env) -> Values:
     if kind == "call":
         return _call(node, env)
     if kind == "new":
-        out, thrown = _seq(list(node.children[1:]), env, lambda _: UNKNOWN)
-        return out, thrown
+        callee = _callee_path(node.children[0])
+        return _seq(list(node.children[1:]), env, lambda args: _construct(callee, args))
     if kind == "spread":
         return _eval(node.children[0], env)
+    if kind == "function":
+        params, body, block = node.children
+        return [(env, _Fn(params, body, block))], []
     raise Unsupported(kind)
 
 
@@ -1115,9 +1266,184 @@ def _callee_path(node: _Node) -> list[str] | None:
     return parts[::-1]
 
 
+def _locals(body: object, params: list) -> set[str]:
+    """The names a function declares itself (parameters, const/let/var, inner functions):
+    they don't change the caller's names."""
+    names = {name for name, _ in params}
+    todo = list(body) if isinstance(body, list) else []
+    while todo:
+        node = todo.pop()
+        if not isinstance(node, _Node) or node.kind == "function":
+            continue  # a nested function's names are its own
+        if node.kind == "declare":
+            target = node.children[0]
+            stack = [target]
+            while stack:
+                t = stack.pop()
+                if t.kind == "name":
+                    names.add(str(t.value))
+                else:
+                    stack += [sub for _, sub in t.value]  # type: ignore[attr-defined]
+        elif node.kind == "fundecl":
+            names.add(str(node.value))
+            continue
+        elif node.kind == "forof":
+            names.add(str(node.value))
+        for child in node.children:
+            if isinstance(child, list):
+                todo += child
+            elif isinstance(child, tuple):
+                todo += [c for c in child if isinstance(c, (_Node, list))]
+            else:
+                todo.append(child)
+        if isinstance(node.value, list):
+            todo += node.value
+    return names
+
+
+def _invoke(fn: _Fn, args: list[object], env: _Env) -> Values:
+    """Calls ``fn``: its body runs with the parameters bound; afterwards the caller's names are
+    back, but changes to names the function doesn't declare stay (they're the caller's)."""
+    if _DEPTH[0] >= _MAX_DEPTH:
+        raise Unsupported("calls too deep")
+    _DEPTH[0] += 1
+    try:
+        inner = env
+        for i, (name, default) in enumerate(fn.params):
+            value = args[i] if i < len(args) else UNDEFINED
+            if value is UNDEFINED and default is not None:
+                out, _ = _eval(default, inner)
+                value = out[0][1] if len(out) == 1 else UNKNOWN
+            inner = inner.with_name(name, value)
+        local = _locals(fn.body, fn.params)
+        values: list[tuple[_Env, object]] = []
+        thrown: list[_Env] = []
+        if fn.block:
+            for end in _block(fn.body, [inner]):  # type: ignore[arg-type]
+                if end.kind in ("exit_ok", "exit_fail", "break", "continue"):
+                    raise Unsupported(f"{end.kind} inside a function")
+                if end.kind == "throw":
+                    thrown.append(_back(end.env, env, local))
+                else:
+                    values.append(
+                        (_back(end.env, env, local), end.value if end.kind == "return" else UNDEFINED)
+                    )
+        else:
+            out, err = _eval(fn.body, inner)  # type: ignore[arg-type]
+            values = [(_back(e, env, local), v) for e, v in out]
+            thrown = [_back(e, env, local) for e in err]
+        return values, thrown
+    finally:
+        _DEPTH[0] -= 1
+
+
+def _back(after: _Env, before: _Env, local: set[str]) -> _Env:
+    names = {k: v for k, v in after.names.items() if k not in local}
+    names.update({k: v for k, v in before.names.items() if k in local})
+    return _Env(names, after.outputs, after.failed, after.asked)
+
+
+def _callback(method: str, items: object, fn: _Fn, env: _Env) -> Values:
+    """``items.some(fn)`` and the like: ``fn(item, index)`` for each element of a known list,
+    in order; on anything else zero or one call (for what it may change) and an unknown
+    result."""
+    if not isinstance(items, list):
+        out, thrown = _invoke(fn, [UNKNOWN, UNKNOWN], env)
+        return [(env, UNKNOWN)] + [(e, UNKNOWN) for e, _ in out], thrown
+    states: list[tuple[_Env, list[object]]] = [(env, [])]
+    thrown: list[_Env] = []
+    for index, item in enumerate(items):
+        nxt = []
+        for e, results in states:
+            out, err = _invoke(fn, [item, float(index)], e)
+            thrown += err
+            nxt += [(e2, [*results, v]) for e2, v in out]
+        states = _cap(nxt)
+    return [(e, _combine(method, items, results)) for e, results in states], thrown
+
+
+def _collection_call(name: str, method: str, arg_nodes: list[_Node], env: _Env) -> Values:
+    """``cache.has(k)``, ``cache.get(k)``, ``cache.set(k, v)``, ``seen.add(k)`` on a Map or Set
+    held in a name: ``set``/``add`` put the new one back under that name."""
+
+    def apply(args: list[object]) -> object:
+        return args
+
+    out, thrown = _seq(list(arg_nodes), env, apply)
+    values: list[tuple[_Env, object]] = []
+    for e, args in out:
+        held = e.names[name]
+        assert isinstance(held, _Collection)
+        if method in ("has", "get"):
+            values.append((e, _method(held, method, args)))  # type: ignore[arg-type]
+        elif method in ("set", "add") and args:
+            value = args[1] if method == "set" and len(args) > 1 else True  # type: ignore[index]
+            new = held.put(args[0], value if held.kind == "Map" else True)  # type: ignore[index]
+            values.append((e.with_name(name, new), new))
+        else:
+            raise Unsupported(f"{held.kind}.{method}")
+    return values, thrown
+
+
+def _combine(method: str, items: list[object], results: list[object]) -> object:
+    tests = [_truthy(r) for r in results]
+    if method == "some":
+        return True if True in tests else (UNKNOWN if None in tests else False)
+    if method == "every":
+        return False if False in tests else (UNKNOWN if None in tests else True)
+    if method in ("find", "findIndex"):
+        for index, (item, test) in enumerate(zip(items, tests, strict=True)):
+            if test is None:
+                return UNKNOWN
+            if test:
+                return item if method == "find" else float(index)
+        return UNDEFINED if method == "find" else -1.0
+    if method == "filter":
+        return UNKNOWN if None in tests else [item for item, test in zip(items, tests, strict=True) if test]
+    if method == "map":
+        return list(results)
+    return UNDEFINED  # forEach
+
+
 def _call(node: _Node, env: _Env) -> Values:
     callee, *arg_nodes = node.children
+    if callee.kind == "member" and str(callee.value) in _CALLBACKS and len(arg_nodes) == 1:
+        method = str(callee.value)
+
+        def apply(vals: list[object]) -> object:
+            return vals
+
+        pairs, thrown = _seq([callee.children[0], arg_nodes[0]], env, apply)
+        values: list[tuple[_Env, object]] = []
+        for e, (items, fn) in pairs:  # type: ignore[misc]
+            if isinstance(fn, _Fn):
+                out, err = _callback(method, items, fn, e)
+                values += out
+                thrown += err
+            else:
+                values.append((e, UNKNOWN))
+                thrown.append(e)
+        return _cap(values), thrown
+    if callee.kind not in ("name", "member") or (
+        callee.kind == "name" and isinstance(env.names.get(str(callee.value)), _Fn)
+    ):
+        fns, thrown = _eval(callee, env)
+        values = []
+        for e, fn in fns:
+            args_out, err = _seq(list(arg_nodes), e, lambda vals: vals)
+            thrown += err
+            for e2, args in args_out:
+                if not isinstance(fn, _Fn):
+                    values.append((e2, UNKNOWN))
+                    thrown.append(e2)
+                    continue
+                out, err2 = _invoke(fn, args, e2)  # type: ignore[arg-type]
+                values += out
+                thrown += err2
+        return _cap(values), thrown
     path = _callee_path(callee)
+    if path and len(path) == 2 and isinstance(env.names.get(path[0]), _Collection):
+        return _collection_call(path[0], path[1], arg_nodes, env)
     if (
         path
         and path[-1] in _STRING_METHODS | {"includes", "indexOf", "startsWith", "endsWith"}
@@ -1128,7 +1454,7 @@ def _call(node: _Node, env: _Env) -> Values:
     if callee.kind == "member" and path is None:
         # (expr).method(...): the object is an expression
         name = str(callee.value)
-        if name in _STRING_METHODS | {"includes", "indexOf", "startsWith", "endsWith"}:
+        if name in _STRING_METHODS | {"includes", "indexOf", "startsWith", "endsWith", "has", "get"}:
             return _seq([callee.children[0], *arg_nodes], env, lambda vals: _method(vals[0], name, vals[1:]))
     values, thrown = _seq(list(arg_nodes), env, lambda vals: vals)
     results: list[tuple[_Env, object]] = []
@@ -1199,9 +1525,14 @@ def _dedupe(ends: list[_End]) -> list[_End]:
 
 
 def _block(body: list[_Node], envs: list[_Env]) -> list[_End]:
-    """Runs statements from each env: how each path ends (``normal`` if it falls through)."""
+    """Runs statements from each env: how each path ends (``normal`` if it falls through).
+    Function statements are bound first (JavaScript hoists them)."""
     ends: list[_End] = []
     current = envs
+    for stmt in body:
+        if stmt.kind == "fundecl":
+            params, fbody, block = stmt.children
+            current = [e.with_name(str(stmt.value), _Fn(params, fbody, block)) for e in current]
     for stmt in body:
         nxt: list[_Env] = []
         for env in current:
@@ -1228,6 +1559,12 @@ def _statement_inner(stmt: _Node, env: _Env) -> list[_End]:
     kind = stmt.kind
     if kind == "block":
         return _block(stmt.value, [env])  # type: ignore[arg-type]
+    if kind == "fundecl":
+        return [_End("normal", env)]  # bound when its block started
+    if kind in ("break", "continue"):
+        return [_End(kind, env)]
+    if kind == "forof":
+        return _for_of(stmt, env)
     if kind == "expr":
         out, thrown = _eval(stmt.value, env)  # type: ignore[arg-type]
         return [_End("normal", e) for e, _ in out] + [_End("throw", e) for e in thrown]
@@ -1281,6 +1618,51 @@ def _statement_inner(stmt: _Node, env: _Env) -> list[_End]:
             ends = finished
         return _dedupe(ends)
     raise Unsupported(kind)
+
+
+def _for_of(stmt: _Node, env: _Env) -> list[_End]:
+    """``for (const x of items)``: once per element of a known list; otherwise round after
+    round with ``x`` unknown until no new state turns up (the loop may end before any round)."""
+    name = str(stmt.value)
+    iterable, body = stmt.children
+    out, thrown = _eval(iterable, env)
+    ends = [_End("throw", e) for e in thrown]
+    for start, items in out:
+        if isinstance(items, list):
+            current = [start]
+            for item in items:
+                again: list[_Env] = []
+                for end in _block(body, [e.with_name(name, item) for e in current]):
+                    if end.kind in ("normal", "continue"):
+                        again.append(end.env)
+                    elif end.kind == "break":
+                        ends.append(_End("normal", end.env))
+                    else:
+                        ends.append(end)
+                current = [e.env for e in _dedupe([_End("normal", e) for e in again])]
+            ends += [_End("normal", e) for e in current]
+            continue
+        seen = {start.key()}
+        current = [start]
+        ends.append(_End("normal", start))
+        for _ in range(_MAX_ROUNDS):
+            fresh: list[_Env] = []
+            for end in _block(body, [e.with_name(name, UNKNOWN) for e in current]):
+                if end.kind in ("normal", "continue"):
+                    ends.append(_End("normal", end.env))
+                    if end.env.key() not in seen:
+                        seen.add(end.env.key())
+                        fresh.append(end.env)
+                elif end.kind == "break":
+                    ends.append(_End("normal", end.env))
+                else:
+                    ends.append(end)
+            current = fresh
+            if not current:
+                break
+        else:
+            raise Unsupported("a loop that doesn't settle")
+    return _dedupe(ends)
 
 
 def _bind(target: _Node, value: object, env: _Env) -> _Env:

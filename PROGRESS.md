@@ -1,5 +1,43 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "Šipky v JS"): functions and callbacks in jscript
+
+Why: next step 2. Of the github-script permission checks in the corpora, 12 fell back to the
+text guess: arrow functions (5), `async function` (5), `function` (3), an escape (1).
+
+Acceptance criteria:
+- Parser: `function`/`async function` statements (hoisted) and expressions, arrows (`x =>`,
+  `(a, b = 1) =>`, `async`), expression or block bodies, `for (const x of ...)`, `break` and
+  `continue` (no labels); parameter patterns and rest stay unsupported.
+- Calls: `_invoke` binds parameters (defaults), runs the body, keeps the caller's own names
+  but not the function's locals (`_locals`, `_back`); depth 8. IIFEs. Throws go to the caller.
+- Callbacks on known lists per element (`_callback`, `_combine`); on unknown ones zero or one
+  call and an unknown result.
+- `for...of`: per element of a known list; rounds until no new state on an unknown one (8).
+- Found on the way: a check that caches in `new Map()` read as reporting (and added a WG010
+  finding): `_Collection` for Map/Set with `has`/`get`/`set`/`add`; a key that may equal
+  another (two strangers) makes `has`/`get` unknown and `set` turn the map unknown.
+
+Done:
+- `jscript.py`: parser `function`, `params`, `arrow`, `for_of`; `_Fn`, `_invoke`, `_locals`,
+  `_back`, `_callback`, `_combine`, `_for_of`, `_Collection`, `_construct`, `_collection_call`;
+  `\u`/`\x` escapes; `break` at the top is unsupported.
+- Tests: 45 more in `test_jscript.py` (4 old "doesn't follow" examples replaced by ones that
+  still aren't followed); 1193 in total.
+- README (How it works, limitations), CHANGELOG v0.35.0, version 0.35.0, v0.34.0 heading dated.
+
+What the corpora showed: 27 of 31 github-script permission checks decided (was 19): 15 fail on
+a no, 12 only report; 2 still fall back (array patterns in a lock file). Findings 20, 17 and
+the fork corpus unchanged.
+
+Verified locally:
+- `pytest -q -W error`: 1193 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.35.0, 0 errors (warning: v0.35.0 not tagged yet).
+- All three corpora: same finding counts as main, no errors. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 21 mutants; 20 killed (5 after adding tests), one equivalent (a duplicate
+  entry after `Map.set` on a known key: the values are replaced before it, so lookups agree).
+
 ## 2026-11-21 (interactive, user picked "Zprávy WG005/9"): why a fork guard doesn't hold
 
 Why: next step 3. v0.33.0 skips steps a fork can't reach, but a guard that doesn't hold was
@@ -1372,10 +1410,9 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.34.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `jscript.py`: arrow functions in `.some()`/`.every()`/`.find()` callbacks and `for...of`
-   (the common reasons the 12 github-scripts fall back), and `require()`d helper scripts of the
-   repository (read the file when it's in the checked repository).
+1. Tag `v0.35.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `jscript.py`: `require()`d helper scripts of the checked repository (read the file and run
+   its exported function), and array patterns (`const [a, b] = ...`, `([k, v]) =>`).
 3. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
    input (5 of the 16 bash fallbacks).
 4. WG005: a label gate with a step that removes the label (`labeled` + `actions-ecosystem/

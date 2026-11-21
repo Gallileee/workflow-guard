@@ -142,10 +142,15 @@ def test_another_users_permission_is_not_followed():
 @pytest.mark.parametrize(
     "script",
     [
-        API + "if (!['admin'].some(p => p === data.permission)) core.setFailed('x')",
-        "function check() { return false }\nif (!check()) core.setFailed('x')",
-        "for (const p of ['a']) { core.setFailed(p) }",
         "while (true) { break }",
+        "for (let i = 0; i < 3; i++) {}",
+        "for (const k in {a: 1}) {}",
+        "const f = ([a, b]) => a",
+        "const f = (...rest) => rest",
+        "function f() { return f() }\nf()",
+        "function f() { process.exit(1) }\nf()",
+        "break",
+        "outer: for (const x of [1]) { break outer }",
         "switch (context.actor) { default: core.setFailed('x') }",
         "class A {}",
         "const [a, b] = [1, 2]",
@@ -156,7 +161,7 @@ def test_another_users_permission_is_not_followed():
         "/* unclosed",
         "x = /unclosed",
         "x++",
-        "const s = '\\u0041'",
+        "const s = '\\u{zz}'",
     ],
 )
 def test_scripts_it_doesnt_follow(script):
@@ -268,3 +273,137 @@ def test_paths(script, fails):
 def test_set_output_writes_json_for_anything_but_text():
     r = result(API + "core.setOutput('ok', data.permission === 'admin')\ncore.setOutput('n', null)")
     assert r.outputs == [{"ok": "false", "n": "", "result": ""}]
+
+
+# --- functions, callbacks, loops ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        API + "if (!['admin', 'write'].some(p => p === data.permission)) core.setFailed('x')",
+        API + "if (!['admin', 'write'].some((p) => { return p === data.permission })) throw new Error('x')",
+        API + "if (['none', 'read'].find(p => p === data.permission)) core.setFailed('x')",
+        API + "if (!['admin'].every(p => p === data.permission)) core.setFailed('x')",
+        API + "if (['admin'].filter(p => p === data.permission).length === 0) core.setFailed('x')",
+        API + "if (!['ADMIN'].map(p => p.toLowerCase()).includes(data.permission)) core.setFailed('x')",
+        API + "if (['admin', 'write'].findIndex(p => p === data.permission) === -1) core.setFailed('x')",
+        # A function declared after it's called (hoisted), async, with a default.
+        "if (!(await allowed(context.actor))) core.setFailed('no')\n"
+        "async function allowed(user, levels = ['admin', 'write']) {\n"
+        "  const { data } = await github.rest.repos.getCollaboratorPermissionLevel(\n"
+        "    {...context.repo, username: user})\n"
+        "  return levels.includes(data.permission)\n}",
+        # An arrow in a const, an IIFE.
+        "const check = async (user) => {\n"
+        "  try {\n"
+        "    const r = await github.rest.repos.getCollaboratorPermissionLevel(\n"
+        "      {...context.repo, username: user})\n"
+        "    return r.data.permission === 'admin'\n"
+        "  } catch (e) { return false }\n}\n"
+        "if (!(await check(context.actor))) core.setFailed('no')",
+        "(() => { core.setFailed('always') })()",
+        # A loop over the allowed levels.
+        API + "let ok = false\nfor (const level of ['admin', 'write']) {\n"
+        "  if (data.permission === level) { ok = true; break }\n}\n"
+        "if (!ok) core.setFailed('x')",
+        # A Map cache in front of the API.
+        "const cache = new Map()\nasync function can(user) {\n"
+        "  if (cache.has(user)) return cache.get(user)\n"
+        "  const { data } = await github.rest.repos.getCollaboratorPermissionLevel(\n"
+        "    {...context.repo, username: user})\n"
+        "  const ok = ['admin', 'write'].includes(data.permission)\n  cache.set(user, ok)\n  return ok\n}\n"
+        "if (!(await can(context.actor))) core.setFailed('x')\n"
+        "if (!(await can(context.payload.comment.user.login))) core.setFailed('y')",
+        API + "if (!new Set(['admin', 'write']).has(data.permission)) core.setFailed('x')",
+    ],
+)
+def test_functions_and_callbacks_that_fail_on_a_no(script):
+    r = result(script)
+    assert r is not None and r.fails is True
+
+
+@pytest.mark.parametrize(
+    ("script", "fails"),
+    [
+        # A function's parameters and declarations are its own.
+        (
+            "const ok = false\nfunction f(ok) { const x = 1; return ok }\nf(true)\n"
+            "if (!ok) core.setFailed('x')",
+            True,
+        ),
+        ("let n = 'a'\nfunction f() { n = 'b' }\nf()\nif (n === 'b') core.setFailed('x')", True),
+        ("let n = 'a'\nfunction f() { let n = 'b' }\nf()\nif (n === 'b') core.setFailed('x')", False),
+        ("const f = x => x\nif (f('a') === 'a') core.setFailed('x')", True),
+        ("function f(a = 'd') { return a }\nif (f() === 'd' && f('e') === 'e') core.setFailed('x')", True),
+        # A throw inside a function goes to the caller's catch.
+        (
+            "function f() { throw new Error('x') }\nlet ok = false\ntry { f() } catch (e) { ok = true }\n"
+            "if (ok) core.setFailed('x')",
+            True,
+        ),  # fmt: skip
+        # Callbacks on an unknown list: an unknown result.
+        ("if (context.payload.issue.labels.some(l => l.name === 'ok')) core.setFailed('x')", False),
+        ("if (!context.payload.issue.labels.some(l => l.name === 'ok')) core.setFailed('x')", False),
+        # ... and a side effect may happen or not.
+        ("context.payload.issue.labels.forEach(l => core.setFailed('x'))", False),
+        ("[1, 2].forEach(n => core.setFailed('x'))", True),
+        ("[].forEach(n => core.setFailed('x'))", False),
+        # A callback that isn't a function.
+        ("if ([1].some(cb)) core.setFailed('x')", False),
+        # for...of over an unknown list runs any number of times.
+        (
+            "let n = 0\nfor (const x of context.payload.issue.labels) { n = 1 }\n"
+            "if (n === 1) core.setFailed('x')",
+            False,
+        ),
+        ("for (const x of context.payload.issue.labels) { core.setFailed('x') }", False),
+        ("for (const x of [1, 2]) { continue\ncore.setFailed('x') }", False),
+        ("for (const x of ['a', 'b']) { if (x === 'b') core.setFailed('x') }", True),
+        # Maps and Sets.
+        ("const m = new Map([['a', 1]])\nif (m.get('a') === 1 && !m.has('b')) core.setFailed('x')", True),
+        ("const s = new Set()\ns.add('a')\nif (s.has('a')) core.setFailed('x')", True),
+        (
+            "const m = new Map()\nm.set('a', 1)\nm.set('a', 2)\nif (m.get('a') === 2) core.setFailed('x')",
+            True,
+        ),
+        ("const m = new Map()\nif (m.get('a') === undefined) core.setFailed('x')", True),
+        # A stranger's login as a key may be another stranger's.
+        (
+            "const m = new Map([[context.actor, 1]])\n"
+            "if (m.has(context.payload.sender.login)) core.setFailed('x')",
+            False,
+        ),
+        # Escapes.
+        ("if ('\\u0041\\x42\\u{43}' === 'ABC') core.setFailed('x')", True),
+    ],
+)
+def test_functions_callbacks_loops(script, fails):
+    r = run(script, {}, "NONE")
+    assert r is not None and r.fails is fails
+
+
+@pytest.mark.parametrize(
+    ("script", "fails"),
+    [
+        # A function's own new names don't reach the caller.
+        ("function f() { const leaked = true }\nf()\nif (leaked) core.setFailed('x')", False),
+        # A callback on an unknown list may run (and change things) or not.
+        (
+            "let ok = false\ncontext.payload.issue.labels.forEach(l => { ok = true })\n"
+            "if (!ok) core.setFailed('x')",
+            False,
+        ),
+        # An element with an unknown test makes .some and .filter unknown.
+        ("if (!['a', context.payload.comment.body].some(x => x === 'go')) core.setFailed('x')", False),
+        (
+            "if ([context.payload.comment.body].filter(x => x === 'go').length === 0) core.setFailed('x')",
+            False,
+        ),
+        # break ends a loop over a known list.
+        ("for (const x of ['a', 'b']) {\n  if (x === 'a') break\n  core.setFailed('x')\n}", False),
+    ],
+)
+def test_more_functions_and_loops(script, fails):
+    r = run(script, {}, "NONE")
+    assert r is not None and r.fails is fails

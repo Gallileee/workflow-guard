@@ -4,7 +4,41 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.34.0 — WG005 and WG009: why a guard doesn't hold
+## v0.35.0 — WG010: functions and callbacks in github-script
+
+### Arrow functions, functions, `for...of`, Map and Set are followed
+
+Most github-script checks that were still judged from their text used functions:
+
+```js
+const allowed = new Set(['admin', 'maintain', 'write'])
+async function canRun(user) {
+  const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: user })
+  return allowed.has(data.permission)
+}
+if (!(await canRun(context.actor))) core.setFailed('write access needed')
+```
+
+Now the JavaScript evaluator follows them:
+
+- `function f(a, b = 1) {}`, `async function`, arrow functions with an expression or a block
+  body, and immediately called ones `(() => {...})()`. A function runs where it's called; its
+  parameters and declarations are its own, and changes to the caller's names stay. Function
+  statements are hoisted.
+- `.some`, `.every`, `.find`, `.findIndex`, `.filter`, `.map` and `.forEach` call their callback
+  for each element of a known list. On an unknown list the callback may run once or not at all,
+  and the result is unknown.
+- `for (const x of list)` with `break` and `continue`: once per element of a known list, round
+  after round on an unknown one until nothing new turns up.
+- `new Map()`, `new Set([...])` with `has`, `get`, `set` and `add`. A cache keyed by the
+  commenter's login stays sound: two strangers' logins may be the same.
+- `\u0041`, `\x41` and `\u{41}` escapes in strings.
+
+On the public workflows, 27 of 31 github-script permission checks are now decided (19 before).
+One cached check (`new Map()` in front of the API) was briefly misread as only reporting and
+is now a check again; no finding changed.
+
+## v0.34.0 — WG005 and WG009: why a guard doesn't hold (2026-11-21)
 
 ### The message names the weak guard
 
