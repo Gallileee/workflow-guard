@@ -16,6 +16,7 @@ from pathlib import Path
 
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
+from . import jscript
 from .conditions import (
     ASSOCIATION,
     NO_ANSWERS,
@@ -745,8 +746,64 @@ def _asks(step: Step) -> bool | None:
         verdict = _api_verdict(run, tuple(sorted((k, v.value) for k, v in env if isinstance(v, ScalarNode))))
         if verdict is not None:
             return verdict
-    # A github-script, or a script the evaluator doesn't follow: guess from the text.
+    js = _js_results(step)
+    if js is not None and all(result.asked for result in js):
+        return all(result.fails for result in js)
+    # A script the evaluators don't follow: guess from the text.
     return bool(_STOPS.search(text))
+
+
+def _is_github_script(step: Step) -> bool:
+    return (step.uses or "").split("@", 1)[0].lower() == "actions/github-script"
+
+
+def _js_results(step: Step) -> list[jscript.Result] | None:
+    """An ``actions/github-script`` step run on paper (``jscript.run``) for each association
+    that can't write; None for another step or a script the evaluator doesn't follow."""
+    script = step.with_value("script")
+    if not _is_github_script(step) or not script:
+        return None
+    encoding = (step.with_value("result-encoding") or "json").strip().lower()
+    return _js_run(script, encoding)
+
+
+@lru_cache(maxsize=1024)
+def _js_run(script: str, encoding: str) -> list[jscript.Result] | None:
+    expressions = list(find_expressions(script))
+    pasted = jscript.paste(script, [(e.start, e.end) for e in expressions])
+    results = []
+    for association in UNTRUSTED_ASSOCIATIONS:
+        values = {n: stranger_text(script[e.start : e.end], association) for n, e in enumerate(expressions)}
+        result = jscript.run(pasted, values, association, encoding)
+        if result is None:
+            return None
+        results.append(result)
+    return results
+
+
+_JS_COMMENTER = re.compile(
+    r"context\.(?:actor|triggering_actor)\b|comment\.(?:user\.login|author_association)|sender\.login"
+)
+
+
+def _js_looks(step: Step) -> bool:
+    """A github-script that looks at who commented: through ``context``, ``${{ }}`` or the
+    permission API."""
+    script = step.with_value("script") or ""
+    return bool(
+        _JS_COMMENTER.search(script)
+        or _PERMISSION_API.search(script)
+        or any(_mentions(_paths(expr), _COMMENTER) for expr in find_expressions(script))
+    )
+
+
+def _js_stops(step: Step) -> bool:
+    """A github-script that looks at who commented and fails for every commenter who can't
+    write (``core.setFailed``, a throw), without asking the permission API."""
+    if _continues(step) or not _js_looks(step):
+        return False
+    results = _js_results(step)
+    return results is not None and all(result.fails for result in results)
 
 
 def _permission_check(step: Step) -> str | None:
@@ -784,7 +841,11 @@ def _stops(wf: Workflow, job_id: str) -> list[_Stop]:
     for i, step in enumerate(steps):
         if _denies(step, [s for s in steps[:i] if _is_answer(s)]):
             stops.append(_Stop(i, step, True))
-        elif _permission_check(step) == _FAILS or (_shell_check(wf, step) == () and not _continues(step)):
+        elif (
+            _permission_check(step) == _FAILS
+            or (_shell_check(wf, step) == () and not _continues(step))
+            or (_permission_check(step) is None and _js_stops(step))
+        ):
             stops.append(_Stop(i, step, _always_runs(step)))
     return stops
 
@@ -970,7 +1031,16 @@ def _script_answers(step: Step) -> list[dict[str, object]] | None:
     ``$GITHUB_ACTOR`` or the permission API): what it writes to ``$GITHUB_OUTPUT`` for a
     stranger on each path where it succeeds (``shell.script_outputs``, every association that
     can't write). None if it doesn't look, writes nothing, never succeeds, has
-    ``continue-on-error`` or isn't followed."""
+    ``continue-on-error`` or isn't followed. A github-script that looks at who commented: its
+    ``core.setOutput`` and ``result`` outputs (``jscript.run``)."""
+    if _is_github_script(step):
+        results = None if _continues(step) or not _js_looks(step) else _js_results(step)
+        if results is None:
+            return None
+        maps = [m for result in results for m in result.outputs]
+        maps = [m for i, m in enumerate(maps) if m not in maps[:i]]
+        writes = any(key != "result" or value != "" for m in maps for key, value in m.items())
+        return maps if maps and writes else None
     run = scalar(get(step.node, "run"))
     shell = (scalar(get(step.node, "shell")) or "bash").split()[0].lower()
     if not run or shell not in ("bash", "sh") or _continues(step):
@@ -1140,10 +1210,24 @@ def _output_text(value: str, lookup: Lookup) -> object:
     return "".join(parts) + value[pos:]
 
 
+def _silent_ids(wf: Workflow, job_id: str) -> set[str]:
+    """The ids of the job's steps that never run for a commenter who can't write (their
+    ``if:`` checks who commented, or the answer of a permission step before them): their
+    outputs are empty for such a commenter."""
+    answers = _answers(wf, job_id)
+    return _step_ids(
+        [
+            step
+            for step in _job_steps(wf, job_id)
+            if _commenter_gate(step.node)[0] or _answer_gate(step.node, answers)[0]
+        ]
+    )
+
+
 def _answer_outputs(wf: Workflow, job_id: str) -> dict[str, str]:
-    """The job's outputs (names in lower case) that carry a permission step's answer, with
-    their values as written."""
-    ids = _step_ids(_askers(wf, job_id))
+    """The job's outputs (names in lower case) that carry a permission step's answer, or the
+    output of a step that never runs for a stranger, with their values as written."""
+    ids = _step_ids(_askers(wf, job_id)) | _silent_ids(wf, job_id)
     outputs = get(dict(wf.jobs()).get(job_id), "outputs")
     return {
         key.lower(): value.value
@@ -1161,9 +1245,16 @@ def _needed_answer_gate(wf: Workflow, job: Node | None, name: str) -> tuple[bool
     if not any(_mentions(paths, (("needs", name.lower(), "outputs", out),)) for out in outputs):
         return False, ""
     lookups: list[tuple[str, Lookup]] = []
+    silent = _silent_ids(wf, name)
     for answer, inner in _no_answers(_askers(wf, name)):
+
+        def quiet(path: tuple[str, ...], inner: Lookup = inner) -> object:
+            if len(path) > 3 and path[0] == "steps" and path[1] in silent and path[2] == "outputs":
+                return ""  # a step that didn't run writes nothing
+            return inner(path)
+
         values = {
-            ("needs", name.lower(), "outputs", out): _output_text(raw, inner) for out, raw in outputs.items()
+            ("needs", name.lower(), "outputs", out): _output_text(raw, quiet) for out, raw in outputs.items()
         }
 
         def outer(path: tuple[str, ...], values: dict[tuple[str, ...], object] = values) -> object:

@@ -1,5 +1,50 @@
 # Progress log
 
+## 2026-11-21 (interactive, user picked "github-script kontroly"): github-script on paper
+
+Why: next step 2. `actions/github-script` permission checks were judged from their text
+(`core.setFailed`/`throw`/`process.exit(1)` anywhere); 31 such steps in the corpora.
+
+Acceptance criteria:
+- `jscript.run`: tokens (strings, templates, regex literals as unknown, comments, line breaks
+  for `return`), a parser for statements (`const`/`let`/`var` with object patterns, `if`,
+  `return`, `throw`, `try`/`catch`/`finally`, blocks, expressions) and expressions (precedence
+  as JS, calls, members, `?.`, arrays, objects with spread, `new`); paths with `_Env` (names,
+  outputs, failed, asked); ends: normal, return, throw, exit.
+- `context` for a stranger; `getCollaboratorPermissionLevel` about them: `none`/`read` or a
+  throw; other calls: unknown and may throw (matters inside `try`).
+- `core.setFailed` (fails at the end), `core.setOutput` (JSON for non-text), `return` -> `result`
+  (JSON, or `result-encoding: string`), `process.exit` as a statement only.
+- Unsupported: arrow functions, functions, loops, `switch`, classes, array patterns, `++`,
+  unknown `setOutput` names: the text guess stays.
+- Rules: `_asks` uses it for github-script with the API; `_js_stops` for scripts that look at
+  the commenter without the API; `_script_answers` gives github-script outputs.
+- Found on the way: a step that never runs for a stranger writes no outputs, so a job output
+  carrying one is empty (`_silent_ids` in `_needed_answer_gate`). Without it one corpus
+  workflow got 4 false findings once its `authorized=false` step was seen to only report.
+
+Done:
+- `jscript.py` (new), `rules.py` (`_is_github_script`, `_js_results`/`_js_run` cached,
+  `_js_looks`, `_js_stops`, github-script branch in `_script_answers`, `_silent_ids`).
+- Tests: `test_jscript.py` (85) and 10 more in `test_wg010.py` (3 old expectations changed: the
+  github-script answers are now 'result=false', and `!= 'false'` on a real `false` output
+  holds); 1092 in total.
+- README (How it works, modules, limitations), CHANGELOG v0.32.0, version 0.32.0, v0.31.0
+  heading dated.
+
+What the corpora showed: 19 of 31 github-script permission checks decided (17 agree with the
+text guess; 2 only report: an early `return` when the comment isn't the command, and an
+`authorized=false` output). 12 fall back (helper scripts loaded with `require`, arrow
+functions, loops, another user's permission). Findings 20 and 17, as on main.
+
+Verified locally:
+- `pytest -q -W error`: 1092 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.32.0, 0 errors (warning: v0.32.0 not tagged yet).
+- Both corpora: all rules without errors, same findings as main. workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor: same output as main.
+- Mutation checks: 28 mutants; 27 killed (11 after adding tests); one showed dead code (the
+  404 path was added twice), removed.
+
 ## 2026-11-21 (interactive, user picked "Cykly v shell.py"): loops in the bash evaluator
 
 Why: next step 2. Loops were the largest group of permission scripts that fell back to the
@@ -1251,12 +1296,12 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.31.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. github-script checks: `core.setOutput('allowed', ...)`, `return` and `core.setFailed` in
-   `actions/github-script` are still guessed from the text; a small evaluator for the common
-   shapes (`if (!['admin','write'].includes(p)) core.setFailed(...)`).
+1. Tag `v0.32.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
+2. `jscript.py`: arrow functions in `.some()`/`.every()`/`.find()` callbacks and `for...of`
+   (the common reasons the 12 github-scripts fall back), and `require()`d helper scripts of the
+   repository (read the file when it's in the checked repository).
 3. Status functions elsewhere: WG009 (`workflow_run`) and WG005 (`pull_request_target`) don't
    look at `if:` at all yet; a guard job there could reuse `_runs_anyway`.
 4. `shell.py`: simple arrays (`roles=(admin write)`, `${roles[@]}`) and `< <(...)` as an unknown
-   input (5 of the 16 fallbacks).
+   input (5 of the 16 bash fallbacks).
 5. The Marketplace listing (needs the owner: it's a public listing under their account).

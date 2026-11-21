@@ -376,8 +376,25 @@ be read or parsed, or bad arguments.
   The user has to be the commenter (`${{ github.actor }}`, `$GITHUB_ACTOR`, a step `env:` set
   from the comment). Then the step fails on a no only if every path exits; a script that exits
   only when the call fails just reports. Scripts it can't follow (arrays, `eval`, another
-  user, another jq filter) and github-scripts are still judged from their text (`core.setFailed`,
-  `throw`, `exit 1`, `grep -q`).
+  user, another jq filter) are still judged from their text (`core.setFailed`, `throw`,
+  `exit 1`, `grep -q`).
+- An `actions/github-script` step is run on paper too (`jscript.py`), for a stranger:
+  `context.actor` and the commenter's login are a stranger, `author_association` each
+  association that can't write, `context.eventName` is `issue_comment`, the rest of `context`
+  unknown. `getCollaboratorPermissionLevel` about the stranger answers `permission`/`role_name`
+  `none` or `read` (`user.permissions` all false but `pull`) or throws a 404; any other call
+  answers something unknown and may throw. It follows `const`/`let` (with `{ a: { b } }`
+  patterns), assignments, `if`/`else`, `return`, `throw`, `try`/`catch`/`finally`,
+  `core.setFailed`, `core.setOutput`, `process.exit`, `!`, `&&`, `||`, `??`, `? :`, `===`,
+  `+`, template strings, `.includes`, `.toLowerCase` and the like, and `${{ }}` pasted into the
+  script. The step fails on a no if every path fails; otherwise its outputs are what it really
+  writes (`core.setOutput`, and `result` from `return`: JSON unless `result-encoding: string`,
+  so `return false` is the text `false`, which is true in an `if:`). A github-script that looks
+  at who commented without the API (`if (author_association !== 'OWNER') core.setFailed(...)`)
+  is a check the same way. Arrow functions, functions, loops and `switch` make the script
+  unknown: then the text decides, as before.
+- A step that never runs for a stranger (its `if:` checks who commented, or a permission step's
+  answer) writes no outputs, so a job output carrying one of its outputs is empty for them.
 - WG010 reads what a bash script **writes to `$GITHUB_OUTPUT`** (`shell.script_outputs`):
   `echo "name=value" >> "$GITHUB_OUTPUT"` (`-n`/`-e` aside), `printf 'name=%s\n' "$x"`,
   `printf '%s\n' "name=$x"`, and `echo` inside `{ ...; } >> "$GITHUB_OUTPUT"`, on every path where
@@ -475,6 +492,8 @@ src/workflow_guard/
   shell.py     a small bash evaluator (WG010: does a run: script exit for strangers? what
                does it write to $GITHUB_OUTPUT? the commenter's association, login and
                permission API answer)
+  jscript.py   a small JavaScript evaluator for actions/github-script (WG010: the same
+               questions for core.setFailed, throw, core.setOutput and return)
   taint.py     WG004/WG007's tracker: untrusted values through env:, $GITHUB_*, job outputs
   calls.py     local reusable workflows and actions: what callers pass into each input
   project.py   the files checked together; which file a uses: ./... runs
@@ -564,7 +583,7 @@ CHANGELOG.md.
   association only in the forms `shell.py` follows (no arrays or `eval`). A script that asks the
   permission API and that the evaluator can't follow (an array, `eval`, a check of another
   user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
-  anywhere (a guess from its text). A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
+  anywhere (a guess from its text), and so does a github-script with an arrow function, a loop or a function (`core.setFailed`, `throw` or `process.exit(1)` in its text). A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)
   is unknown as a whole. Whether a script fails on a no is guessed from its text
   (`core.setFailed`, `throw`, `exit 1`, `grep -q`); a script that fails some other way
