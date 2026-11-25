@@ -403,8 +403,8 @@ be read or parsed, or bad arguments.
   association that can't write, `context.eventName` is `issue_comment`, the rest of `context`
   unknown. `getCollaboratorPermissionLevel` about the stranger answers `permission`/`role_name`
   `none` or `read` (`user.permissions` all false but `pull`) or throws a 404; any other call
-  answers something unknown and may throw. It follows `const`/`let` (with `{ a: { b } }`
-  patterns), assignments, `if`/`else`, `return`, `throw`, `try`/`catch`/`finally`,
+  answers something unknown and may throw. It follows `const`/`let` (with object and array
+  patterns: `{ a: { b } = {}, ...rest }`, `[a, , b = 1, ...rest]`), assignments, `if`/`else`, `return`, `throw`, `try`/`catch`/`finally`,
   `core.setFailed`, `core.setOutput`, `process.exit`, `!`, `&&`, `||`, `??`, `? :`, `===`,
   `+`, template strings, `.includes`, `.toLowerCase` and the like, and `${{ }}` pasted into the
   script. The step fails on a no if every path fails; otherwise its outputs are what it really
@@ -417,8 +417,11 @@ be read or parsed, or bad arguments.
   element of a known list (on an unknown one: zero or one call, and an unknown result);
   `for (const x of list)` runs once per element of a known list, and round after round on an
   unknown one until nothing new turns up; `new Map()`/`new Set()` with `has`/`get`/`set`/`add`
-  (a stranger's login as a key may be another stranger's). Other loops, `switch`, classes,
-  array patterns and recursion make the script unknown: then the text decides, as before.
+  (a stranger's login as a key may be another stranger's), and their entries in `for...of`;
+  parameter patterns and rest parameters; `Promise.all([...])` (the list of answers) and
+  `Object.keys`/`values`/`entries`. Other loops, `switch`, classes, recursion and a default
+  that may throw or change something make the script unknown: then the text decides, as
+  before.
 - A step that never runs for a stranger (its `if:` checks who commented, or a permission step's
   answer) writes no outputs, so a job output carrying one of its outputs is empty for them.
 - WG010 reads what a bash script **writes to `$GITHUB_OUTPUT`** (`shell.script_outputs`):
@@ -609,7 +612,7 @@ CHANGELOG.md.
   association only in the forms `shell.py` follows (no `eval` or heredocs). A script that asks the
   permission API and that the evaluator can't follow (a heredoc, `eval`, `$(...)` that doesn't start with a function, a check of another
   user's permission, `env:` from the job or workflow) still counts when it has an `exit 1`
-  anywhere (a guess from its text), and so does a github-script with a `while`/`for (;;)` loop, `switch`, a class or an array pattern (`core.setFailed`, `throw` or `process.exit(1)` in its text). A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
+  anywhere (a guess from its text), and so does a github-script with a `while`/`for (;;)` loop, `switch`, a class or a pattern on the left of an assignment (`core.setFailed`, `throw` or `process.exit(1)` in its text). In a github-script an API call may throw where it is made, so a rejection that `Promise.allSettled` or `.catch()` would swallow still counts as a throw. A check that may be skipped covers a later step only when that step's `if:` repeats its condition word for word (as parsed); a condition that implies it in another way (`x == 'a'` for `x != 'b'`) isn't seen. A pull request's ref saved
   in a shell variable on one line and fetched on another isn't a checkout. A job output with an unknown part (`${{ github.run_id }}`)
   is unknown as a whole. Whether a script fails on a no is guessed from its text
   (`core.setFailed`, `throw`, `exit 1`, `grep -q`); a script that fails some other way

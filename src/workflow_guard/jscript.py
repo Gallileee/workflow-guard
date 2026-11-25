@@ -16,20 +16,23 @@ is the association given, ``context.eventName`` is ``issue_comment`` and everyth
 ``context`` is unknown. ``getCollaboratorPermissionLevel`` about the stranger answers
 ``permission``/``role_name`` ``none`` or ``read`` (``user.permissions`` all false but ``pull``)
 or throws (a 404 for someone who isn't a collaborator); any other call answers something
-unknown and may throw. It follows ``const``/``let``/``var`` (with ``{ a, b: { c } }``
-patterns), assignments, ``if``/``else``, ``return``, ``throw``, ``try``/``catch``/``finally``,
+unknown and may throw. It follows ``const``/``let``/``var`` (with object and array patterns:
+``{ a, b: { c } = {}, ...rest }``, ``[a, , b = 1, ...rest]``; also in parameters and
+``for...of``), assignments, ``if``/``else``, ``return``, ``throw``, ``try``/``catch``/``finally``,
 ``core.setFailed`` (the step fails at the end), ``core.setOutput``, ``process.exit``, and the
 expressions around them: ``!``, ``&&``, ``||``, ``??``, ``? :``, ``===``/``!==``/``==``/``!=``,
 ``+``, template strings, ``.includes``/``.indexOf``/``.toLowerCase``/``.trim``/``.startsWith``/
-``.endsWith``, ``String``/``Boolean``/``JSON.stringify``. A condition it can't decide goes both
+``.endsWith``, ``String``/``Boolean``/``JSON.stringify``, ``Promise.all`` (the list it's given),
+``Object.keys``/``values``/``entries``. A condition it can't decide goes both
 ways. Functions (``function f(a, b = 1) {}``, ``async function``, arrow functions with an
 expression or a block) run where they are called, with their own parameters and declarations
 (``async``/``await`` change nothing here); ``.some``, ``.every``, ``.find``, ``.findIndex``,
 ``.filter``, ``.map`` and ``.forEach`` call their callback for each element of a known list (on
 an unknown one: zero or one call, and an unknown result). ``for (const x of list)`` runs once
-per element of a known list, and round after round on an unknown one until no new state turns
-up (at most 8); ``break`` and ``continue`` work in it. Other loops, ``switch``, classes,
-recursion past 8 calls and array patterns make the script unknown.
+per element of a known list (a string, a Map's entries, a Set), and round after round on an
+unknown one until no new state turns up (at most 8); ``break`` and ``continue`` work in it.
+Other loops, ``switch``, classes, recursion past 8 calls, patterns on the left of an assignment
+and a default that may throw or change something make the script unknown.
 
 ``${{ }}`` in the script is pasted in before it runs; its value (see
 ``conditions.stranger_text``) is put where it stands, inside a string or not.
@@ -465,13 +468,13 @@ class _Parser:
         if not self.is_name("const", "let", "var"):
             raise Unsupported("for loop")
         self.i += 1
-        tok = self.take()
-        if tok.kind != "name" or not self.is_name("of"):
+        target = self.binding()
+        if not self.is_name("of"):
             raise Unsupported("for loop that isn't for...of")
         self.i += 1
         iterable = self.expression()
         self.take(")")
-        return _Node("forof", tok.value, (iterable, self.body()))
+        return _Node("forof", target, (iterable, self.body()))
 
     def function(self) -> _Node:
         """``[async] function [name](params) { body }``: a node with the name (or None) and
@@ -485,23 +488,49 @@ class _Parser:
         params = self.params()
         return _Node("function", name, (params, self.block(), True))
 
-    def params(self) -> list[tuple[str, _Node | None]]:
-        """``(a, b = 1)``: names with their defaults; patterns and rest aren't followed."""
+    def params(self) -> _Node:
+        """``(a, { b } = {}, ...rest)``: an array pattern the arguments are bound to."""
         self.take("(")
-        params = []
-        while not self.is_op(")"):
-            tok = self.take()
-            if tok.kind != "name":
-                raise Unsupported("a parameter pattern")
-            default = None
-            if self.is_op("="):
+        return self.elements(")")
+
+    def elements(self, close: str) -> _Node:
+        """The inside of ``[a, , b = 1, ...rest]`` (or a parameter list) up to ``close``: an
+        ``apattern`` node with ((target, default) or None for a hole, ...) and the rest target."""
+        items: list[tuple[_Node, _Node | None] | None] = []
+        rest = None
+        while not self.is_op(close):
+            if self.is_op(",") and close == "]":
                 self.i += 1
-                default = self.assignment()
-            params.append((str(tok.value), default))
-            if not self.is_op(")"):
+                items.append(None)
+                continue
+            if self.is_op("..."):
+                self.i += 1
+                rest = self.binding()
+                break
+            items.append((self.binding(), self.default()))
+            if not self.is_op(close):
                 self.take(",")
-        self.take(")")
-        return params
+        self.take(close)
+        return _Node("apattern", (items, rest))
+
+    def binding(self) -> _Node:
+        """What a declaration, parameter or ``for...of`` binds: a name, ``{ ... }`` or
+        ``[ ... ]``."""
+        if self.is_op("{"):
+            return self.pattern()
+        if self.is_op("["):
+            self.i += 1
+            return self.elements("]")
+        tok = self.take()
+        if tok.kind != "name":
+            raise Unsupported(f"unexpected {tok.value!r} in a binding")
+        return _Node("name", tok.value)
+
+    def default(self) -> _Node | None:
+        if self.is_op("="):
+            self.i += 1
+            return self.assignment()
+        return None
 
     def arrow(self) -> _Node:
         """``[async] x => body`` or ``[async] (a, b) => body``."""
@@ -510,44 +539,43 @@ class _Parser:
         if self.is_op("("):
             params = self.params()
         else:
-            params = [(str(self.take().value), None)]
+            params = _Node("apattern", ([(_Node("name", self.take().value), None)], None))
         self.take("=>")
         if self.is_op("{"):
             return _Node("function", None, (params, self.block(), True))
         return _Node("function", None, (params, self.assignment(), False))
 
     def declarator(self) -> _Node:
-        if self.is_op("{"):
-            target = self.pattern()
-        elif self.is_op("["):
-            raise Unsupported("array pattern")
-        else:
-            target = _Node("name", self.take().value)
-        value = None
-        if self.is_op("="):
-            self.i += 1
-            value = self.assignment()
-        return _Node("declare", value, (target,))
+        target = self.binding()
+        return _Node("declare", self.default(), (target,))
 
     def pattern(self) -> _Node:
-        """``{ a, b: c, d: { e } }``: (key, target) pairs."""
+        """``{ a, b: c, d: { e } = {}, 'f-g': h, ...rest }``: (key, target, default) triples
+        and the rest name."""
         self.take("{")
-        pairs = []
+        pairs: list[tuple[object, _Node, _Node | None]] = []
+        rest = None
         while not self.is_op("}"):
             if self.is_op("..."):
-                raise Unsupported("rest pattern")
-            key = self.take().value
-            target = _Node("name", key)
+                self.i += 1
+                rest = self.binding()
+                if rest.kind != "name":
+                    raise Unsupported("a pattern after ... in an object pattern")
+                break
+            tok = self.take()
+            if tok.kind == "op":
+                raise Unsupported("computed key")
+            target = _Node("name", tok.value)
             if self.is_op(":"):
                 self.i += 1
-                target = self.pattern() if self.is_op("{") else _Node("name", self.take().value)
-            if self.is_op("="):
-                raise Unsupported("default in a pattern")
-            pairs.append((key, target))
+                target = self.binding()
+            elif tok.kind != "name":
+                raise Unsupported(f"{tok.value!r} without a name")
+            pairs.append((tok.value, target, self.default()))
             if not self.is_op("}"):
                 self.take(",")
         self.take("}")
-        return _Node("pattern", pairs)
+        return _Node("pattern", (pairs, rest))
 
     # expressions, lowest precedence first
     def expression(self) -> _Node:
@@ -1266,29 +1294,37 @@ def _callee_path(node: _Node) -> list[str] | None:
     return parts[::-1]
 
 
-def _locals(body: object, params: list) -> set[str]:
+def _names(target: _Node) -> list[str]:
+    """The names a binding target (a name, ``pattern`` or ``apattern``) declares."""
+    if target.kind == "name":
+        return [str(target.value)]
+    if target.kind == "pattern":
+        pairs, rest = target.value  # type: ignore[misc]
+        subs = [sub for _, sub, _ in pairs]
+    else:
+        items, rest = target.value  # type: ignore[misc]
+        subs = [item[0] for item in items if item is not None]
+    if rest is not None:
+        subs.append(rest)
+    return [name for sub in subs for name in _names(sub)]
+
+
+def _locals(body: object, params: _Node) -> set[str]:
     """The names a function declares itself (parameters, const/let/var, inner functions):
     they don't change the caller's names."""
-    names = {name for name, _ in params}
+    names = set(_names(params))
     todo = list(body) if isinstance(body, list) else []
     while todo:
         node = todo.pop()
         if not isinstance(node, _Node) or node.kind == "function":
             continue  # a nested function's names are its own
         if node.kind == "declare":
-            target = node.children[0]
-            stack = [target]
-            while stack:
-                t = stack.pop()
-                if t.kind == "name":
-                    names.add(str(t.value))
-                else:
-                    stack += [sub for _, sub in t.value]  # type: ignore[attr-defined]
+            names.update(_names(node.children[0]))
         elif node.kind == "fundecl":
             names.add(str(node.value))
             continue
         elif node.kind == "forof":
-            names.add(str(node.value))
+            names.update(_names(node.value))  # type: ignore[arg-type]
         for child in node.children:
             if isinstance(child, list):
                 todo += child
@@ -1308,13 +1344,10 @@ def _invoke(fn: _Fn, args: list[object], env: _Env) -> Values:
         raise Unsupported("calls too deep")
     _DEPTH[0] += 1
     try:
-        inner = env
-        for i, (name, default) in enumerate(fn.params):
-            value = args[i] if i < len(args) else UNDEFINED
-            if value is UNDEFINED and default is not None:
-                out, _ = _eval(default, inner)
-                value = out[0][1] if len(out) == 1 else UNKNOWN
-            inner = inner.with_name(name, value)
+        try:
+            inner = _bind(fn.params, list(args), env)
+        except _Throw:
+            return [], [env]  # a parameter pattern on undefined or null
         local = _locals(fn.body, fn.params)
         values: list[tuple[_Env, object]] = []
         thrown: list[_Env] = []
@@ -1348,14 +1381,14 @@ def _callback(method: str, items: object, fn: _Fn, env: _Env) -> Values:
     in order; on anything else zero or one call (for what it may change) and an unknown
     result."""
     if not isinstance(items, list):
-        out, thrown = _invoke(fn, [UNKNOWN, UNKNOWN], env)
+        out, thrown = _invoke(fn, [UNKNOWN, UNKNOWN, items], env)
         return [(env, UNKNOWN)] + [(e, UNKNOWN) for e, _ in out], thrown
     states: list[tuple[_Env, list[object]]] = [(env, [])]
     thrown: list[_Env] = []
     for index, item in enumerate(items):
         nxt = []
         for e, results in states:
-            out, err = _invoke(fn, [item, float(index)], e)
+            out, err = _invoke(fn, [item, float(index), items], e)
             thrown += err
             nxt += [(e2, [*results, v]) for e2, v in out]
         states = _cap(nxt)
@@ -1487,6 +1520,23 @@ def _call_known(path: list[str] | None, args: list[object], env: _Env) -> Values
         return [(env, UNKNOWN if t is None else t)], []
     if path == ["JSON", "stringify"] and args:
         return [(env, _json(args[0]))], []
+    if path == ["Promise", "all"] and args and isinstance(args[0], list):
+        # `await` changes nothing here: the calls in the list already ran (and may have thrown)
+        return [(env, args[0])], []
+    if path and len(path) == 2 and path[0] == "Object" and path[1] in ("keys", "values", "entries"):
+        obj = args[0] if args else UNDEFINED
+        if isinstance(obj, dict) and not isinstance(obj, _Context):
+            pairs = list(obj.items())
+            listed = {
+                "keys": [k for k, _ in pairs],
+                "values": [v for _, v in pairs],
+                "entries": [[k, v] for k, v in pairs],
+            }[path[1]]
+            return [(env, listed)], []
+        if isinstance(obj, _Context):
+            return [(env, UNKNOWN)], []
+        if obj is None or obj is UNDEFINED:
+            return [], [env]
     if path and path[-1] == "getCollaboratorPermissionLevel" and path[0] == "github":
         request = args[0] if args else UNKNOWN
         user = request.get("username", UNKNOWN) if isinstance(request, dict) else UNKNOWN
@@ -1623,16 +1673,31 @@ def _statement_inner(stmt: _Node, env: _Env) -> list[_End]:
 def _for_of(stmt: _Node, env: _Env) -> list[_End]:
     """``for (const x of items)``: once per element of a known list; otherwise round after
     round with ``x`` unknown until no new state turns up (the loop may end before any round)."""
-    name = str(stmt.value)
+    target = stmt.value
     iterable, body = stmt.children
     out, thrown = _eval(iterable, env)
     ends = [_End("throw", e) for e in thrown]
-    for start, items in out:
+
+    def bound(envs: list[_Env], item: object) -> list[_Env]:
+        result = []
+        for e in envs:
+            try:
+                result.append(_bind(target, item, e))  # type: ignore[arg-type]
+            except _Throw:
+                ends.append(_End("throw", e))
+        return result
+
+    for start, value in out:
+        try:
+            items = _iterate(value)
+        except _Throw:
+            ends.append(_End("throw", start))
+            continue
         if isinstance(items, list):
             current = [start]
             for item in items:
                 again: list[_Env] = []
-                for end in _block(body, [e.with_name(name, item) for e in current]):
+                for end in _block(body, bound(current, item)):
                     if end.kind in ("normal", "continue"):
                         again.append(end.env)
                     elif end.kind == "break":
@@ -1647,7 +1712,7 @@ def _for_of(stmt: _Node, env: _Env) -> list[_End]:
         ends.append(_End("normal", start))
         for _ in range(_MAX_ROUNDS):
             fresh: list[_Env] = []
-            for end in _block(body, [e.with_name(name, UNKNOWN) for e in current]):
+            for end in _block(body, bound(current, UNKNOWN)):
                 if end.kind in ("normal", "continue"):
                     ends.append(_End("normal", end.env))
                     if end.env.key() not in seen:
@@ -1666,8 +1731,66 @@ def _for_of(stmt: _Node, env: _Env) -> list[_End]:
 
 
 def _bind(target: _Node, value: object, env: _Env) -> _Env:
+    """``target = value`` for a name or a pattern; raises _Throw where JavaScript throws (an
+    object pattern on undefined or null, an array pattern on something not iterable)."""
     if target.kind == "name":
         return env.with_name(str(target.value), value)
-    for key, sub in target.value:  # type: ignore[attr-defined]
-        env = _bind(sub, _member(value, key), env)
+    if target.kind == "pattern":
+        pairs, rest = target.value  # type: ignore[misc]
+        if value is None or value is UNDEFINED:
+            raise _Throw
+        for key, sub, default in pairs:
+            env = _bind(sub, _default(_member(value, key), default, env), env)
+        if rest is not None:
+            env = _bind(rest, _object_rest(value, {key for key, _, _ in pairs}), env)
+        return env
+    items, rest = target.value  # type: ignore[misc]
+    elements = _iterate(value)
+    for i, item in enumerate(items):
+        if item is None:
+            continue
+        sub, default = item
+        if isinstance(elements, list):
+            element = elements[i] if i < len(elements) else UNDEFINED
+        else:
+            element = UNKNOWN
+        env = _bind(sub, _default(element, default, env), env)
+    if rest is not None:
+        env = _bind(rest, elements[len(items) :] if isinstance(elements, list) else UNKNOWN, env)
     return env
+
+
+def _default(value: object, default: _Node | None, env: _Env) -> object:
+    """``value`` or, where it is undefined, the default; a default that may throw or change
+    anything isn't followed."""
+    if default is None or (value is not UNDEFINED and value is not UNKNOWN):
+        return value
+    out, thrown = _eval(default, env)
+    if thrown or any(e.key() != env.key() for e, _ in out):
+        raise Unsupported("a default that may throw or change something")
+    if value is UNKNOWN or len(out) != 1:
+        return UNKNOWN
+    return out[0][1]
+
+
+def _iterate(value: object) -> object:
+    """The elements ``for...of`` and an array pattern go through: a list, or UNKNOWN; raises
+    _Throw for something that isn't iterable."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return list(value)
+    if isinstance(value, _Collection):
+        if value.kind == "Map":
+            return [[k, v] for k, v in value.pairs]
+        return [k for k, _ in value.pairs]
+    if value is UNKNOWN or value is STRANGER:
+        return UNKNOWN
+    raise _Throw  # undefined, null, a number, a plain object, a function
+
+
+def _object_rest(value: object, taken: set[object]) -> object:
+    """``...rest`` in an object pattern: the other keys of a known object."""
+    if isinstance(value, dict) and not isinstance(value, _Context):
+        return {k: v for k, v in value.items() if k not in taken}
+    return UNKNOWN
