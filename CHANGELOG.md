@@ -4,7 +4,42 @@ Every release of workflow-guard, newest first. Each section is the text of its
 [GitHub Release](https://github.com/Gallileee/workflow-guard/releases), with headings one
 level deeper; `scripts/release_check.py` checks that the two agree.
 
-## v0.37.0 — WG010: gh wrappers and functions in `$(...)`
+## v0.38.0 — WG010: array patterns in github-script checks
+
+### `const [a, b] = ...` and other patterns are followed
+
+A github-script permission check that asks two things at once takes the answers apart by
+position:
+
+```js
+const [perm, issue] = await Promise.all([
+  github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: context.actor }),
+  github.rest.issues.get({ ...context.repo, issue_number: context.issue.number }),
+])
+if (!['admin', 'write'].includes(perm.data.permission)) core.setFailed('not allowed')
+```
+
+The JavaScript evaluator gave up on array patterns, and the step was judged from its text. Now
+it follows them wherever a name can be bound (`const`/`let`/`var`, parameters, `for...of`):
+
+- array patterns with holes, defaults and a rest (`const [a, , b = 1, ...more] = list`), nested
+  in each other and in object patterns, on lists, strings, `Map`s (`[key, value]` pairs) and
+  `Set`s;
+- object patterns with defaults, quoted keys and a rest (`{ data: { permission = 'none' } = {},
+  ...others }`);
+- parameter patterns and rest parameters (`([level, ok]) => ...`, `function f({ username },
+  ...more)`); callbacks get the list as their third argument;
+- `Promise.all([...])` is the list of answers (a call in it that may throw still may), and
+  `Object.keys`/`values`/`entries` of a known object.
+
+Where JavaScript throws, so does the evaluator: a pattern on `undefined` or `null`, an array
+pattern or `for...of` on something that isn't iterable. A default that may throw or change
+something isn't followed (the text decides).
+
+On the public workflows, all 31 github-script permission checks are now decided (29 before).
+The two new ones return early for comments and only check other events, so no finding changed.
+
+## v0.37.0 — WG010: gh wrappers and functions in `$(...)` (2026-11-21)
 
 ### What a function prints is followed
 

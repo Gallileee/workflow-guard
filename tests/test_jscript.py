@@ -145,15 +145,18 @@ def test_another_users_permission_is_not_followed():
         "while (true) { break }",
         "for (let i = 0; i < 3; i++) {}",
         "for (const k in {a: 1}) {}",
-        "const f = ([a, b]) => a",
-        "const f = (...rest) => rest",
+        "[a, b] = [1, 2]",
+        "const { [k]: v } = {}",
         "function f() { return f() }\nf()",
         "function f() { process.exit(1) }\nf()",
         "break",
         "outer: for (const x of [1]) { break outer }",
         "switch (context.actor) { default: core.setFailed('x') }",
         "class A {}",
-        "const [a, b] = [1, 2]",
+        "function f(a = core.setFailed('x')) {}\nf()",
+        "const { b = github.rest.repos.get() } = {}",
+        "const { 'a' } = {}",
+        "const { ...[a] } = {}",
         "core.setOutput(context.actor, 'x')",
         "const x = cond ? process.exit(1) : 0",
         "let s = 'unclosed",
@@ -407,3 +410,109 @@ def test_functions_callbacks_loops(script, fails):
 def test_more_functions_and_loops(script, fails):
     r = run(script, {}, "NONE")
     assert r is not None and r.fails is fails
+
+
+PERMISSION = "github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: context.actor })"
+THREW = "let threw = false\ntry { %s } catch { threw = true }\nif (!threw) core.setFailed('x')"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Two calls at once, the answers taken apart by position.
+        "const [perm, issue] = await Promise.all([\n  " + PERMISSION + ",\n"
+        "  github.rest.issues.get({ ...context.repo, issue_number: 1 }),\n])\n"
+        "if (!['admin', 'write'].includes(perm.data.permission)) core.setFailed('no')",
+        # An array pattern in a callback's parameters, over Object.entries.
+        "const levels = { admin: true, maintain: true, write: true, read: false }\n"
+        "const { data } = await " + PERMISSION + "\n"
+        "const ok = Object.entries(levels).some(([level, yes]) => yes && level === data.permission)\n"
+        "if (!ok) core.setFailed('no')",
+        # for...of over a Map's entries.
+        "const { data } = await " + PERMISSION + "\nlet ok = false\n"
+        "for (const [level, yes] of new Map([['admin', true], ['write', true]])) {\n"
+        "  if (yes && data.permission === level) ok = true\n}\nif (!ok) core.setFailed('no')",
+        # A default in a nested object pattern.
+        "const { data: { permission = 'none' } = {} } = await " + PERMISSION + "\n"
+        "if (permission !== 'admin') core.setFailed(permission)",
+        # A function that takes its options apart.
+        "async function level({ username, fallback = 'none' }) {\n"
+        "  const { data } = await github.rest.repos.getCollaboratorPermissionLevel(\n"
+        "    { ...context.repo, username },\n  )\n"
+        "  return data.permission ?? fallback\n}\n"
+        "if ((await level({ username: context.actor })) !== 'admin') core.setFailed('no')",
+    ],
+)
+def test_patterns_in_checks_that_fail_on_a_no(script):
+    r = result(script)
+    assert r is not None
+    assert (r.fails, r.asked) == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("script", "fails"),
+    [
+        # Positions, holes, defaults and the rest.
+        ("const [a, , b = 3, ...r] = [1, 2]\nif (a === 1 && b === 3 && !r.length) core.setFailed('x')", True),
+        ("const [, second] = ['a', 'b']\nif (second === 'b') core.setFailed('x')", True),
+        ("const [x, ...r] = [1, 2, 3]\nif (r.length === 2 && r[1] === 3) core.setFailed('x')", True),
+        ("const [[x], { y }] = [[1], { y: 2 }]\nif (x === 1 && y === 2) core.setFailed('x')", True),
+        ("const [c] = 'ab'\nif (c === 'a') core.setFailed('x')", True),
+        ("const [a = 5] = [null]\nif (a === null) core.setFailed('x')", True),
+        # Taken from something unknown: unknown, whatever the default.
+        ("const [a] = context.payload.comment.body.split(' ')\nif (a === '/go') core.setFailed('x')", False),
+        ("const { a = 5 } = context.payload.issue\nif (a === 5) core.setFailed('x')", False),
+        ("const [a = 5] = context.payload.issue.labels\nif (a === 5) core.setFailed('x')", False),
+        # Object patterns: defaults, quoted keys and the rest.
+        ("const { a = 5 } = {}\nif (a === 5) core.setFailed('x')", True),
+        ("const { 'a-b': c } = { 'a-b': 1 }\nif (c === 1) core.setFailed('x')", True),
+        (
+            "const { a, ...others } = { a: 1, b: 2 }\n"
+            "if (Object.keys(others).length === 1 && others.b === 2) core.setFailed('x')",
+            True,
+        ),
+        # JavaScript throws for these.
+        ("try { const [a] = null } catch { core.setFailed('x') }", True),
+        ("try { const {} = null } catch { core.setFailed('x') }", True),
+        ("try { const [a] = { a: 1 } } catch { core.setFailed('x') }", True),
+        ("try { for (const x of null) {} } catch { core.setFailed('x') }", True),
+        ("try { for (const [a] of [1]) {} } catch { core.setFailed('x') }", True),
+        ("function f({ a }) { return a }\ntry { f() } catch { core.setFailed('x') }", True),
+        ("try { Object.keys(null) } catch { core.setFailed('x') }", True),
+        # ... and only there: a path that doesn't throw doesn't fail.
+        (THREW % "for (const [a] of [1]) {}", False),
+        (THREW % "const [a] = null", False),
+        (THREW % "Object.keys(null)", False),
+        # Parameters: patterns, defaults and the rest.
+        ("function count(...xs) { return xs.length }\nif (count(1, 2) === 2) core.setFailed('x')", True),
+        ("const f = (a, ...r) => r[0]\nif (f(1, 2) === 2) core.setFailed('x')", True),
+        ("const f = ([a, b] = [1, 2]) => b\nif (f() === 2) core.setFailed('x')", True),
+        # A rest parameter is the function's own name.
+        ("let r = 1\nfunction f(...r) { r = 2 }\nf()\nif (r === 1) core.setFailed('x')", True),
+        ("const f = ({ a } = {}) => a\nif (f() === undefined) core.setFailed('x')", True),
+        # Sets and Maps are iterable; callbacks get the list as their third argument.
+        ("for (const x of new Set(['a'])) { if (x === 'a') core.setFailed('x') }", True),
+        ("for (const [k, v] of new Map([['a', 1]])) { if (k === 'a' && v === 1) core.setFailed('x') }", True),
+        ("if (![1, 2].every((x, i, all) => all.length === 2)) core.setFailed('x')", False),
+        # Object.values and a for...of pattern on objects.
+        ("for (const { n } of [{ n: 1 }]) { if (n === 1) core.setFailed('x') }", True),
+        ("if (Object.values({ a: 1 })[0] === 1) core.setFailed('x')", True),
+        ("const [[k, v]] = Object.entries({ a: 1 })\nif (k === 'a' && v === 1) core.setFailed('x')", True),
+        ("if (Object.keys(context.repo).length === 2) core.setFailed('x')", False),
+        # A for...of pattern's names stay in the function.
+        ("function f() { for (const [x] of [[1]]) {} }\nf()\nif (x === 1) core.setFailed('x')", False),
+    ],
+)
+def test_array_and_object_patterns(script, fails):
+    r = run(script, {}, "NONE")
+    assert r is not None and r.fails is fails
+
+
+def test_a_call_in_promise_all_may_throw():
+    # Without the 404 path the step would fail on every path.
+    script = (
+        "let threw = false\ntry {\n  const [p] = await Promise.all([" + PERMISSION + "])\n"
+        "  core.info(p.data.permission)\n} catch {\n  threw = true\n}\nif (!threw) core.setFailed('x')"
+    )
+    r = result(script)
+    assert r is not None and r.asked is True and r.fails is False

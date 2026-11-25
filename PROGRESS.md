@@ -1,5 +1,47 @@
 # Progress log
 
+## 2026-11-25 (scheduled run): array patterns in jscript
+
+Why: next step 2. The last two github-script permission checks in the corpora that fell back to
+the text guess did so on `const [a, b] = await Promise.all([...])`. Array patterns also come up
+in callbacks over `Object.entries` (`([k, v]) => ...`) and `for (const [k, v] of map)`.
+
+Acceptance criteria:
+- One `binding()` in the parser for declarations, parameters and `for...of`: a name, an object
+  pattern (defaults, quoted keys, `...rest`) or an array pattern (holes, defaults, `...rest`),
+  nested in any order. Parameters are an array pattern the arguments are bound to.
+- `_bind` throws where JavaScript does: an object pattern on undefined/null, an array pattern or
+  `for...of` on something that isn't iterable (`_iterate`: lists, strings, Map entries, Set
+  keys; a stranger's login or something unknown gives unknown elements).
+- Defaults: used for undefined; with an unknown value the result stays unknown; a default that
+  may throw or change state is unsupported (it used to be evaluated and its effects dropped).
+- `Promise.all([...])` is the list (the calls' throws stay), `Object.keys/values/entries` of a
+  known object; callbacks get `(item, index, list)`.
+
+Done:
+- `jscript.py`: parser `binding`, `elements`, `default`, `pattern` (triples and rest), `params`
+  as an `apattern`; `_names`, `_bind`, `_default`, `_iterate`, `_object_rest`; `_invoke` binds
+  the parameters with `_bind`; `_for_of` binds patterns and iterates Maps/Sets; `Promise.all`,
+  `Object.*` in `_call_known`.
+- Tests: 45 more in `test_jscript.py` (3 "doesn't follow" examples replaced by ones that still
+  aren't followed, 3 more added); 1309 in total.
+- README (How it works, limitations: a rejection swallowed by `Promise.allSettled`/`.catch()`
+  still counts as a throw, a pre-existing gap now written down), CHANGELOG v0.38.0, version
+  0.38.0, v0.37.0 heading dated.
+
+What the corpora showed: 31 of 31 github-script permission checks decided (29 before). The two
+new ones (one generated workflow family) return early for `issue_comment` and only check the
+`labeled`/dispatch paths, so they correctly don't count as a check for a comment. Findings 475,
+170 and the fork corpus unchanged.
+
+Verified locally:
+- `pytest -q -W error`: 1309 passed. `ruff check`, `ruff format --check`: clean.
+- `release_check.py`: version 0.38.0, 0 errors (warning: v0.38.0 not tagged yet).
+- All three corpora: same output as main (v0.37.0). workflow-guard, LendLoop,
+  fitness-workout-log, transit-raptor, pulsewatch: same output as main (0 findings).
+- Mutation checks: 20 mutants, all killed (8 only after adding tests: two "throws" tests could
+  pass when the path vanished, so each now has a twin where a throw is the only way not to fail).
+
 ## 2026-11-21 (interactive, user picked "Obálky gh v shell.py"): gh wrappers and `$(function)`
 
 Why: next step 2. A retry wrapper around `gh` (`gh_retry api .../permission`, running `gh "$@"`
@@ -1482,9 +1524,10 @@ Environment note: the scoop-installed Python 3.12 can't create a venv on this ma
 
 ## Next steps (in order)
 
-1. Tag `v0.37.0` on the merge commit and publish its release from CHANGELOG.md (needs the owner).
-2. `jscript.py`: `require()`d helper scripts of the checked repository, and array patterns
-   (`const [a, b] = ...`, `([k, v]) =>`).
+1. Tag `v0.38.0` on the merge commit and publish its release from CHANGELOG.md.
+2. `jscript.py`: `require()`d helper scripts of the checked repository
+   (`require('./.github/scripts/check.js')`), and promises that don't throw where they're made
+   (`Promise.allSettled`, `.catch()`).
 3. WG005: a label gate with a step that removes the label (`labeled` + `actions-ecosystem/
    action-remove-labels` before the checkout) as a recognised pattern, with a note on the
    remaining race.
